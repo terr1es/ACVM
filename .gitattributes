@@ -1,0 +1,55 @@
+# Line endings.
+#
+# The project is developed on Windows and built on Linux, and the test suite compares
+# program output byte for byte. A `\r` that appears on one machine and not the other makes
+# a passing test fail for no reason, so text files are normalised in the repository and
+# checked out with the platform's convention.
+* text=auto
+
+*.c      text
+*.h      text
+*.cpp    text
+*.ax     text
+*.axd    text
+*.md     text
+*.py     text
+*.json   text
+*.cmake  text
+*.yml    text
+*.txt    text
+
+# Windows batch and shell scripts need their own endings to run at all.
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+*.sh     text eol=lf
+
+# Binary assets. Without this, git treats them as text and a checkout on a machine with
+# different line-ending settings silently corrupts them.
+*.ico    binary
+*.png    binary
+*.vsix   binary
+*.dll    binary
+*.so     binary
+*.exe    binary
+*.acvm   binary
+
+# ── GitHub language detection ───────────────────────────────────────────────
+#
+# GitHub decides a repository's language from a server-side database (github/linguist).
+# These lines tell it that `.ax` and `.axd` are Axiom rather than "Other", which is what
+# the language bar on the repository page reads.
+#
+# Note: naming the language here does not by itself produce colours in the code view.
+# GitHub's highlighter uses the grammar linguist associates with the language, and a
+# language absent from linguist's database has no grammar to use. Until Axiom is added
+# (see editors/linguist/), the file view renders as plain text while the language bar
+# still reports Axiom.
+*.ax     linguist-language=Axiom linguist-detectable
+*.axd    linguist-language=Axiom linguist-detectable
+
+# Samples, fixtures and examples are not part of the implementation. Excluding them keeps
+# the percentages on the repository page describing the compiler and its libraries rather
+# than the test data. They still highlight; this only affects statistics.
+editors/samples/*  linguist-documentation
+tests/**           linguist-detectable=false
+examples/**        linguist-detectable=false

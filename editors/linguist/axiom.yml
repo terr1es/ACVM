@@ -1,0 +1,70 @@
+# The language definition to submit to github/linguist.
+#
+# `.gitattributes` can name a language for `.ax` files, but GitHub only draws colours in
+# the code view for languages it already knows. Registering Axiom means one pull request
+# to https://github.com/github-linguist/linguist adding the block below to
+# `lib/linguist/languages.yml`, and (if that project wants it) a grammar.
+#
+# ── what to add to lib/linguist/languages.yml ──────────────────────────────
+#
+# Axiom:
+#   type: programming
+#   color: "#1F6FB2"
+#   extensions:
+#   - ".ax"
+#   - ".axd"
+#   tm_scope: source.axiom
+#   ace_mode: text
+#   language_id: 0            # see below
+#
+# Field notes:
+#
+#   type          `programming`, not `markup`. These files are compiled.
+#   color         Hex, drawn as the dot beside the language name on the repository page.
+#                 Dark values look black at that size, so this is a lifted version of the
+#                 brand navy (#1F2430). Change it if the brand has a brighter accent.
+#   extensions    `.axd` is included because declaration files are the same language.
+#                 They carry two extra rules -- they must start with `library "name";`,
+#                 and resolution prefers them over `name.ax` -- but neither is syntax.
+#   tm_scope      Must equal the grammar's `scopeName` (`source.axiom`). This is the link
+#                 between the language and the TextMate grammar: get it wrong and the
+#                 language shows up with no highlighting at all.
+#   ace_mode      `text` until a dedicated ACE mode exists. `text` means a browser-side
+#                 editor falls back to plain text rather than guessing.
+#   language_id   Must be unique across the file and is assigned by the maintainers on
+#                 submission. Pick an unused value above the current maximum; do not reuse
+#                 one from a deleted language.
+#
+# ── the grammar ────────────────────────────────────────────────────────────
+#
+# linguist sources grammar scopes from a list of vendored grammars, so a submission
+# normally needs the grammar to exist somewhere it can point at. The one in this
+# repository is the input for that: `editors/textmate/axiom.tmLanguage.json`.
+#
+# ── heuristics ─────────────────────────────────────────────────────────────
+#
+# Not needed. Heuristics exist to disambiguate extensions shared by several languages
+# (`.h`, `.m`, `.inc`); `.ax` and `.axd` are not claimed by any other language in the
+# database.
+#
+# ── before submitting ──────────────────────────────────────────────────────
+#
+# linguist asks that the language be used by a real, public project -- this repository
+# once it is published -- and that the extension not collide with an existing language.
+# Both are true here. The submission is a YAML block and a short justification, not code.
+#
+# ── what to expect until then ──────────────────────────────────────────────
+#
+# With the `.gitattributes` mapping in place, the repository page's language bar reports
+# Axiom, and the file view renders `.ax` files as plain text. GitHub search also relies on
+# its own copy of the database, so `language:Axiom` finds nothing until the merge lands.
+
+# Placeholder kept so this file is valid YAML and can be copied from directly.
+Axiom:
+  type: programming
+  color: "#1F6FB2"
+  extensions:
+    - ".ax"
+    - ".axd"
+  tm_scope: source.axiom
+  ace_mode: text

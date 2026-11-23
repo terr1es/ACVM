@@ -193,8 +193,9 @@ extralib/     Modules built on the standard library
 tests/        Script tests, C++ unit tests, differential harnesses, fixtures
 examples/     Runnable programs
 tools/        verify_tutorial.py and the acvm wrapper
-vscode-axiom/ Editor support: syntax highlighting and a TextMate grammar
+editors/      A TextMate grammar for syntax highlighting, and sample files
 brand/        Icon sources and the generator that produces the .ico files
+.gitattributes  Line endings, and telling GitHub that .ax/.axd are Axiom
 ```
 
 ## Status and known limitations

@@ -21,7 +21,7 @@ S25 = math.sin(HALF_ANGLE)
 C25 = math.cos(HALF_ANGLE)
 HB = (BASE_Y - APEX_Y) * T25    # half base width = 93.26
 
-TILE = (0x1F, 0x24, 0x30)       # same navy as the VSCode extension icon
+TILE = (0x1F, 0x24, 0x30)       # the editor-extension badge navy
 TILE_INSET = 8.0
 TILE_RADIUS = 44.0
 

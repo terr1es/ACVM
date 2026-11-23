@@ -474,8 +474,6 @@ if(ACVM_BUILD_TESTS)
                      -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/generics_errors
                      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_generics_errors.cmake)
 
-    # The `module` directive's own rules: name must match the file, version must be
-    # MAJOR.MINOR.PATCH, one per file -- and a valid one must be completely inert.
     # The tutorial's programs must run, and where it states an output that output must
     # match. A document is the easiest thing in a repository to let rot: it does not
     # fail to compile when the language changes, it just becomes quietly wrong, and
@@ -490,6 +488,18 @@ if(ACVM_BUILD_TESTS)
                  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     endif()
 
+    # The TextMate grammar is a derived artifact: when the lexer gains a keyword nothing
+    # breaks, it just stops highlighting that word. It had already drifted twice, so the
+    # keyword list is read out of the lexer and compared with the grammar, and the
+    # grammar's scopeName is checked against the language definition that names it.
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME grammar_check
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_grammar_keywords.py)
+    endif()
+
+    # The `module` directive's own rules: name must match the file, version must be
+    # MAJOR.MINOR.PATCH, one per file -- and a valid one must be completely inert.
     add_test(NAME module_check
              COMMAND ${CMAKE_COMMAND}
                      -DACVM=$<TARGET_FILE:acvm>

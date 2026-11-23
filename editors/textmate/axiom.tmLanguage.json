@@ -202,7 +202,7 @@
     "typedecl": {
       "patterns": [
         {
-          "match": "\\b(struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(struct|union|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
               "name": "storage.type.axiom"
@@ -295,6 +295,10 @@
         {
           "name": "keyword.other.library.axiom",
           "match": "\\blibrary\\b"
+        },
+        {
+          "name": "keyword.other.module.axiom",
+          "match": "\\bmodule\\b"
         },
         {
           "name": "keyword.operator.cast.axiom",

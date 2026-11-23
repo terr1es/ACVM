@@ -7,7 +7,7 @@ numbers here instead of always re-deriving them from the PNG lets each ICO
 entry be rendered at its own resolution with size-specific optical
 corrections, which a plain downscale cannot do.
 
-Design, matching vscode-axiom/icons/extension-icon.png (measured: the badge
+Design, matching the extension icon that used to live beside the grammar (measured: the badge
 fills the canvas, #1F2430, corner radius 14.8% of the side, white logo whose
 bbox is 56% of the side wide and centred):
 
