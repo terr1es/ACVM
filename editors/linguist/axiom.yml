@@ -23,9 +23,8 @@
 #   color         Hex, drawn as the dot beside the language name on the repository page.
 #                 Dark values look black at that size, so this is a lifted version of the
 #                 brand navy (#1F2430). Change it if the brand has a brighter accent.
-#   extensions    `.axd` is included because declaration files are the same language.
-#                 They carry two extra rules -- they must start with `library "name";`,
-#                 and resolution prefers them over `name.ax` -- but neither is syntax.
+#   extensions    `.ax` only. See "the .axd collision" below for why `.axd` is left out
+#                 of this list even though declaration files are the same language.
 #   tm_scope      Must equal the grammar's `scopeName` (`source.axiom`). This is the link
 #                 between the language and the TextMate grammar: get it wrong and the
 #                 language shows up with no highlighting at all.
@@ -41,11 +40,33 @@
 # normally needs the grammar to exist somewhere it can point at. The one in this
 # repository is the input for that: `editors/textmate/axiom.tmLanguage.json`.
 #
-# ── heuristics ─────────────────────────────────────────────────────────────
+# ── the .axd collision ─────────────────────────────────────────────────────
 #
-# Not needed. Heuristics exist to disambiguate extensions shared by several languages
-# (`.h`, `.m`, `.inc`); `.ax` and `.axd` are not claimed by any other language in the
-# database.
+# `.axd` is already claimed by ASP.NET, as a Web Handler file. This is not a guess: the
+# repository reported 71,738 bytes of ASP.NET before the mapping was added, and the
+# `.axd` files in this tree total 73,058 bytes, of which 1,320 is a sample excluded as
+# documentation -- 71,738 exactly. Every byte of "ASP.NET" in the statistics was a
+# declaration file.
+#
+# That leaves two options, and the choice is worth making deliberately:
+#
+#   1. Submit `.ax` only. Clean, no conflict, merges quickly. Other Axiom projects get no
+#      highlighting for their `.axd` files and have them counted as ASP.NET, unless they
+#      add the same `.gitattributes` override this repository has.
+#
+#   2. Submit both, with a heuristic that looks at the first line. Axiom declaration files
+#      begin with `library "name";`, ASP.NET handlers begin with `<%@ WebHandler ... %>`.
+#      linguist supports this (`heuristics:` with a first-line pattern), but heuristics
+#      make a submission slower to review and can be rejected as fragile.
+#
+# Option 1 is the right first pull request: it gets the language registered, and `.axd`
+# can follow once the language exists. Registration is the bottleneck; a second pull
+# request that only adds an extension has a much easier review than a first one that
+# brings a heuristic.
+#
+# ── heuristics for .ax ────────────────────────────────────────────────────
+#
+# Not needed. `.ax` is not claimed by any other language in the database.
 #
 # ── before submitting ──────────────────────────────────────────────────────
 #
@@ -65,6 +86,5 @@ Axiom:
   color: "#1F6FB2"
   extensions:
     - ".ax"
-    - ".axd"
   tm_scope: source.axiom
   ace_mode: text

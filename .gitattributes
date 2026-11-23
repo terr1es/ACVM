@@ -39,13 +39,22 @@
 # These lines tell it that `.ax` and `.axd` are Axiom rather than "Other", which is what
 # the language bar on the repository page reads.
 #
-# Note: naming the language here does not by itself produce colours in the code view.
-# GitHub's highlighter uses the grammar linguist associates with the language, and a
-# language absent from linguist's database has no grammar to use. Until Axiom is added
-# (see editors/linguist/), the file view renders as plain text while the language bar
-# still reports Axiom.
+# These lines are only half the story, and the missing half is not something a repository
+# can supply. `linguist-language` resolves its value against linguist's own database
+# (`Language.find_by_alias`); a name that is not there resolves to nil, and a file whose
+# language is nil is counted under no language at all. It does not fall back to extension
+# matching, and it does not create the language.
+#
+# So until Axiom is registered (see editors/linguist/), these two lines mean "count these
+# files as nothing" -- which is why the language bar shows no Axiom entry. Registering it
+# is a pull request to github/linguist, and the lines above start working the moment it
+# merges, with no change here.
 *.ax     linguist-language=Axiom linguist-detectable
 *.axd    linguist-language=Axiom linguist-detectable
+
+# `.axd` is ASP.NET's Web Handler extension, so without the line above these 10 files are
+# counted as ASP.NET -- which is what the repository reported before this file existed.
+# The override is what stops that, once Axiom is a registered language.
 
 # Samples, fixtures and examples are not part of the implementation. Excluding them keeps
 # the percentages on the repository page describing the compiler and its libraries rather
