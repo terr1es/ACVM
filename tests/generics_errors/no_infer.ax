@@ -1,0 +1,10 @@
+//  T appears in no parameter type -> cannot be inferred, so this must be an error
+//  rather than a guessed default.
+function makeZero<T>():T {
+    return 0 as T;
+}
+
+function main():void {
+    print(makeZero());
+    eof: pass;
+}

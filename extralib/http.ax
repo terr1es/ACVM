@@ -1,0 +1,835 @@
+//  http.ax -- an HTTP/1.1 client (request building, response parsing, chunked decoding).
+//
+//      function import (return:(http));
+//
+//      Doc d = docNew(0);
+//      ptr HttpResponse r = httpGet(#d, "http://example.com/api", 5000);
+//      if (r == null) { print(docError(#d)); }
+//      else if (r->status != 200) { print("status "); print(r->status); }
+//      else { print(r->body); }
+//      docFree(#d);
+//
+//  ── three layers, only the top one touches the network ───────────────────
+//
+//      httpBuildRequest   string -> string        pure
+//      httpParseResponse  bytes  -> HttpResponse  pure (chunked included)
+//      httpGet/httpPost   URL    -> HttpResponse  via net.dll
+//
+//  The first two layers **never touch a socket**, so they are testable in one thread
+//  with literal bytes (as `tests/http_check.ax` does). The third is thin: connect,
+//  send, read to EOF, close -- all through `net`'s one-call API, so no handle can leak.
+//
+//  ── URL parsing stops at what is needed ──────────────────────────────────
+//
+//  Supports `http://host[:port][/path][?query]`, plus Basic auth from
+//  `http://user:pass@host/`. **https is not supported**: TLS needs a certificate store
+//  and a handshake, a dependency rather than a syscall (same reason as in `net.axd`).
+//  An `https://` URL is an explicit error, not a plain connection that returns garbage.
+//
+//  ── what is deliberately left out ────────────────────────────────────────
+//
+//  Redirects (a 3xx comes back as is; the caller resends), a cookie jar, keep-alive
+//  reuse (one connection per request, the only simple correct answer on `net`'s
+//  blocking model), HTTP/2. Each is another module's work, and each composes client-side.
+
+//  depends: value, net, inflate, json
+
+module "http" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(value));
+function import (return:(net));
+function import (return:(inflate));
+function import (return:(codec));
+function import (return:(json));
+
+comptime int kHttpDefaultPort = 80;
+comptime int kHttpConnectTimeoutMs = 30000;
+comptime int kHttpReadTimeoutMs = 30000;
+//  Default cap on the whole response, and on a decompressed body. Large enough for
+//  any API reply, small enough that a runaway server cannot exhaust the process.
+comptime int kHttpLimit = 8 * 1024 * 1024;
+
+//===--- types -----------------------------------------------------------===//
+
+struct HttpHeader {
+    string name;
+    string value;
+};
+
+struct HttpResponse {
+    int status;
+    string reason;
+    string version;
+    ptr HttpHeader headers;
+    int headerCount;
+    int headerCapacity;
+    string body;
+    //  Chunked decoding and content decompression both change `body`; these two flags
+    //  say what happened, so a caller can tell whether the body is the original bytes.
+    bool chunked;
+    bool decompressed;
+};
+
+struct HttpUrl {
+    string scheme;
+    string host;
+    int port;
+    string path;       // with a leading '/', query string included
+    string user;       // Basic auth user, "" when absent
+    string password;
+};
+
+//===--- URL -------------------------------------------------------------===//
+
+function private httpIsAlpha(int c):bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    eof: pass;
+}
+
+//  Parses an absolute `http://` URL. The scheme check is where `https` is rejected:
+//  failing here is far better than connecting and misreading the reply.
+function httpParseUrl(ptr Doc doc, string url):ptr HttpUrl {
+    int schemeEnd = indexOf(url, "://");
+    if (schemeEnd <= 0) {
+        docFail(doc, "not an absolute URL (expected 'http://host/…')", 0);
+        return null;
+    }
+    string scheme = toLower(url[0 .. schemeEnd]);
+    if (scheme != "http") {
+        if (scheme == "https") {
+            docFail(doc, "https is not supported: this client speaks plain TCP, so a TLS " +
+                             "connection would silently produce garbage. Terminate TLS in " +
+                             "front of the program (a tunnel or a local proxy)", 0);
+            return null;
+        }
+        docFail(doc, "unsupported URL scheme '" + scheme + "'", 0);
+        return null;
+    }
+
+    ptr HttpUrl parsed = arenaTake(#doc->arena, sizeof(HttpUrl)) as ptr HttpUrl;
+    if (parsed == null) {
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    parsed->scheme = "http";
+    parsed->host = "";
+    parsed->port = kHttpDefaultPort;
+    parsed->path = "/";
+    parsed->user = "";
+    parsed->password = "";
+
+    int at = schemeEnd + 3;
+    int authorityEnd = url.length;
+    int i = at;
+    while (i < url.length) {
+        int c = strByteAt(url, i);
+        if (c == 47 || c == 63 || c == 35) {      // '/', '?', '#'
+            authorityEnd = i;
+            i = url.length;
+        } else {
+            i = i + 1;
+        }
+    }
+    string authority = url[at .. authorityEnd];
+    string rest = url[authorityEnd .. url.length];
+
+    // user:pass@host
+    int atSign = lastIndexOf(authority, "@");
+    if (atSign >= 0) {
+        string credentials = authority[0 .. atSign];
+        authority = authority[atSign + 1 .. authority.length];
+        int colon = indexOf(credentials, ":");
+        if (colon >= 0) {
+            parsed->user = credentials[0 .. colon];
+            parsed->password = credentials[colon + 1 .. credentials.length];
+        } else {
+            parsed->user = credentials;
+        }
+    }
+
+    // host:port -- IPv6 literals in brackets are accepted, because splitting on
+    // the last ':' would break `[::1]:8080`.
+    if (authority.length == 0) {
+        docFail(doc, "the URL has no host", at);
+        return null;
+    }
+    int lastColon = lastIndexOf(authority, ":");
+    if (authority.length > 0 && strByteAt(authority, 0) == 91 && lastColon > 0) {
+        int bracket = indexOf(authority, "]");
+        if (bracket > 0 && bracket + 1 < authority.length &&
+            strByteAt(authority, bracket + 1) == 58) {
+            parsed->host = authority[1 .. bracket];
+            string portText = authority[bracket + 2 .. authority.length];
+            int64 port = 0i64;
+            if (txtParseInt64(strBytesOf(portText), portText.length, #port) != portText.length) {
+                docFail(doc, "invalid port '" + portText + "'", 0);
+                return null;
+            }
+            parsed->port = port as int;
+        } else {
+            parsed->host = authority[1 .. bracket];
+        }
+    } else if (lastColon > 0) {
+        parsed->host = authority[0 .. lastColon];
+        string portText = authority[lastColon + 1 .. authority.length];
+        int64 port = 0i64;
+        if (txtParseInt64(strBytesOf(portText), portText.length, #port) != portText.length) {
+            docFail(doc, "invalid port '" + portText + "'", 0);
+            return null;
+        }
+        parsed->port = port as int;
+    } else {
+        parsed->host = authority;
+    }
+    if (parsed->port <= 0 || parsed->port > 65535) {
+        docFail(doc, "port out of range in '" + url + "'", 0);
+        return null;
+    }
+    if (parsed->host.length == 0) {
+        docFail(doc, "the URL has no host", at);
+        return null;
+    }
+
+    // Fragment is not sent to the server.
+    int hash = indexOf(rest, "#");
+    if (hash >= 0) {
+        rest = rest[0 .. hash];
+    }
+    if (rest.length == 0) {
+        parsed->path = "/";
+    } else if (strByteAt(rest, 0) != 47) {
+        parsed->path = "/" + rest;
+    } else {
+        parsed->path = rest;
+    }
+    return parsed;
+    eof: pass;
+}
+
+//===--- requests --------------------------------------------------------===//
+
+//  Base64 of `user:password`, for the Authorization header.
+function private httpBasicAuth(string user, string password):string {
+    return base64Encode(user + ":" + password);
+    eof: pass;
+}
+
+//  Builds the request bytes. `extraHeaders` may be "" or a block of lines already
+//  terminated by CRLF; `Host`, `Connection`, `User-Agent` and (when the URL has
+//  credentials) `Authorization` are added here, so a caller cannot forget them.
+//
+//  Returns a heap string; `httpFree` it or let it go (the language has no ownership
+//  tracking, so the convention is: whoever calls `httpBuildRequest` and does not
+//  hand it to `httpGet` should free it).
+function httpBuildRequest(ptr Doc doc, ptr HttpUrl url, string method, string path,
+                          string body, string contentType, string extraHeaders):string {
+    StrBuf b = {null, 0, 0};
+    sbInit(#b, 512);
+    sbPut(#b, method);
+    sbPutByte(#b, 32);
+    sbPut(#b, path.length > 0 ? path : url->path);
+    sbPut(#b, " HTTP/1.1\r\n");
+
+    // IPv6 literals go back in brackets; a bare `::1` would be read as host:port.
+    int colon = indexOf(url->host, ":");
+    sbPut(#b, "Host: ");
+    if (colon >= 0) {
+        sbPutByte(#b, 91);
+        sbPut(#b, url->host);
+        sbPutByte(#b, 93);
+    } else {
+        sbPut(#b, url->host);
+    }
+    if (url->port != kHttpDefaultPort) {
+        sbPutByte(#b, 58);
+        sbPut(#b, itoa(url->port, 10));
+    }
+    sbPut(#b, "\r\n");
+
+    // One request per connection: `net` is blocking, so there is no reuse to be
+    // had, and saying so keeps a server from holding the socket open.
+    sbPut(#b, "Connection: close\r\n");
+    sbPut(#b, "User-Agent: axiom-http/1.0\r\n");
+    // Asking for identity is honest -- the client *can* decompress gzip, but only
+    // when it is given the chance to say no; see httpDecodeBody.
+    sbPut(#b, "Accept-Encoding: gzip, identity\r\n");
+
+    if (url->user.length > 0) {
+        sbPut(#b, "Authorization: Basic ");
+        sbPut(#b, httpBasicAuth(url->user, url->password));
+        sbPut(#b, "\r\n");
+    }
+    if (body.length > 0) {
+        sbPut(#b, "Content-Length: ");
+        sbPut(#b, itoa(body.length, 10));
+        sbPut(#b, "\r\n");
+        if (contentType.length > 0) {
+            sbPut(#b, "Content-Type: ");
+            sbPut(#b, contentType);
+            sbPut(#b, "\r\n");
+        }
+    }
+    if (extraHeaders.length > 0) {
+        sbPut(#b, extraHeaders);
+        if (!endsWith(extraHeaders, "\r\n")) {
+            sbPut(#b, "\r\n");
+        }
+    }
+    sbPut(#b, "\r\n");
+    if (body.length > 0) {
+        sbPut(#b, body);
+    }
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+//===--- response parsing ------------------------------------------------===//
+
+function private httpAddHeader(ptr Doc doc, ptr HttpResponse r, string name,
+                                             string value):ptr HttpHeader {
+    if (r->headerCount >= r->headerCapacity) {
+        int cap = r->headerCapacity < 16 ? 16 : r->headerCapacity * 2;
+        ptr HttpHeader grown = arenaTake(#doc->arena, cap * sizeof(HttpHeader)) as ptr HttpHeader;
+        if (grown == null) {
+            return null;
+        }
+        if (r->headerCount > 0) {
+            memcpy(grown as ptr void, r->headers as ptr void, r->headerCount * sizeof(HttpHeader));
+        }
+        r->headers = grown;
+        r->headerCapacity = cap;
+    }
+    ptr HttpHeader slot = r->headers + r->headerCount;
+    slot->name = arenaStringOfString(#doc->arena, name);
+    slot->value = arenaStringOfString(#doc->arena, value);
+    r->headerCount = r->headerCount + 1;
+    return slot;
+    eof: pass;
+}
+
+//  Index of the CRLF at or after `from`, or -1.
+function private httpFindCrlf(ptr unsigned int8 bytes, int length, int from):int {
+    int i = from;
+    while (i + 1 < length) {
+        if (@(bytes + i) as int == 13 && @(bytes + i + 1) as int == 10) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+    eof: pass;
+}
+
+function private httpEqualsNoCase(string a, string b):bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    int i = 0;
+    while (i < a.length) {
+        int ca = strByteAt(a, i);
+        int cb = strByteAt(b, i);
+        if (ca >= 65 && ca <= 90) {
+            ca = ca + 32;
+        }
+        if (cb >= 65 && cb <= 90) {
+            cb = cb + 32;
+        }
+        if (ca != cb) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+    eof: pass;
+}
+
+function private httpTrim(string text):string {
+    int from = 0;
+    while (from < text.length) {
+        int c = strByteAt(text, from);
+        if (c == 32 || c == 9) {
+            from = from + 1;
+        } else {
+            from = from + 0;
+            break;
+        }
+    }
+    int to = text.length;
+    while (to > from) {
+        int c = strByteAt(text, to - 1);
+        if (c == 32 || c == 9) {
+            to = to - 1;
+        } else {
+            to = to + 0;
+            break;
+        }
+    }
+    return text[from .. to];
+    eof: pass;
+}
+
+//  Parses a complete response (as received on the wire) into `HttpResponse`.
+//  Handles the three body framings: Content-Length, chunked, and read-to-close.
+//
+//  `bytes` is the raw stream -- status line, headers, blank line, body -- exactly
+//  what comes out of the socket.
+function httpParseResponse(ptr Doc doc, ptr unsigned int8 bytes, int length):ptr HttpResponse {
+    ptr HttpResponse r = arenaTake(#doc->arena, sizeof(HttpResponse)) as ptr HttpResponse;
+    if (r == null) {
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    r->status = 0;
+    r->reason = "";
+    r->version = "";
+    r->headers = null;
+    r->headerCount = 0;
+    r->headerCapacity = 0;
+    r->body = "";
+    r->chunked = false;
+    r->decompressed = false;
+
+    int lineEnd = httpFindCrlf(bytes, length, 0);
+    if (lineEnd < 0) {
+        docFail(doc, "the response has no status line", 0);
+        return null;
+    }
+    string statusLine = arenaString(#doc->arena, bytes as ptr int8, lineEnd);
+    // "HTTP/1.1 200 OK"
+    int firstSpace = indexOf(statusLine, " ");
+    if (firstSpace < 0) {
+        docFail(doc, "malformed status line '" + statusLine + "'", 0);
+        return null;
+    }
+    r->version = statusLine[0 .. firstSpace];
+    if (!startsWith(r->version, "HTTP/")) {
+        docFail(doc, "not an HTTP response (starts with '" + r->version + "')", 0);
+        return null;
+    }
+    int secondSpace = -1;
+    int i = firstSpace + 1;
+    while (i < statusLine.length) {
+        if (strByteAt(statusLine, i) == 32) {
+            secondSpace = i;
+            i = statusLine.length;
+        } else {
+            i = i + 1;
+        }
+    }
+    string codeText = statusLine;
+    if (secondSpace > 0) {
+        codeText = statusLine[firstSpace + 1 .. secondSpace];
+        r->reason = statusLine[secondSpace + 1 .. statusLine.length];
+    } else {
+        codeText = statusLine[firstSpace + 1 .. statusLine.length];
+    }
+    int64 status = 0i64;
+    if (txtParseInt64(strBytesOf(codeText), codeText.length, #status) != codeText.length) {
+        docFail(doc, "malformed status code '" + codeText + "'", 0);
+        return null;
+    }
+    r->status = status as int;
+
+    // ── headers ──
+    int at = lineEnd + 2;
+    while (true) {
+        if (at >= length) {
+            docFail(doc, "the response ends inside the headers", at);
+            return null;
+        }
+        if (@(bytes + at) as int == 13 && at + 1 < length && @(bytes + at + 1) as int == 10) {
+            at = at + 2;
+            break;
+        }
+        int end = httpFindCrlf(bytes, length, at);
+        if (end < 0) {
+            docFail(doc, "the response ends inside the headers", at);
+            return null;
+        }
+        string line = arenaString(#doc->arena, (bytes + at) as ptr int8, end - at);
+        at = end + 2;
+        if (line.length == 0) {
+            break;
+        }
+        int colon = indexOf(line, ":");
+        if (colon <= 0) {
+            docFail(doc, "malformed header line '" + line + "'", at);
+            return null;
+        }
+        string name = httpTrim(line[0 .. colon]);
+        string value = httpTrim(line[colon + 1 .. line.length]);
+        if (httpAddHeader(doc, r, name, value) == null) {
+            return null;
+        }
+    }
+
+    // ── body framing ──
+    bool hasLength = false;
+    int contentLength = 0;
+    string transfer = "";
+    string encoding = "";
+    i = 0;
+    while (i < r->headerCount) {
+        ptr HttpHeader h = r->headers + i;
+        if (httpEqualsNoCase(h->name, "content-length")) {
+            int64 parsed = 0i64;
+            if (txtParseInt64(strBytesOf(h->value), h->value.length, #parsed) == h->value.length) {
+                contentLength = parsed as int;
+                hasLength = true;
+            }
+        } else if (httpEqualsNoCase(h->name, "transfer-encoding")) {
+            transfer = h->value;
+        } else if (httpEqualsNoCase(h->name, "content-encoding")) {
+            encoding = toLower(h->value);
+        }
+        i = i + 1;
+    }
+
+    if (indexOf(toLower(transfer), "chunked") >= 0) {
+        r->chunked = true;
+        ptr InflateResult decoded = httpDecodeChunked(doc, bytes, length, at);
+        if (decoded == null) {
+            return null;
+        }
+        r->body = inflateText(decoded);
+    } else if (hasLength) {
+        if (at + contentLength > length) {
+            // A body shorter than Content-Length is a truncated transfer, not a
+            // shorter document: reporting it as success would hide the difference.
+            docFail(doc, "the body is shorter than Content-Length (" +
+                             itoa(length - at, 10) + " of " + itoa(contentLength, 10) + " bytes)",
+                    at);
+            return null;
+        }
+        r->body = arenaString(#doc->arena, (bytes + at) as ptr int8, contentLength);
+    } else {
+        // No framing header: read to the end of the stream.
+        if (at < length) {
+            r->body = arenaString(#doc->arena, (bytes + at) as ptr int8, length - at);
+        }
+    }
+
+    // ── content-encoding ──
+    if (encoding.length > 0 && encoding != "identity") {
+        if (indexOf(encoding, "gzip") >= 0 || indexOf(encoding, "deflate") >= 0) {
+            ptr InflateResult plain = inflateAuto(doc, strBytesOf(r->body) as ptr unsigned int8,
+                                                  r->body.length, kHttpLimit);
+            if (plain == null) {
+                return null;
+            }
+            r->body = inflateText(plain);
+            r->decompressed = true;
+        } else {
+            docFail(doc, "unsupported Content-Encoding '" + encoding + "'", 0);
+            return null;
+        }
+    }
+    doc->root = null;
+    return r;
+    eof: pass;
+}
+
+//  Decodes a chunked body starting at `at`. Each chunk is `<hex length>\r\n<data>\r\n`
+//  and the stream ends with a zero-length chunk followed by optional trailers --
+//  which are parsed and dropped, because a chunked response that carries real
+//  headers in trailers is vanishingly rare and merging them afterwards would
+//  change when `headerCount` means what it says.
+function private httpDecodeChunked(ptr Doc doc, ptr unsigned int8 bytes,
+                                                    int length, int at):ptr InflateResult {
+    ptr InflateResult out = arenaTake(#doc->arena, sizeof(InflateResult)) as ptr InflateResult;
+    if (out == null) {
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    out->data = null;
+    out->length = 0;
+    out->capacity = 0;
+    int capacity = 4096;
+    ptr unsigned int8 buffer = arenaTake(#doc->arena, capacity) as ptr unsigned int8;
+    if (buffer == null) {
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    out->data = buffer;
+    out->capacity = capacity;
+    int pos = at;
+    while (true) {
+        int end = httpFindCrlf(bytes, length, pos);
+        if (end < 0) {
+            docFail(doc, "chunked body ends inside a chunk size line", pos);
+            return null;
+        }
+        string sizeLine = arenaString(#doc->arena, (bytes + pos) as ptr int8, end - pos);
+        // A size line may carry chunk extensions after ';'.
+        int semi = indexOf(sizeLine, ";");
+        if (semi >= 0) {
+            sizeLine = sizeLine[0 .. semi];
+        }
+        sizeLine = httpTrim(sizeLine);
+        int size = 0;
+        int digits = 0;
+        int i = 0;
+        while (i < sizeLine.length) {
+            int digit = txtHexValue(strByteAt(sizeLine, i));
+            if (digit < 0) {
+                docFail(doc, "invalid chunk size '" + sizeLine + "'", pos);
+                return null;
+            }
+            size = size * 16 + digit;
+            digits = digits + 1;
+            i = i + 1;
+        }
+        if (digits == 0) {
+            docFail(doc, "empty chunk size", pos);
+            return null;
+        }
+        pos = end + 2;
+        if (size == 0) {
+            return out;
+        }
+        if (pos + size > length) {
+            docFail(doc, "chunked body ends inside a chunk", pos);
+            return null;
+        }
+        if (out->length + size > capacity) {
+            int cap = capacity;
+            while (cap < out->length + size) {
+                cap = cap * 2;
+            }
+            ptr unsigned int8 grown = arenaTake(#doc->arena, cap) as ptr unsigned int8;
+            if (grown == null) {
+                docFail(doc, "out of memory", 0);
+                return null;
+            }
+            if (out->length > 0) {
+                memcpy(grown as ptr void, buffer as ptr void, out->length);
+            }
+            buffer = grown;
+            capacity = cap;
+            out->data = grown;
+            out->capacity = cap;
+        }
+        memcpy((buffer + out->length) as ptr void, (bytes + pos) as ptr void, size);
+        out->length = out->length + size;
+        pos = pos + size;
+        // The chunk data is followed by its own CRLF.
+        if (pos + 1 < length && @(bytes + pos) as int == 13 && @(bytes + pos + 1) as int == 10) {
+            pos = pos + 2;
+        }
+    }
+    return out;
+    eof: pass;
+}
+
+//===--- access ----------------------------------------------------------===//
+
+//  Header lookup, case-insensitive. "" when the header is absent; use
+//  `httpHasHeader` when an empty value is meaningful.
+function httpHeader(ptr HttpResponse r, string name):string {
+    if (r == null) {
+        return "";
+    }
+    int i = 0;
+    while (i < r->headerCount) {
+        if (httpEqualsNoCase(r->headers[i].name, name)) {
+            return r->headers[i].value;
+        }
+        i = i + 1;
+    }
+    return "";
+    eof: pass;
+}
+
+function httpHasHeader(ptr HttpResponse r, string name):bool {
+    if (r == null) {
+        return false;
+    }
+    int i = 0;
+    while (i < r->headerCount) {
+        if (httpEqualsNoCase(r->headers[i].name, name)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+    eof: pass;
+}
+
+function httpHeaderNameAt(ptr HttpResponse r, int index):string {
+    if (r == null || index < 0 || index >= r->headerCount) {
+        return "";
+    }
+    return r->headers[index].name;
+    eof: pass;
+}
+
+function httpHeaderValueAt(ptr HttpResponse r, int index):string {
+    if (r == null || index < 0 || index >= r->headerCount) {
+        return "";
+    }
+    return r->headers[index].value;
+    eof: pass;
+}
+
+function httpIsSuccess(ptr HttpResponse r):bool {
+    if (r == null) {
+        return false;
+    }
+    return r->status >= 200 && r->status < 300;
+    eof: pass;
+}
+
+//  The body parsed as JSON. A one-call path for the common case: an API that
+//  returns JSON needs no intermediate string handling.
+//
+//      function import (return:(json));
+//      ptr Value doc = httpJson(#d, response);
+function httpJson(ptr Doc d, ptr HttpResponse r):ptr Value {
+    if (r == null) {
+        docFail(d, "no response", 0);
+        return null;
+    }
+    return jsonParse(d, r->body);
+    eof: pass;
+}
+
+//===--- transport -------------------------------------------------------===//
+
+//  Sends `request` and reads until the peer closes, then parses.
+//
+//  The connection is opened and closed here and nowhere else, which is the shape
+//  `net.ax` argues for: with no `defer`, a handle that escapes a function is a
+//  leaked descriptor, so the transport lives inside one function with a close on
+//  every exit path.
+//
+//  The read buffer starts at 8 KB and doubles up to `limit`. Allocating the limit
+//  up front was the first version and it was wrong: four ordinary requests at a
+//  64 MB limit exhausted the process's memory before any of them returned.
+function httpExchange(ptr Doc doc, ptr HttpUrl url, string request, int limit):ptr HttpResponse {
+    if (limit <= 0) {
+        limit = kHttpLimit;
+    }
+    int64 fd = tcpConnect(url->host, url->port, kHttpConnectTimeoutMs);
+    if (fd < 0) {
+        // Translate the transport's errno form into the document's message form,
+        // so callers of this module never have to know `netLastError` exists.
+        docFail(doc, "cannot connect to " + url->host + ":" + itoa(url->port, 10) + ": " +
+                         netErrorString(), 0);
+        return null;
+    }
+    if (tcpSend(fd, request) < 0) {
+        string reason = netErrorString();
+        tcpClose(fd);
+        docFail(doc, "cannot send the request: " + reason, 0);
+        return null;
+    }
+    // Half-close so the peer knows the request is complete even when it has no
+    // length prefix to go by.
+    tcpShutdownWrite(fd);
+
+    int capacity = 8192;
+    ptr unsigned int8 buffer = alloc(capacity) as ptr unsigned int8;
+    if (buffer == null) {
+        tcpClose(fd);
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    int total = 0;
+    while (true) {
+        if (total >= capacity) {
+            if (capacity >= limit) {
+                tcpClose(fd);
+                free(buffer as ptr void);
+                docFail(doc, "the reply exceeds the limit of " + itoa(limit, 10) + " bytes", 0);
+                return null;
+            }
+            int cap = capacity * 2;
+            if (cap > limit) {
+                cap = limit;
+            }
+            ptr unsigned int8 grown = alloc(cap) as ptr unsigned int8;
+            if (grown == null) {
+                tcpClose(fd);
+                free(buffer as ptr void);
+                docFail(doc, "out of memory growing the read buffer", 0);
+                return null;
+            }
+            memcpy(grown as ptr void, buffer as ptr void, total);
+            free(buffer as ptr void);
+            buffer = grown;
+            capacity = cap;
+        }
+        int n = tcpRecvTimeout(fd, buffer + total, capacity - total, kHttpReadTimeoutMs);
+        if (n < 0) {
+            // A timeout and a socket error both surface as -1 here; `netTimedOut`
+            // is what tells them apart, and the message should say which.
+            string reason = netTimedOut() ? "timed out waiting for the reply" : netErrorString();
+            tcpClose(fd);
+            free(buffer as ptr void);
+            docFail(doc, reason, 0);
+            return null;
+        }
+        if (n == 0) {
+            break;      // clean close: the reply is complete
+        }
+        total = total + n;
+    }
+    tcpClose(fd);
+
+    ptr HttpResponse r = httpParseResponse(doc, buffer, total);
+    free(buffer as ptr void);
+    return r;
+    eof: pass;
+}
+
+function httpRequest(ptr Doc doc, string method, string url, string body,
+                     string contentType, string extraHeaders):ptr HttpResponse {
+    ptr HttpUrl parsed = httpParseUrl(doc, url);
+    if (parsed == null) {
+        return null;
+    }
+    string request = httpBuildRequest(doc, parsed, method, parsed->path, body, contentType,
+                                      extraHeaders);
+    if (docFailed(doc)) {
+        return null;
+    }
+    return httpExchange(doc, parsed, request, kHttpLimit);
+    eof: pass;
+}
+
+function httpGet(ptr Doc doc, string url, int timeoutMs):ptr HttpResponse {
+    ptr HttpUrl parsed = httpParseUrl(doc, url);
+    if (parsed == null) {
+        return null;
+    }
+    string request = httpBuildRequest(doc, parsed, "GET", parsed->path, "", "", "");
+    if (docFailed(doc)) {
+        return null;
+    }
+    return httpExchange(doc, parsed, request, kHttpLimit);
+    eof: pass;
+}
+
+function httpPost(ptr Doc doc, string url, string body, string contentType):ptr HttpResponse {
+    ptr HttpUrl parsed = httpParseUrl(doc, url);
+    if (parsed == null) {
+        return null;
+    }
+    string request = httpBuildRequest(doc, parsed, "POST", parsed->path, body, contentType, "");
+    if (docFailed(doc)) {
+        return null;
+    }
+    return httpExchange(doc, parsed, request, kHttpLimit);
+    eof: pass;
+}
+
+//  POST with `Content-Type: application/json` -- the shape almost every API call
+//  ends up needing, so it gets a name instead of a string argument.
+function httpPostJson(ptr Doc doc, string url, string json):ptr HttpResponse {
+    return httpPost(doc, url, json, "application/json");
+    eof: pass;
+}

@@ -1,0 +1,97 @@
+//  codec_check.ax — the codec module: hex, base64, URL encoding.
+//
+//  The base64 expectations come from the RFC 4648 test vectors, not from running
+//  the implementation and copying the output back — that only shows it is
+//  self-consistent, not that it is right.
+//
+//  Run:  acvm run tests/codec_check.ax
+
+function import (return:(codec));
+function import (return:(test));
+
+function private checkHex():void {
+    testGroup("hex");
+
+    checkString(hexEncode("Hi"), "4869", "encode Hi");
+    checkString(hexEncode(""), "", "encode empty");
+    checkString(hexEncode("A"), "41", "encode one byte");
+    checkString(hexDecode("4869"), "Hi", "decode");
+
+    //  Upper and lower case input decode to the same bytes: encode(decode(x))
+    //  folds both spellings to lower case.
+    checkString(hexEncode(hexDecode("ABCDEF")), "abcdef", "uppercase input normalises");
+    checkString(hexEncode(hexDecode("abcdef")), "abcdef", "lowercase input normalises");
+
+    //  round trip, including multibyte UTF-8.
+    string text = "Hello, 世界";
+    checkString(hexDecode(hexEncode(text)), text, "round trip multibyte");
+
+    //  the contract for invalid input: return the empty string.
+    checkEmpty(hexDecode("abc"), "odd length rejected");
+    checkEmpty(hexDecode("zz"), "non-hex rejected");
+    checkEmpty(hexDecode("4g"), "half-valid rejected");
+    checkEmpty(hexDecode(""), "empty decodes to empty");
+    eof: pass;
+}
+
+function private checkBase64():void {
+    testGroup("base64");
+
+    //  the vectors from RFC 4648 §10.
+    checkString(base64Encode(""), "", "vector: empty");
+    checkString(base64Encode("f"), "Zg==", "vector: f");
+    checkString(base64Encode("fo"), "Zm8=", "vector: fo");
+    checkString(base64Encode("foo"), "Zm9v", "vector: foo");
+    checkString(base64Encode("foob"), "Zm9vYg==", "vector: foob");
+    checkString(base64Encode("fooba"), "Zm9vYmE=", "vector: fooba");
+    checkString(base64Encode("foobar"), "Zm9vYmFy", "vector: foobar");
+
+    //  decode the same vectors.
+    checkString(base64Decode("Zg=="), "f", "decode f");
+    checkString(base64Decode("Zm8="), "fo", "decode fo");
+    checkString(base64Decode("Zm9v"), "foo", "decode foo");
+    checkString(base64Decode("Zm9vYmFy"), "foobar", "decode foobar");
+
+    //  round trip, including multibyte and binary-looking bytes.
+    checkString(base64Decode(base64Encode("Hello, World!")), "Hello, World!", "round trip ascii");
+    checkString(base64Decode(base64Encode("中文测试")), "中文测试", "round trip cjk");
+
+    //  invalid input.
+    checkEmpty(base64Decode("Zm9"), "length not multiple of 4");
+    checkEmpty(base64Decode("Z!9v"), "invalid character");
+    checkEmpty(base64Decode(""), "empty decodes to empty");
+    eof: pass;
+}
+
+function private checkUrl():void {
+    testGroup("url");
+
+    checkString(urlEncode("a b&c"), "a%20b%26c", "space and ampersand");
+    checkString(urlEncode("AZaz09-._~"), "AZaz09-._~", "unreserved pass through");
+    checkString(urlEncode(""), "", "encode empty");
+    checkString(urlEncode("="), "%3d", "equals is escaped");
+
+    checkString(urlDecode("a%20b%26c"), "a b&c", "decode");
+    checkString(urlDecode("a+b"), "a b", "plus is a space");
+    checkString(urlDecode("100%"), "100%", "stray percent passes through");
+    checkString(urlDecode("%zz"), "%zz", "invalid escape passes through");
+    checkString(urlDecode(""), "", "decode empty");
+
+    //  Round trip. A space encodes as %20 rather than +, while decoding accepts
+    //  both — a deliberate asymmetry.
+    string text = "a b&c=d/e?f#g";
+    checkString(urlDecode(urlEncode(text)), text, "round trip symbols");
+    checkString(urlDecode(urlEncode("中文")), "中文", "round trip cjk");
+
+    //  every byte of the UTF-8 encoding has to become %XX.
+    checkString(urlEncode("中"), "%e4%b8%ad", "cjk expands to three triplets");
+    eof: pass;
+}
+
+function main():void {
+    checkHex();
+    checkBase64();
+    checkUrl();
+    testFinish();
+    eof: pass;
+}

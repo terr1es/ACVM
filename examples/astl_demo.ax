@@ -1,0 +1,187 @@
+//  astl_demo.ax — the four ASTL containers, tied together by one small real task.
+//
+//  Scenario: count how often each word appears in a text, then
+//    · hash map for the counting (fast insert, counts only)
+//    · ordered map for output (sorted by key, which a hash map cannot do)
+//    · set for deduplication (only "which ones exist" matters)
+//    · vector to collect the results
+//
+//  This one task shows how the four share the work, rather than four isolated API demos.
+//
+//  Run:  acvm run examples/astl_demo.ax
+
+function import (return:(vec));
+function import (return:(set));
+function import (return:(map));
+function import (return:(hash));
+
+comptime int WORDS = 40;
+
+//  Cut the `index`-th space-separated word out of a text. "" means there are no more.
+//
+//  You cannot index a string by character (`s[i]` counts UTF-16 units but bytes are UTF-8),
+//  so this walks forward one slice at a time using `indexOf` plus slicing.
+function private wordAt(string text, int index):string {
+    int cursor = 0;
+    int seen = 0;
+    string found = "";
+    bool finished = false;
+    //  A sentinel loop rather than `while (true) { return ...; }`: the path checker
+    //  treats an unconditional loop as fall-through and then reports that the
+    //  function can end without a value.
+    while (!finished && cursor < text.length) {
+        //  skip leading spaces
+        while (cursor < text.length && text[cursor .. cursor + 1] == " ") {
+            cursor = cursor + 1;
+        }
+        if (cursor >= text.length) {
+            finished = true;
+        } else {
+            int space = indexOf(text[cursor .. text.length], " ");
+            string word = "";
+            if (space < 0) {
+                word = text[cursor .. text.length];
+                cursor = text.length;
+            } else {
+                word = text[cursor .. cursor + space];
+                cursor = cursor + space + 1;
+            }
+            if (seen == index) {
+                found = word;
+                finished = true;
+            } else {
+                seen = seen + 1;
+            }
+        }
+    }
+    return found;
+    eof: pass;
+}
+
+//  Tokenise a text, count word frequencies, and write the counts into a hash map.
+function private countWords(string text, ptr HashMapStr counts):int {
+    int index = 0;
+    int total = 0;
+    while (true) {
+        string word = wordAt(text, index);
+        if (word.length == 0) {
+            break;
+        }
+        int previous = 0;
+        if (hashMapStrGet(counts, word, #previous)) {
+            hashMapStrPut(counts, word, previous + 1);
+        } else {
+            hashMapStrPut(counts, word, 1);
+        }
+        total = total + 1;
+        index = index + 1;
+    }
+    return total;
+    eof: pass;
+}
+
+//  Move the hash keys into an ordered map: hash order is arbitrary, so sorting comes first.
+function private sortWords(ptr HashMapStr counts, ptr MapStrInt ordered):void {
+    //  A hash map has no iteration API (open addressing means slot order is hash order),
+    //  so this walks the source vocabulary again — the real price of "hashes are unordered".
+    string vocabulary[WORDS];
+    int found = 0;
+    string seed = "alpha beta gamma delta alpha epsilon beta gamma alpha zeta";
+    int index = 0;
+    while (true) {
+        string word = wordAt(seed, index);
+        if (word.length == 0) {
+            break;
+        }
+        int count = 0;
+        if (hashMapStrGet(counts, word, #count)) {
+            mapStrPut(ordered, word, count);
+        }
+        index = index + 1;
+    }
+    eof: pass;
+}
+
+function main():void {
+    // ─── 1. vector: collect the raw word list ─────────────────────────────────
+    string text = "alpha beta gamma delta alpha epsilon beta gamma alpha zeta beta";
+    print("1. tokenize\n");
+
+    string wordStore[WORDS];
+    Vec words = makeVec(#wordStore[0] as ptr char, WORDS, sizeof(string));
+    int index = 0;
+    while (true) {
+        string word = wordAt(text, index);
+        if (word.length == 0) {
+            break;
+        }
+        vecPush(#words, #word as ptr char);
+        index = index + 1;
+    }
+    print("   tokens: "); print(words.count);
+    print(" ("); print(words.elemSize); print(" bytes each = string descriptor)\n");
+
+    // ─── 2. hash: count frequencies ──────────────────────────────────────────
+    print("\n2. count with a hash map\n");
+    HashMapStr counts = makeHashMapStr(16);
+    int total = countWords(text, #counts);
+    print("   total words: "); print(total);
+    print("  distinct: "); print(hashMapStrCount(#counts)); print("\n");
+
+    int alpha = 0;
+    if (hashMapStrGet(#counts, "alpha", #alpha)) {
+        print("   alpha appears "); print(alpha); print(" times\n");
+    }
+    int missing = 0;
+    print("   'omega' known: "); print(hashMapStrGet(#counts, "omega", #missing)); print("\n");
+
+    // ─── 3. set: the deduplicated word list ──────────────────────────────────
+    print("\n3. distinct words as a set\n");
+    HashSetStr distinct = makeHashSetStr(16);
+    for (int i = 0; i < index; i++) {
+        hashSetStrAdd(#distinct, wordAt(text, i));
+    }
+    print("   set size: "); print(hashSetStrCount(#distinct)); print("\n");
+    print("   has 'gamma': "); print(hashSetStrContains(#distinct, "gamma"));
+    print("  has 'omega': "); print(hashSetStrContains(#distinct, "omega")); print("\n");
+
+    // ─── 4. ordered map: output in alphabetical order ────────────────────────
+    print("\n4. sorted output\n");
+    string keyStore[WORDS];
+    int valueStore[WORDS];
+    MapStrInt ordered = makeMapStrInt(#keyStore[0], #valueStore[0], WORDS);
+    sortWords(#counts, #ordered);
+    for (int i = 0; i < mapStrCount(#ordered); i++) {
+        print("   "); print(mapStrKeyAt(#ordered, i));
+        print(" = "); print(mapStrValueAt(#ordered, i)); print("\n");
+    }
+
+    // ─── 5. ordered int set: another angle ───────────────────────────────────
+    print("\n5. an ordered int set\n");
+    int numbers[8] = {0};
+    SetInt set = makeSetInt(#numbers[0], 8);
+    int seed[6] = {5, 3, 9, 3, 1, 9};
+    for (int i = 0; i < 6; i++) {
+        setIntAdd(#set, @(#seed[0] + i));
+    }
+    print("   inserted 6, distinct "); print(setIntCount(#set)); print(", sorted: ");
+    for (int i = 0; i < setIntCount(#set); i++) {
+        print(setIntAt(#set, i)); print(" ");
+    }
+    print("\n");
+
+    // ─── 6. release ──────────────────────────────────────────────────────────
+    //
+    //  Any container that grew must be freed; one that never grew (it borrows the
+    //  caller buffer) makes Free a no-op. SetInt and MapStrInt below use stack arrays
+    //  with room, so they never grow; HashMapStr / HashSetStr are heap from the start.
+    print("\n6. release\n");
+    vecFree(#words);
+    hashMapStrFree(#counts);
+    hashSetStrFree(#distinct);
+    mapStrIntFree(#ordered);
+    setIntFree(#set);
+    print("   all released\n");
+    print("\ndone\n");
+    eof: pass;
+}

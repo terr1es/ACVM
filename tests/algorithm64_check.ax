@@ -1,0 +1,45 @@
+//  algorithm64_check.ax — the 64 bit half of the algorithm library.
+//
+//  The `*64` functions have no Axiom fallback: writing 31 more bodies that mirror
+//  the 32 bit ones line for line would double the maintenance of a file that
+//  already carries 32, and the differential test that justifies a fallback cannot
+//  cover them anyway (there is nothing to compare against). They require
+//  algorithm.dll, so this script is only run where the library was built.
+//
+//  Counts and indices stay `int` in both widths -- they are element counts, not
+//  values -- which is why `binarySearch64` returns `int` while its `value`
+//  parameter is `int64`.
+
+function import (return:(algorithm));
+
+function main():void {
+    int64 a[8] = {5000000000, 3, 9000000000, 1, 7000000000, 2000000000, 8, 4};
+
+    heapSort64(#a[0], 8);
+    print("heapSort64: "); for i in 0..8 { print(@(#a[0]+i)); print(" "); } print("\n");
+
+    print("isSortedAsc64: "); print(isSortedAsc64(#a[0], 8)); print("\n");
+    print("lowerBound64(5000000000): "); print(lowerBound64(#a[0], 8, 5000000000i64)); print("\n");
+    print("binarySearch64(9000000000): "); print(binarySearch64(#a[0], 8, 9000000000i64)); print("\n");
+    print("min/max idx: "); print(minIndex64(#a[0], 8)); print(" "); print(maxIndex64(#a[0], 8)); print("\n");
+    print("countInt64(4): "); print(countInt64(#a[0], 8, 4i64)); print("\n");
+    print("medianValue64: "); print(medianValue64(#a[0], 8)); print("\n");
+
+    int64 mm[4] = {0, 0, 0, 0};
+    print("minMax64 rc: "); print(minMax64(#mm[0], 4, #a[0], 8));
+    print(" -> "); print(@(#mm[0]+0)); print(" "); print(@(#mm[0]+1)); print("\n");
+
+    int64 A[3] = {1, 5, 9};
+    int64 B[3] = {5, 6, 9};
+    int64 D[8] = {0,0,0,0,0,0,0,0};
+    int n = intersectSorted64(#D[0], 8, #A[0], 3, #B[0], 3);
+    print("intersect64("); print(n); print("): "); for i in 0..n { print(@(#D[0]+i)); print(" "); } print("\n");
+
+    int64 r[5] = {1, 5, 5, 7, 5};
+    print("removeValue64(5): "); print(removeValue64(#r[0], 5, 5i64)); print(" -> "); print(@(#r[0]+0)); print(" "); print(@(#r[0]+1)); print("\n");
+
+    heapSort64(#a[0], 8);   // medianValue64 rearranged it
+    print("percentileSorted64 100: "); print(percentileSorted64(#a[0], 8, 100)); print("\n");
+    print("done\n");
+    eof: pass;
+}

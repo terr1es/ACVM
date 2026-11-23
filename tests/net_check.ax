@@ -1,0 +1,386 @@
+//  net_check.ax — TCP over the loopback interface.
+//
+//  Every case here uses a listener on port 0, so the OS picks a free port and the
+//  test cannot fail because something else holds one. That is the only way to make
+//  a network test repeatable on a machine that is doing other things.
+//
+//  ── why this can run in one thread ────────────────────────────────────────
+//
+//  A TCP handshake completes in the kernel: `connect` returns once the SYN/ACK has
+//  been exchanged, and the connection then waits in the listener's accept queue
+//  until `accept` picks it up. So listen → connect → accept works in one function
+//  with no concurrency, and that is what `openPair` does.
+//
+//  What this does **not** prove is that a blocking call lets other `process`
+//  bodies run: it does not, and no arrangement of these tests could show
+//  otherwise. See stdlib/net.ax on the blocking model -- a server that must
+//  serve two clients at once needs two OS processes, not two `process` blocks.
+//
+//  ── what is deliberately not tested here ──────────────────────────────────
+//
+//  `fetchAll` / `exchangeInto` open a connection and read until the peer closes,
+//  so the server end has to answer *while* the client is blocked inside the call.
+//  One thread cannot do that, and a `process` cannot either (the blocked C call
+//  never returns to the scheduler). They are exercised by
+//  `examples/net_echo.ax`, which is run as two processes by hand.
+//
+//  Run:  acvm run tests/net_check.ax
+
+function import (return:(test));
+function import (return:(net));
+
+//  The pair under test, held in globals so the helpers can hand back three
+//  handles without a tuple type.
+global int64 gListener = -1;
+global int64 gClient = -1;
+global int64 gServer = -1;
+
+//  Establishes a connected pair. Returns false when the loopback is unusable,
+//  which is worth distinguishing from a bug in the code under test: a machine with
+//  no networking at all should say so, not fail twelve checks.
+function openPair():bool {
+    gListener = tcpListen(0, 4);
+    if (gListener < 0) {
+        return false;
+    }
+    int port = tcpLocalPort(gListener) as int;
+    if (port <= 0) {
+        tcpClose(gListener);
+        gListener = -1;
+        return false;
+    }
+    gClient = tcpConnect("127.0.0.1", port, 2000);
+    if (gClient < 0) {
+        tcpClose(gListener);
+        gListener = -1;
+        return false;
+    }
+    gServer = tcpAccept(gListener, 2000);
+    if (gServer < 0) {
+        tcpClose(gClient);
+        tcpClose(gListener);
+        gClient = -1;
+        gListener = -1;
+        return false;
+    }
+    return true;
+}
+
+//  Closes all three, in the order that matters least for correctness but most for
+//  readability. Guarded so a half-built pair is still safe to tear down.
+function closePair():void {
+    if (gServer >= 0) {
+        tcpClose(gServer);
+        gServer = -1;
+    }
+    if (gClient >= 0) {
+        tcpClose(gClient);
+        gClient = -1;
+    }
+    if (gListener >= 0) {
+        tcpClose(gListener);
+        gListener = -1;
+    }
+    eof: pass;
+}
+
+//===--- availability ------------------------------------------------------===//
+
+function checkAvailability():void {
+    testGroup("available");
+    check(netReady(), "net.dll loaded");
+    // Nothing has failed yet on this thread, so there is no description to give.
+    // A fresh thread reporting "timed out" would be a lie, and it was one before
+    // the sentinel changed from 0 to -1.
+    checkString(netErrorString(), "", "no failure has no error text");
+}
+
+//===--- listener ----------------------------------------------------------===//
+
+function checkListener():void {
+    testGroup("listen");
+
+    int64 listener = tcpListen(0, 8);
+    check(listener >= 0, "listen on port 0 succeeds");
+
+    int port = tcpLocalPort(listener) as int;
+    check(port > 0, "a port was assigned");
+    check(port < 65536, "the port is in range");
+
+    // Serving from the wildcard address means a client on another machine can
+    // reach it; a check that only passed for 127.0.0.1 would hide that.
+    int64 second = tcpListen(0, 8);
+    check(second >= 0, "a second listener can be opened at the same time");
+    check(tcpLocalPort(second) as int != port, "two listeners get different ports");
+    tcpClose(second);
+    tcpClose(listener);
+}
+
+//===--- connect and accept ------------------------------------------------===//
+
+function checkConnect():void {
+    testGroup("connect");
+
+    if (!openPair()) {
+        check(false, "loopback is usable (could not establish a pair)");
+        return;
+    }
+    check(gClient >= 0, "connect returns a handle");
+    check(gServer >= 0, "accept returns a handle");
+    check(gServer != gClient, "the two ends are distinct handles");
+    // The client's *local* port is the ephemeral one it was given, so it must not
+    // be the listening port. (The remote port is not exposed -- `tcpLocalPort` is
+    // about the binding, not the peer.)
+    check(tcpLocalPort(gClient) as int != tcpLocalPort(gListener) as int,
+          "the client is bound to a different port than the listener");
+    closePair();
+}
+
+//===--- transfer ----------------------------------------------------------===//
+
+function checkEcho():void {
+    testGroup("echo");
+
+    if (!openPair()) {
+        check(false, "loopback is usable (could not establish a pair)");
+        return;
+    }
+
+    checkInt(tcpSend(gClient, "ping"), 4, "send reports every byte");
+    unsigned int8[64] buffer;
+    int n = tcpRecv(gServer, #buffer[0], 64);
+    checkInt(n, 4, "recv returns the byte count");
+    checkString(makeString(#buffer[0] as ptr char, n), "ping", "the bytes arrive unchanged");
+
+    // And back the other way: a connection is bidirectional, and a test that only
+    // ever sends one direction would not notice a swapped handle.
+    checkInt(tcpSend(gServer, "pong!"), 5, "the server can send too");
+    int m = tcpRecv(gClient, #buffer[0], 64);
+    checkString(makeString(#buffer[0] as ptr char, m), "pong!", "the reply arrives at the client");
+
+    closePair();
+}
+
+function checkMultipleMessages():void {
+    testGroup("messages");
+
+    if (!openPair()) {
+        check(false, "loopback is usable (could not establish a pair)");
+        return;
+    }
+
+    // Three round trips on one connection: a protocol that opens a connection per
+    // message would pass a single-message test and fail this one.
+    unsigned int8[64] buffer;
+    bool allOk = true;
+    for (int i = 0; i < 3; i++) {
+        string word = "msg" + itoa(i, 10);
+        if (tcpSend(gClient, word) != 4) {
+            allOk = false;
+        }
+        int n = tcpRecv(gServer, #buffer[0], 64);
+        if (makeString(#buffer[0] as ptr char, n) != word) {
+            allOk = false;
+        }
+    }
+    check(allOk, "three messages cross the same connection in order");
+    closePair();
+}
+
+function checkLargeTransfer():void {
+    testGroup("bulk");
+
+    if (!openPair()) {
+        check(false, "loopback is usable (could not establish a pair)");
+        return;
+    }
+
+    // 256 KB. Large enough that `send` must loop (the socket buffer is far
+    // smaller) and that the receiving side needs many `recv` calls, small enough
+    // that the loopback's kernel buffering is not what makes it pass.
+    int size = 262144;
+
+    // One byte per element: the allocation, the count and the offsets are all in
+    // the same unit.
+    ptr unsigned int8 payload = alloc(size) as ptr unsigned int8;
+    if (payload == 0 as ptr unsigned int8) {
+        check(false, "allocated the payload");
+        closePair();
+        return;
+    }
+    for (int i = 0; i < size; i++) {
+        payload[i] = (65 + (i % 26)) as unsigned int8;
+    }
+
+    string body = makeString(payload as ptr char, size);
+    int sent = tcpSend(gClient, body);
+    checkInt(sent, size, "send reports the whole payload");
+
+    // Tell the server end that nothing more is coming, so its read loop stops on
+    // a clean close instead of waiting for a byte that will never arrive.
+    tcpShutdownWrite(gClient);
+
+    ptr unsigned int8 chunk = alloc(size) as ptr unsigned int8;
+    int total = 0;
+    int rounds = 0;
+    while (true) {
+        // Advance by `total`: every round writes further into the buffer, or the
+        // first chunk would be overwritten each time and the totals would still
+        // look right.
+        int n = tcpRecv(gServer, chunk + total, size - total);
+        if (n <= 0) {
+            break;
+        }
+        total = total + n;
+        rounds = rounds + 1;
+    }
+    checkInt(total, size, "every byte arrived");
+    check(rounds > 1, "the read spanned more than one recv");
+
+    // Spot-check the pattern at both ends: a total of the right size says nothing
+    // about whether the bytes are the right bytes.
+    checkInt(chunk[0] as int, 65, "the first byte is intact");
+    checkInt(chunk[size - 1] as int, 65 + ((size - 1) % 26), "the last byte is intact");
+
+    free(chunk as ptr void);
+    free(payload as ptr void);
+    closePair();
+}
+
+//===--- half close and end of stream --------------------------------------===//
+
+function checkHalfClose():void {
+    testGroup("shutdown");
+
+    if (!openPair()) {
+        check(false, "loopback is usable (could not establish a pair)");
+        return;
+    }
+
+    checkInt(tcpSend(gClient, "last words"), 10, "send before the half close");
+    checkInt(tcpShutdownWrite(gClient), 0, "half close succeeds");
+
+    unsigned int8[64] buffer;
+    int n = tcpRecv(gServer, #buffer[0], 64);
+    checkString(makeString(#buffer[0] as ptr char, n), "last words",
+                "data sent before the close arrives");
+
+    // The next read sees end of stream: 0, not -1. That distinction is what lets a
+    // loop tell "the peer is done" from "the connection broke".
+    int after = tcpRecv(gServer, #buffer[0], 64);
+    checkInt(after, 0, "a clean close reads as 0");
+
+    // The other direction must still work: that is what "half" means.
+    check(tcpSend(gServer, "bye") == 3, "the half-closed end can still be written to");
+    int back = tcpRecv(gClient, #buffer[0], 64);
+    checkString(makeString(#buffer[0] as ptr char, back), "bye", "and the client can still read");
+
+    closePair();
+}
+
+//===--- failures ---------------------------------------------------------===//
+
+function checkFailures():void {
+    testGroup("failures");
+
+    // A port that was bound and released. On this machine the connection attempt
+    // ends in a timeout rather than a refusal -- the SYN is dropped, not reset --
+    // so the assertion is on the *shape* of the failure, not on a specific code.
+    // Asserting "connection refused" would make this test pass or fail depending
+    // on the host's firewall.
+    int64 probe = tcpListen(0, 1);
+    int deadPort = tcpLocalPort(probe) as int;
+    tcpClose(probe);
+
+    int64 refused = tcpConnect("127.0.0.1", deadPort, 300);
+    check(refused < 0, "connecting to a dead port fails");
+
+    // A name that cannot resolve. `.invalid` is reserved by RFC 2606, so it never
+    // exists and no DNS server can be blamed for answering.
+    int64 badHost = tcpConnect("no-such-host.invalid", 80, 500);
+    check(badHost < 0, "an unresolvable name fails");
+    check(netLastError() != 0, "an unresolvable name reports a real error code");
+    check(!netTimedOut(), "an unresolvable name is not reported as a timeout");
+
+    // Bad arguments are rejected before any syscall, and must not leave the error
+    // slot claiming a timeout.
+    check(tcpConnect("127.0.0.1", 0, 100) < 0, "port 0 on connect is rejected");
+    check(tcpConnect("127.0.0.1", 70000, 100) < 0, "port 70000 is rejected");
+    check(tcpAccept(-1i64, 10) < 0, "accept on a bad handle fails");
+    check(tcpSend(-1i64, "x") < 0, "send on a bad handle fails");
+    check(tcpClose(-1i64) < 0, "close on a bad handle fails");
+}
+
+function checkAcceptTimeout():void {
+    testGroup("timeout");
+
+    int64 listener = tcpListen(0, 4);
+    check(listener >= 0, "listener for the timeout case");
+
+    // A bounded accept is what lets a server decide to stop. With an unbounded one
+    // the only way out of the loop is for a client to arrive -- which is a real
+    // hang, not a theoretical one.
+    int64 accepted = tcpAccept(listener, 200);
+    check(accepted < 0, "accept times out with no client");
+    check(netTimedOut(), "the timeout is reported as a timeout, not as an error");
+    checkString(netErrorString(), "timed out", "the timeout has a readable description");
+
+    tcpClose(listener);
+}
+
+//===--- peer address -----------------------------------------------------===//
+
+function checkPeerAddress():void {
+    testGroup("peer");
+
+    if (!openPair()) {
+        check(false, "loopback is usable (could not establish a pair)");
+        return;
+    }
+    // Numeric, no reverse lookup: the client connected to 127.0.0.1, so that is
+    // what the server must see.
+    checkString(peerAddress(gServer), "127.0.0.1", "the server sees the client's address");
+    checkString(peerAddress(gClient), "127.0.0.1", "the client sees the server's address");
+    closePair();
+}
+
+//===--- handles are not leaked --------------------------------------------===//
+
+function checkRepeatedPairs():void {
+    testGroup("leaks");
+
+    // Fifty connect/accept/close cycles. A missing close would show up as a
+    // failure long before fifty on most systems, and on the ones where it would
+    // not, this at least proves the close path runs.
+    int established = 0;
+    for (int i = 0; i < 50; i++) {
+        if (openPair()) {
+            closePair();
+            established = established + 1;
+        }
+    }
+    checkInt(established, 50, "fifty sequential pairs all established and closed");
+}
+
+//===--- main -------------------------------------------------------------===//
+
+function main():void {
+    if (!netReady()) {
+        print("net.dll is not available; skipping\n");
+        return;
+    }
+
+    checkAvailability();
+    checkListener();
+    checkConnect();
+    checkEcho();
+    checkMultipleMessages();
+    checkLargeTransfer();
+    checkHalfClose();
+    checkFailures();
+    checkAcceptTimeout();
+    checkPeerAddress();
+    checkRepeatedPairs();
+    testFinish();
+    eof: pass;
+}

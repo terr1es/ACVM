@@ -1,0 +1,425 @@
+//  astl_check.ax — checks for the four ASTL containers.
+//
+//  Each container is exercised on three things: the normal path, the
+//  deduplicate/overwrite semantics, and the borrowed-buffer-upgrades-to-heap
+//  path, which is the easy one to get wrong (`owned` flips from false to true,
+//  and after that free releases a different object).
+//
+//  One group is dedicated to string hashing, because that is the only place in
+//  the library that digs a byte pointer out of the descriptor, and it hides a
+//  sign-extension trap that only fires when the address is above 0x80000000.
+//
+//  Run:  acvm run tests/astl_check.ax
+
+function import (return:(vec));
+function import (return:(set));
+function import (return:(map));
+function import (return:(hash));
+function import (return:(strbyte));
+
+// ─── vector ────────────────────────────────────────────────────────────────
+
+function private checkVec():void {
+    int store[4] = {0};
+    Vec v = makeVec(#store[0], 4);
+    for (int i = 0; i < 3; i++) {
+        vecPushInt(#v, i * 10);
+    }
+    print("vec borrowed: count="); print(v.count);
+    print(" cap="); print(v.capacity);
+    print(" owned="); print(v.owned);
+    print(" [");
+    for (int i = 0; i < v.count; i++) {
+        print(vecGetInt(#v, i)); print(" ");
+    }
+    print("]\n");
+
+    // past the borrowed capacity: grows onto the heap, data kept, stack intact
+    vecPushInt(#v, 30);
+    vecPushInt(#v, 40);
+    print("vec grown: count="); print(v.count);
+    print(" cap="); print(v.capacity);
+    print(" owned="); print(v.owned);
+    print(" stack[0]="); print(store[0]);
+    print(" [");
+    for (int i = 0; i < v.count; i++) {
+        print(vecGetInt(#v, i)); print(" ");
+    }
+    print("]\n");
+
+    // insert / remove / pop
+    int probe = 99;
+    vecInsert(#v, 1, #probe as ptr char);
+    print("vec after insert: [");
+    for (int i = 0; i < v.count; i++) {
+        print(vecGetInt(#v, i)); print(" ");
+    }
+    print("]\n");
+    vecRemove(#v, 0);
+    int last = 0;
+    vecPop(#v, #last as ptr char);
+    print("vec after remove+pop: last="); print(last); print(" [");
+    for (int i = 0; i < v.count; i++) {
+        print(vecGetInt(#v, i)); print(" ");
+    }
+    print("]\n");
+
+    // out of range
+    print("vec out of range: at="); print(vecAt(#v, 99) as int64);
+    print(" get="); print(vecGetInt(#v, 99));
+    // Pop on a genuinely empty vector, not on the four elements still in `v`.
+    Vec drained = makeVecHeap(2, sizeof(int));
+    print(" popEmpty="); print(vecPop(#drained, 0 as ptr char));
+    print("\n");
+    vecFree(#drained);
+
+    vecFree(#v);
+    print("vec freed: data="); print(v.data as int64);
+    print(" count="); print(v.count);
+    print(" owned="); print(v.owned);
+    print("\n");
+
+    // arbitrary element type: a struct
+    Vec pv = makeVecHeap(4, 2 * sizeof(int));
+    int first = 11;
+    int second = 22;
+    vecPush(#pv, #first as ptr char);
+    vecPush(#pv, #second as ptr char);
+    print("vec of struct: elem="); print(pv.elemSize);
+    print(" count="); print(pv.count);
+    print(" [0]="); print(@(vecAt(#pv, 0) as ptr int));
+    print(" [1]="); print(@(vecAt(#pv, 1) as ptr int));
+    print("\n");
+    vecFree(#pv);
+    eof: pass;
+}
+
+// ─── set ───────────────────────────────────────────────────────────────────
+
+function private checkSetInt():void {
+    int store[4] = {0};
+    SetInt s = makeSetInt(#store[0], 4);
+    int values[6] = {42, 7, 91, 7, 13, 42};
+    for (int i = 0; i < 6; i++) {
+        setIntAdd(#s, @(#values[0] + i));
+    }
+    print("SetInt count="); print(setIntCount(#s));
+    print(" sorted [");
+    for (int i = 0; i < setIntCount(#s); i++) {
+        print(setIntAt(#s, i)); print(" ");
+    }
+    print("]\n");
+
+    print("SetInt contains 42/99: ");
+    print(setIntContains(#s, 42)); print(" "); print(setIntContains(#s, 99)); print("\n");
+
+    print("SetInt remove 7 (twice): ");
+    print(setIntRemove(#s, 7)); print(" "); print(setIntRemove(#s, 7));
+    print(" count="); print(setIntCount(#s)); print("\n");
+
+    // still ordered and complete after growing
+    for (int i = 0; i < 40; i++) {
+        setIntAdd(#s, (i * 7) % 40);
+    }
+    int ordered = 1;
+    for (int i = 1; i < setIntCount(#s); i++) {
+        if (setIntAt(#s, i - 1) >= setIntAt(#s, i)) {
+            ordered = 0;
+        }
+    }
+    print("SetInt grown count="); print(setIntCount(#s));
+    print(" owned="); print(s.items.owned);
+    print(" strictly ordered="); print(ordered);
+    print(" min="); print(setIntAt(#s, 0));
+    print("\n");
+
+    // empty set
+    int tiny[2] = {0};
+    SetInt empty = makeSetInt(#tiny[0], 2);
+    print("SetInt empty: count="); print(setIntCount(#empty));
+    print(" contains="); print(setIntContains(#empty, 1));
+    print(" remove="); print(setIntRemove(#empty, 1));
+    print("\n");
+    setIntFree(#s);
+    eof: pass;
+}
+
+function private checkSetWide():void {
+    int64 store[3];
+    SetInt64 s = makeSetInt64(#store[0], 3);
+    setInt64Add(#s, 9000000000i64);
+    setInt64Add(#s, 5i64);
+    setInt64Add(#s, -3000000000i64);
+    print("SetInt64 sorted [");
+    for (int i = 0; i < setInt64Count(#s); i++) {
+        print(setInt64At(#s, i)); print(" ");
+    }
+    print("] contains 9e9="); print(setInt64Contains(#s, 9000000000i64));
+    print(" contains 6="); print(setInt64Contains(#s, 6i64));
+    print("\n");
+    setInt64Free(#s);
+
+    string store2[4];
+    SetStr ss = makeSetStr(#store2[0], 4);
+    setStrAdd(#ss, "banana");
+    setStrAdd(#ss, "apple");
+    setStrAdd(#ss, "cherry");
+    setStrAdd(#ss, "apple");
+    print("SetStr count="); print(setStrCount(#ss));
+    print(" sorted [");
+    for (int i = 0; i < setStrCount(#ss); i++) {
+        print(setStrAt(#ss, i)); print(" ");
+    }
+    print("]\n");
+    print("SetStr contains apple/date: ");
+    print(setStrContains(#ss, "apple")); print(" "); print(setStrContains(#ss, "date"));
+    print(" remove banana="); print(setStrRemove(#ss, "banana"));
+    print(" count="); print(setStrCount(#ss)); print("\n");
+    setStrFree(#ss);
+    eof: pass;
+}
+
+// ─── map ───────────────────────────────────────────────────────────────────
+
+function private checkMapInt():void {
+    int keys[4] = {0};
+    int values[4] = {0};
+    MapIntInt m = makeMapIntInt(#keys[0], #values[0], 4);
+    mapIntPut(#m, 42, 100);
+    mapIntPut(#m, 7, 200);
+    mapIntPut(#m, 91, 300);
+    mapIntPut(#m, 42, 999);
+    print("MapInt count="); print(mapIntCount(#m));
+    print(" sorted [");
+    for (int i = 0; i < mapIntCount(#m); i++) {
+        print(mapIntKeyAt(#m, i)); print("="); print(mapIntValueAt(#m, i)); print(" ");
+    }
+    print("]\n");
+
+    int found = 0;
+    print("MapInt get 42="); print(mapIntGet(#m, 42, #found)); print(" -> "); print(found);
+    print(" get 999="); print(mapIntGet(#m, 999, #found));
+    print(" has 7="); print(mapIntHas(#m, 7));
+    print("\n");
+
+    print("MapInt remove 7 (twice): ");
+    print(mapIntRemove(#m, 7)); print(" "); print(mapIntRemove(#m, 7));
+    print(" count="); print(mapIntCount(#m)); print("\n");
+
+    // both columns must grow together
+    for (int i = 0; i < 30; i++) {
+        mapIntPut(#m, i * 3, i);
+    }
+    print("MapInt grown count="); print(mapIntCount(#m));
+    print(" keyCap="); print(m.keys.capacity);
+    print(" valCap="); print(m.values.capacity);
+    print(" aligned="); print(m.keys.capacity == m.values.capacity);
+    print("\n");
+
+    int probe = 0;
+    int wrong = 0;
+    for (int i = 0; i < 30; i++) {
+        if (!mapIntGet(#m, i * 3, #probe) || probe != i) {
+            wrong = wrong + 1;
+        }
+    }
+    print("MapInt wrong lookups="); print(wrong); print(" (expected 0)\n");
+    mapIntIntFree(#m);
+    eof: pass;
+}
+
+function private checkMapStr():void {
+    string keys[4];
+    int values[4] = {0};
+    MapStrInt m = makeMapStrInt(#keys[0], #values[0], 4);
+    mapStrPut(#m, "banana", 2);
+    mapStrPut(#m, "apple", 1);
+    mapStrPut(#m, "cherry", 3);
+    mapStrPut(#m, "apple", 11);
+    print("MapStr count="); print(mapStrCount(#m));
+    print(" sorted [");
+    for (int i = 0; i < mapStrCount(#m); i++) {
+        print(mapStrKeyAt(#m, i)); print("="); print(mapStrValueAt(#m, i)); print(" ");
+    }
+    print("]\n");
+
+    int found = 0;
+    print("MapStr get apple="); print(mapStrGet(#m, "apple", #found)); print(" -> "); print(found);
+    print(" has date="); print(mapStrHas(#m, "date")); print("\n");
+
+    for (int i = 0; i < 12; i++) {
+        mapStrPut(#m, "key" + itoa(i, 10), i);
+    }
+    int probe = 0;
+    int wrong = 0;
+    for (int i = 0; i < 12; i++) {
+        if (!mapStrGet(#m, "key" + itoa(i, 10), #probe) || probe != i) {
+            wrong = wrong + 1;
+        }
+    }
+    print("MapStr grown count="); print(mapStrCount(#m));
+    print(" wrong="); print(wrong);
+    print(" aligned="); print(m.keys.capacity == m.values.capacity);
+    print("\n");
+    mapStrIntFree(#m);
+    eof: pass;
+}
+
+// ─── hash ──────────────────────────────────────────────────────────────────
+
+function private checkHashInt():void {
+    HashSetInt s = makeHashSetInt(8);
+    for (int i = 0; i < 5; i++) {
+        hashSetIntAdd(#s, i * 11);
+    }
+    hashSetIntAdd(#s, 11);
+    print("HashSetInt count="); print(hashSetIntCount(#s));
+    print(" has 33/34: "); print(hashSetIntContains(#s, 33));
+    print(" "); print(hashSetIntContains(#s, 34)); print("\n");
+
+    print("HashSetInt remove 22: "); print(hashSetIntRemove(#s, 22));
+    print(" has 22="); print(hashSetIntContains(#s, 22));
+    print(" count="); print(hashSetIntCount(#s)); print("\n");
+
+    // bulk insert, then look each one up: covers growth and tombstone paths
+    for (int i = 0; i < 300; i++) {
+        hashSetIntAdd(#s, i);
+    }
+    int missing = 0;
+    for (int i = 0; i < 300; i++) {
+        if (!hashSetIntContains(#s, i)) {
+            missing = missing + 1;
+        }
+    }
+    print("HashSetInt bulk count="); print(hashSetIntCount(#s));
+    print(" missing="); print(missing);
+    print(" slots="); print(s.table.states.count);
+    print("\n");
+
+    // remove half, then look up the other half: a tombstone must not cut a probe
+    // chain short
+    for (int i = 0; i < 300; i = i + 2) {
+        hashSetIntRemove(#s, i);
+    }
+    int stillThere = 0;
+    for (int i = 1; i < 300; i = i + 2) {
+        if (hashSetIntContains(#s, i)) {
+            stillThere = stillThere + 1;
+        }
+    }
+    print("HashSetInt after mass remove: odd survivors="); print(stillThere);
+    print(" (expected 150) count="); print(hashSetIntCount(#s)); print("\n");
+    hashSetIntFree(#s);
+
+    HashSetInt64 w = makeHashSetInt64(8);
+    hashSetInt64Add(#w, 9000000000i64);
+    hashSetInt64Add(#w, 5i64);
+    print("HashSetInt64 count="); print(hashSetInt64Count(#w));
+    print(" has 9e9="); print(hashSetInt64Contains(#w, 9000000000i64));
+    print(" has 6="); print(hashSetInt64Contains(#w, 6i64));
+    print("\n");
+    hashSetInt64Free(#w);
+
+    HashMapInt m = makeHashMapInt(8);
+    hashMapIntPut(#m, 1, 100);
+    hashMapIntPut(#m, 2, 200);
+    hashMapIntPut(#m, 1, 111);
+    int value = 0;
+    print("HashMapInt count="); print(hashMapIntCount(#m));
+    print(" get1="); print(hashMapIntGet(#m, 1, #value)); print("->"); print(value);
+    print(" has3="); print(hashMapIntHas(#m, 3));
+    print(" remove1="); print(hashMapIntRemove(#m, 1));
+    print(" has1="); print(hashMapIntHas(#m, 1));
+    print("\n");
+    hashMapIntFree(#m);
+    eof: pass;
+}
+
+function private checkHashStr():void {
+    //  This group is the regression test for the sign-extension trap: a string
+    //  produced by concatenation lands in the arena above 0x80000000, so reading
+    //  the pointer out of the descriptor as int32 hashes garbage, and a key that
+    //  was definitely inserted cannot be found.
+    HashSetStr s = makeHashSetStr(8);
+    hashSetStrAdd(#s, "apple");
+    hashSetStrAdd(#s, "banana");
+    hashSetStrAdd(#s, "apple");
+    print("HashSetStr count="); print(hashSetStrCount(#s));
+    print(" has apple/date: "); print(hashSetStrContains(#s, "apple"));
+    print(" "); print(hashSetStrContains(#s, "date")); print("\n");
+
+    string built = "ban" + "ana";
+    print("HashSetStr built key matches="); print(hashSetStrContains(#s, built));
+    print(" (expected true)\n");
+
+    print("HashSetStr remove apple="); print(hashSetStrRemove(#s, "apple"));
+    print(" has apple="); print(hashSetStrContains(#s, "apple"));
+    print(" count="); print(hashSetStrCount(#s)); print("\n");
+
+    for (int i = 0; i < 120; i++) {
+        hashSetStrAdd(#s, "key" + itoa(i, 10));
+    }
+    int missing = 0;
+    for (int i = 0; i < 120; i++) {
+        if (!hashSetStrContains(#s, "key" + itoa(i, 10))) {
+            missing = missing + 1;
+        }
+    }
+    print("HashSetStr bulk count="); print(hashSetStrCount(#s));
+    print(" missing="); print(missing);
+    print(" slots="); print(s.table.states.count);
+    print("\n");
+    hashSetStrFree(#s);
+
+    HashMapStr m = makeHashMapStr(8);
+    hashMapStrPut(#m, "one", 1);
+    hashMapStrPut(#m, "two", 2);
+    hashMapStrPut(#m, "one", 11);
+    int value = 0;
+    print("HashMapStr get one="); print(hashMapStrGet(#m, "one", #value)); print("->"); print(value);
+    print(" has three="); print(hashMapStrHas(#m, "three"));
+    print(" count="); print(hashMapStrCount(#m));
+    print("\n");
+    hashMapStrFree(#m);
+    eof: pass;
+}
+
+// ─── string bytes ──────────────────────────────────────────────────────────
+
+function private checkStrByte():void {
+    print("strbyte bytes: ");
+    print(strByteAt("ABC", 0)); print(" ");
+    print(strByteAt("ABC", 1)); print(" ");
+    print(strByteAt("ABC", 2)); print(" ");
+    print("oob="); print(strByteAt("ABC", 9)); print("\n");
+
+    print("strbyte compare: apple<banana=");
+    print(strCompare("apple", "banana") < 0);
+    print(" same="); print(strCompare("x", "x") == 0);
+    print(" ab<abc="); print(strCompare("ab", "abc") < 0);
+    //  the key regression: builtin '<' is unreliable on strings, so strCompare
+    //  must provide a definite order
+    print(" zzz>aaa="); print(strCompare("zzz", "aaa") > 0);
+    print("\n");
+
+    print("strbyte hash: same="); print(strHashOf("hello") == strHashOf("hello"));
+    print(" diff="); print(strHashOf("hello") != strHashOf("hellp"));
+    string built = "he" + "llo";
+    print(" built==literal="); print(strHashOf(built) == strHashOf("hello"));
+    print(" empty ok="); print(strHashOf("") == strHashOf(""));
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    checkVec();
+    checkSetInt();
+    checkSetWide();
+    checkMapInt();
+    checkMapStr();
+    checkHashInt();
+    checkHashStr();
+    checkStrByte();
+    print("done\n");
+    eof: pass;
+}

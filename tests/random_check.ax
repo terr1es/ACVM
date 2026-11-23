@@ -1,0 +1,39 @@
+//  random_check.ax — the random library.
+//
+//  Two things are being checked, and the second is the reason this file exists:
+//  that each function behaves as documented, and that the C and Axiom
+//  implementations produce the *same* sequence. A seed that reproduces a shuffle
+//  on one machine has to reproduce it everywhere, so a divergence here is a bug
+//  even if both sequences look random.
+//
+//  Run it with the library and without it; the output must be identical.
+
+function import (return:(random));
+
+function main():void {
+    unsigned int seed[1] = {12345u32};
+    print("randNext: ");
+    for (int i = 0; i < 5; i++) { print(randNext(#seed[0], seed.length)); print(" "); }
+    print("\n");
+
+    unsigned int s2[1] = {12345u32};
+    print("randBelow(10): ");
+    for (int i = 0; i < 10; i++) { print(randBelow(#s2[0], s2.length, 10)); print(" "); }
+    print("\n");
+
+    unsigned int s3[1] = {99u32};
+    print("randRange(5,10): ");
+    for (int i = 0; i < 8; i++) { print(randRange(#s3[0], s3.length, 5, 10)); print(" "); }
+    print("\n");
+
+    int deck[8] = {1,2,3,4,5,6,7,8};
+    unsigned int s4[1] = {7u32};
+    shuffle(#deck[0], 8, #s4[0], s4.length);
+    print("shuffled: "); for i in 0..8 { print(@(#deck[0]+i)); print(" "); } print("\n");
+
+    int h[5] = {1,2,3,4,5};
+    print("hashInts: "); print(hashInts(#h[0], 5)); print("\n");
+    print("hashInts empty: "); print(hashInts(0 as ptr int, 0)); print("\n");
+    print("done\n");
+    eof: pass;
+}

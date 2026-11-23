@@ -1,0 +1,17 @@
+//  T is inferred as a struct, and structs do not support '+' -> the error must
+//  point at the line of the template that uses the operator, and the diagnostic
+//  must name the substituted concrete type, otherwise the author cannot tell
+//  which instantiation failed.
+struct Point { int x; int y; };
+
+function sumOf<T>(T a, T b):T {
+    return a + b;
+}
+
+function main():void {
+    Point p = {1, 2};
+    Point q = {3, 4};
+    Point r = sumOf(p, q);
+    print(r.x);
+    eof: pass;
+}

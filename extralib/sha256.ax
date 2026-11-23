@@ -1,0 +1,304 @@
+//  sha256.ax -- SHA-256 and CRC-32.
+//
+//      function import (return:(sha256));
+//
+//      string digest = sha256Hex("hello");
+//      // 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+//
+//      unsigned int crc = crc32("123456789");
+//      // 0xCBF43926
+//
+//  ── why these two share a file ───────────────────────────────────────────
+//
+//  CRC-32 is part of gzip (used by `inflate.ax`) and a usual file checksum; SHA-256 is
+//  the usual tool for download checks, ETags and content addressing. Both map bytes to a
+//  fixed-size value with no failure path, so one file brings no second error convention.
+//
+//  ── this is not `hash.ax` ────────────────────────────────────────────────
+//
+//  `stdlib/hash.ax` is a **hash table** (`HashTableInt` / `HashMapStr`), and its
+//  `strHashOf` is for buckets with no collision resistance at all. Similar name, different job.
+//
+//  ── implementation notes ─────────────────────────────────────────────────
+//
+//  SHA-256 follows FIPS 180-4: 64 rounds, constants written out (`K` is the top 32 bits
+//  of each prime cube root's fraction); 8 state words, 64-word message schedule.
+//
+//  Axiom's `unsigned int` wraps at 32 bits (README: "unsigned wraps"), so a plain `+`
+//  is mod 2^32 -- exactly what SHA-256 wants, no extra masking. Shifts are logical
+//  (unsigned type), matching the spec's `>>>`.
+//
+//  Speed is not the goal: this is for checking a downloaded file, not cryptographic
+//  workloads. A 4 MB file takes a few hundred milliseconds in the interpreter -- enough.
+
+//  depends: (none)
+
+module "sha256" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(strbyte));
+function import (return:(io));
+
+//===--- SHA-256 ---------------------------------------------------------===//
+
+//  Round constants: first 32 bits of the fractional parts of the cube roots of the
+//  first 64 primes.
+global unsigned int ShaK[64] = {
+    0x428a2f98u32, 0x71374491u32, 0xb5c0fbcfu32, 0xe9b5dba5u32, 0x3956c25bu32, 0x59f111f1u32,
+    0x923f82a4u32, 0xab1c5ed5u32, 0xd807aa98u32, 0x12835b01u32, 0x243185beu32, 0x550c7dc3u32,
+    0x72be5d74u32, 0x80deb1feu32, 0x9bdc06a7u32, 0xc19bf174u32, 0xe49b69c1u32, 0xefbe4786u32,
+    0x0fc19dc6u32, 0x240ca1ccu32, 0x2de92c6fu32, 0x4a7484aau32, 0x5cb0a9dcu32, 0x76f988dau32,
+    0x983e5152u32, 0xa831c66du32, 0xb00327c8u32, 0xbf597fc7u32, 0xc6e00bf3u32, 0xd5a79147u32,
+    0x06ca6351u32, 0x14292967u32, 0x27b70a85u32, 0x2e1b2138u32, 0x4d2c6dfcu32, 0x53380d13u32,
+    0x650a7354u32, 0x766a0abbu32, 0x81c2c92eu32, 0x92722c85u32, 0xa2bfe8a1u32, 0xa81a664bu32,
+    0xc24b8b70u32, 0xc76c51a3u32, 0xd192e819u32, 0xd6990624u32, 0xf40e3585u32, 0x106aa070u32,
+    0x19a4c116u32, 0x1e376c08u32, 0x2748774cu32, 0x34b0bcb5u32, 0x391c0cb3u32, 0x4ed8aa4au32,
+    0x5b9cca4fu32, 0x682e6ff3u32, 0x748f82eeu32, 0x78a5636fu32, 0x84c87814u32, 0x8cc70208u32,
+    0x90befffau32, 0xa4506cebu32, 0xbef9a3f7u32, 0xc67178f2u32
+};
+
+function private shaRor(unsigned int x, int n):unsigned int {
+    return (x >> n) | (x << (32 - n));
+    eof: pass;
+}
+
+//  One 64-byte block, folding into `state` (8 words).
+function private shaBlock(ptr unsigned int state, ptr unsigned int8 block):void {
+    unsigned int w[64] = {};
+    int i = 0;
+    while (i < 16) {
+        int base = i * 4;
+        unsigned int word = (@(block + base) as unsigned int) << 24;
+        word = word | ((@(block + base + 1) as unsigned int) << 16);
+        word = word | ((@(block + base + 2) as unsigned int) << 8);
+        word = word | (@(block + base + 3) as unsigned int);
+        w[i] = word;
+        i = i + 1;
+    }
+    while (i < 64) {
+        unsigned int s0 = shaRor(w[i - 15], 7) ^ shaRor(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        unsigned int s1 = shaRor(w[i - 2], 17) ^ shaRor(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        i = i + 1;
+    }
+
+    unsigned int a = state[0];
+    unsigned int b = state[1];
+    unsigned int c = state[2];
+    unsigned int d = state[3];
+    unsigned int e = state[4];
+    unsigned int f = state[5];
+    unsigned int g = state[6];
+    unsigned int h = state[7];
+
+    i = 0;
+    while (i < 64) {
+        unsigned int s1 = shaRor(e, 6) ^ shaRor(e, 11) ^ shaRor(e, 25);
+        unsigned int ch = (e & f) ^ ((~e) & g);
+        unsigned int t1 = h + s1 + ch + ShaK[i] + w[i];
+        unsigned int s0 = shaRor(a, 2) ^ shaRor(a, 13) ^ shaRor(a, 22);
+        unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
+        unsigned int t2 = s0 + maj;
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+        i = i + 1;
+    }
+
+    state[0] = state[0] + a;
+    state[1] = state[1] + b;
+    state[2] = state[2] + c;
+    state[3] = state[3] + d;
+    state[4] = state[4] + e;
+    state[5] = state[5] + f;
+    state[6] = state[6] + g;
+    state[7] = state[7] + h;
+    eof: pass;
+}
+
+//  Writes the 32-byte digest of `length` bytes at `bytes` into `out`.
+function sha256(ptr unsigned int8 bytes, int length, ptr unsigned int8 out):void {
+    unsigned int state[8] = {
+        0x6a09e667u32, 0xbb67ae85u32, 0x3c6ef372u32, 0xa54ff53au32,
+        0x510e527fu32, 0x9b05688cu32, 0x1f83d9abu32, 0x5be0cd19u32
+    };
+
+    int full = length - (length % 64);
+    int i = 0;
+    while (i < full) {
+        shaBlock(#state[0], bytes + i);
+        i = i + 64;
+    }
+
+    // Tail: the remaining bytes, a 0x80 marker, zero padding, and the bit length
+    // as a 64-bit big-endian integer. Two blocks when the tail does not fit.
+    int rest = length - full;
+    unsigned int8 tail[128] = {};
+    i = 0;
+    while (i < rest) {
+        tail[i] = @(bytes + full + i);
+        i = i + 1;
+    }
+    tail[rest] = 128;
+    int tailLength = 64;
+    if (rest + 9 > 64) {
+        tailLength = 128;
+    }
+
+    // Bit length = byte length * 8. Split into two 32-bit halves so a length above
+    // 2^29 bytes (537 MB) does not overflow the shift.
+    unsigned int highBits = (length as unsigned int) >> 29;
+    unsigned int lowBits = (length as unsigned int) << 3;
+    int at = tailLength - 8;
+    tail[at] = ((highBits >> 24) & 255) as unsigned int8;
+    tail[at + 1] = ((highBits >> 16) & 255) as unsigned int8;
+    tail[at + 2] = ((highBits >> 8) & 255) as unsigned int8;
+    tail[at + 3] = (highBits & 255) as unsigned int8;
+    tail[at + 4] = ((lowBits >> 24) & 255) as unsigned int8;
+    tail[at + 5] = ((lowBits >> 16) & 255) as unsigned int8;
+    tail[at + 6] = ((lowBits >> 8) & 255) as unsigned int8;
+    tail[at + 7] = (lowBits & 255) as unsigned int8;
+
+    shaBlock(#state[0], #tail[0]);
+    if (tailLength == 128) {
+        shaBlock(#state[0], #tail[64]);
+    }
+
+    i = 0;
+    while (i < 8) {
+        unsigned int word = state[i];
+        @(out + i * 4) = ((word >> 24) & 255) as unsigned int8;
+        @(out + i * 4 + 1) = ((word >> 16) & 255) as unsigned int8;
+        @(out + i * 4 + 2) = ((word >> 8) & 255) as unsigned int8;
+        @(out + i * 4 + 3) = (word & 255) as unsigned int8;
+        i = i + 1;
+    }
+    eof: pass;
+}
+
+//===--- hex output ------------------------------------------------------===//
+
+function private shaHex(ptr unsigned int8 bytes, int count):string {
+    string digits = "0123456789abcdef";
+    ptr int8 buffer = alloc(count * 2 + 1) as ptr int8;
+    if (buffer == null) {
+        return "";
+    }
+    int i = 0;
+    while (i < count) {
+        int value = @(bytes + i) as int;
+        @((buffer + i * 2) as ptr unsigned int8) = strByteAt(digits, value >> 4) as unsigned int8;
+        @((buffer + i * 2 + 1) as ptr unsigned int8) = strByteAt(digits, value & 15) as unsigned int8;
+        i = i + 1;
+    }
+    string result = makeString(buffer as ptr char, count * 2);
+    free(buffer as ptr void);
+    return result;
+    eof: pass;
+}
+
+//  Digest of a string as 64 lowercase hex characters. The common case: checking a
+//  string is one call, no buffers.
+function sha256Hex(string text):string {
+    unsigned int8 digest[32] = {};
+    sha256(strBytesOf(text) as ptr unsigned int8, text.length, #digest[0]);
+    return shaHex(#digest[0], 32);
+    eof: pass;
+}
+
+//  Digest of a byte range, for callers that already have a buffer (a file read
+//  through `io`, a network body).
+function sha256HexBytes(ptr unsigned int8 bytes, int length):string {
+    unsigned int8 digest[32] = {};
+    sha256(bytes, length, #digest[0]);
+    return shaHex(#digest[0], 32);
+    eof: pass;
+}
+
+//  Digest of a whole file, read in 64 KB chunks so the size is not bounded by a
+//  single allocation. Returns "" and leaves `*failed` true when the file cannot be
+//  read -- the same "no exception, check the flag" shape as the rest of the
+//  library, minus the Doc (a hash has no arena to write into).
+function sha256File(string path, ptr bool failed):string {
+    @failed = false;
+    int size = fileSize(path);
+    if (size < 0) {
+        @failed = true;
+        return "";
+    }
+    ptr char buffer = alloc(size + 16) as ptr char;
+    if (buffer == null) {
+        @failed = true;
+        return "";
+    }
+    int got = readTextFile(path, buffer, size);
+    if (got < 0) {
+        free(buffer as ptr void);
+        @failed = true;
+        return "";
+    }
+    string result = sha256HexBytes(buffer as ptr unsigned int8, got);
+    free(buffer as ptr void);
+    return result;
+    eof: pass;
+}
+
+//===--- CRC-32 ----------------------------------------------------------===//
+
+//  CRC-32 (the one gzip and PNG use): polynomial 0xEDB88320 reflected, init
+//  0xFFFFFFFF, final XOR 0xFFFFFFFF.
+//
+//  The table is built once on first use into a `global`. Building it costs 256
+//  iterations; computing it per call would dominate a short input, and a
+//  `comptime` table would be 256 literals nobody wants to read.
+global unsigned int Crc32Table[256] = {};
+global bool Crc32Ready = false;
+
+function private crc32Build():void {
+    if (Crc32Ready) {
+        return;
+    }
+    unsigned int i = 0;
+    while (i < 256) {
+        unsigned int value = i;
+        int bit = 0;
+        while (bit < 8) {
+            if ((value & 1) != 0) {
+                value = 0xedb88320u32 ^ (value >> 1);
+            } else {
+                value = value >> 1;
+            }
+            bit = bit + 1;
+        }
+        Crc32Table[i] = value;
+        i = i + 1;
+    }
+    Crc32Ready = true;
+    eof: pass;
+}
+
+function crc32(ptr unsigned int8 bytes, int length):unsigned int {
+    crc32Build();
+    unsigned int crc = 0xffffffffu32;
+    int i = 0;
+    while (i < length) {
+        unsigned int index = (crc ^ (@(bytes + i) as unsigned int)) & 255u32;
+        crc = Crc32Table[index] ^ (crc >> 8);
+        i = i + 1;
+    }
+    return crc ^ 0xffffffffu32;
+    eof: pass;
+}
+
+function crc32Of(string text):unsigned int {
+    return crc32(strBytesOf(text) as ptr unsigned int8, text.length);
+    eof: pass;
+}

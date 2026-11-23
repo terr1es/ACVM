@@ -1,0 +1,296 @@
+//  sync_check.ax -- atomics and synchronisation primitives.
+//
+//  ── architectural constraints (read before editing) ─────────────────────────
+//
+//  An Axiom `process` function **is created and started when the program begins**.
+//  `main` cannot start one, and there is no handle to join. Two rules follow:
+//
+//  1. **Every scenario needs its own process function.** A process function has
+//     exactly one instance; once it finishes it cannot be restarted, so sharing one
+//     between scenarios lets them interfere.
+//  2. **The initial value of any handshake counter must be written at the `global`
+//     declaration**, never assigned in `main`. A worker may already be running
+//     before `main`'s first statement, and the assignment would overwrite its work.
+//
+//  So the shape of this file is: a set of process functions each doing its own
+//  work, and a `main` that waits for each to finish and then checks the result.
+//  The scheduler decides the order, but the scenarios share no state.
+//
+//  Also: **the program ends when `main` returns**; any process still running is
+//  discarded. `main` must therefore reach `eof` only after the last scenario has
+//  been verified.
+
+function import (return:(sync));
+function import (return:(test));
+
+// ─── atomics (single-threaded semantics) ───────────────────────────────────
+
+function private checkAtomics():void {
+    testGroup("atomics");
+
+    int slot[1] = {10};
+
+    checkInt(atomicAdd(#slot[0], 5), 10, "atomicAdd returns old");
+    checkInt(@#slot[0], 15, "atomicAdd applied");
+    checkInt(atomicSub(#slot[0], 3), 15, "atomicSub returns old");
+    checkInt(@#slot[0], 12, "atomicSub applied");
+    checkInt(atomicIncrement(#slot[0]), 13, "atomicIncrement returns new");
+    checkInt(atomicDecrement(#slot[0]), 12, "atomicDecrement returns new");
+
+    checkInt(atomicSwap(#slot[0], 99), 12, "atomicSwap returns old");
+    checkInt(@#slot[0], 99, "atomicSwap applied");
+    checkInt(atomicLoad(#slot[0]), 99, "atomicLoad");
+    atomicStore(#slot[0], 7);
+    checkInt(@#slot[0], 7, "atomicStore");
+
+    check(atomicCompareExchange(#slot[0], 7, 8), "CAS succeeds on match");
+    checkInt(@#slot[0], 8, "CAS wrote");
+    check(!atomicCompareExchange(#slot[0], 7, 9), "CAS fails on mismatch");
+    checkInt(@#slot[0], 8, "CAS left value alone");
+
+    checkInt(atomicMax(#slot[0], 100), 100, "atomicMax raises");
+    checkInt(atomicMax(#slot[0], 50), 100, "atomicMax ignores smaller");
+    checkInt(atomicMin(#slot[0], 3), 3, "atomicMin lowers");
+    checkInt(atomicMin(#slot[0], 50), 3, "atomicMin ignores larger");
+    eof: pass;
+}
+
+// ─── scenario 1: atomics prevent lost updates ──────────────────────────────
+//
+// Control group, deliberately not in this file because it really does produce a
+// wrong value: replacing `atomicAdd` with `shared = shared + 1`, four workers at
+// 250 calls each lands far below 1000, because a safe point can interrupt the
+// read / compute / write sequence. Measured: 2 workers x 100 calls gave 100.
+
+global int gAddShared = 0;
+global int gAddPending = 4;
+
+function process addWorkerA():void {
+    int i = 0;
+    while (i < 250) { atomicAdd(#gAddShared, 1); i = i + 1; }
+    atomicDecrement(#gAddPending);
+    return;
+    eof: pass;
+}
+
+function process addWorkerB():void {
+    int i = 0;
+    while (i < 250) { atomicAdd(#gAddShared, 1); i = i + 1; }
+    atomicDecrement(#gAddPending);
+    return;
+    eof: pass;
+}
+
+function process addWorkerC():void {
+    int i = 0;
+    while (i < 250) { atomicAdd(#gAddShared, 1); i = i + 1; }
+    atomicDecrement(#gAddPending);
+    return;
+    eof: pass;
+}
+
+function process addWorkerD():void {
+    int i = 0;
+    while (i < 250) { atomicAdd(#gAddShared, 1); i = i + 1; }
+    atomicDecrement(#gAddPending);
+    return;
+    eof: pass;
+}
+
+// ─── scenario 2: a mutex protects a critical section that yields ────────────
+//
+// Control group: drop the lock/unlock and the same code yields 100 instead of 200,
+// because the yield inside the section let another process observe a half-done state.
+
+global Mutex gMutex;
+global int gGuarded = 0;
+global int gLockPending = 2;
+
+function process lockedWorkerA():void {
+    int i = 0;
+    while (i < 100) {
+        mutexLock(#gMutex);
+        int snapshot = gGuarded;
+        yield();
+        gGuarded = snapshot + 1;
+        mutexUnlock(#gMutex);
+        i = i + 1;
+    }
+    atomicDecrement(#gLockPending);
+    return;
+    eof: pass;
+}
+
+function process lockedWorkerB():void {
+    int i = 0;
+    while (i < 100) {
+        mutexLock(#gMutex);
+        int snapshot = gGuarded;
+        yield();
+        gGuarded = snapshot + 1;
+        mutexUnlock(#gMutex);
+        i = i + 1;
+    }
+    atomicDecrement(#gLockPending);
+    return;
+    eof: pass;
+}
+
+// ─── scenario 3: a semaphore bounds concurrency ────────────────────────────
+//
+// Two permits, four workers, so at most two are ever inside. What is asserted is
+// **the peak observed**, not an instantaneous value, which would jitter with scheduling.
+
+global Semaphore gSem;
+global int gInside = 0;
+global int gPeak = 0;
+global int gSemFinished = 0;
+global int gSemPending = 4;
+
+function private semBody():void {
+    semWait(#gSem);
+    int now = atomicIncrement(#gInside);
+    atomicMax(#gPeak, now);
+    yield();                        // pause longer so others can observe the section
+    yield();
+    atomicDecrement(#gInside);
+    semPost(#gSem);
+    atomicIncrement(#gSemFinished);
+    atomicDecrement(#gSemPending);
+    eof: pass;
+}
+
+function process semWorkerA():void { semBody(); return; eof: pass; }
+function process semWorkerB():void { semBody(); return; eof: pass; }
+function process semWorkerC():void { semBody(); return; eof: pass; }
+function process semWorkerD():void { semBody(); return; eof: pass; }
+
+// ─── scenario 4: a channel (capacity 4, forcing the producer to wait) ───────
+
+global Channel gChannel;
+global int gSum = 0;
+global int gConsumed = 0;
+global int gProducerDone = 0;
+global int gChanPending = 1;        // waits for the consumer only
+
+function process channelProducer():void {
+    int i = 0;
+    while (i < 50) {
+        chanPush(#gChannel, i + 1);     // 1..50, sum 1275
+        i = i + 1;
+    }
+    chanClose(#gChannel);
+    atomicIncrement(#gProducerDone);
+    return;
+    eof: pass;
+}
+
+function process channelConsumer():void {
+    int value = 0;
+    while (chanPop(#gChannel, #value)) {
+        atomicAdd(#gSum, value);
+        atomicIncrement(#gConsumed);
+    }
+    atomicDecrement(#gChanPending);
+    return;
+    eof: pass;
+}
+
+// ─── scenario 5: a barrier ─────────────────────────────────────────────────
+//
+// All three workers increment phaseOne, cross the barrier, then check that all three arrived.
+
+global Barrier gBarrier;
+global int gPhaseOne = 0;
+global int gPhaseTwo = 0;
+global int gBarViolations = 0;
+global int gBarPending = 3;
+
+function private barBody():void {
+    atomicIncrement(#gPhaseOne);
+    barrierWait(#gBarrier);
+    //  Past the barrier, all three must have completed phaseOne.
+    if (atomicLoad(#gPhaseOne) != 3) {
+        atomicIncrement(#gBarViolations);
+    }
+    atomicIncrement(#gPhaseTwo);
+    atomicDecrement(#gBarPending);
+    eof: pass;
+}
+
+function process barWorkerA():void { barBody(); return; eof: pass; }
+function process barWorkerB():void { barBody(); return; eof: pass; }
+function process barWorkerC():void { barBody(); return; eof: pass; }
+
+// ─── scenario 6: one-time initialisation ───────────────────────────────────
+//
+// Five workers race for the same initialisation; only one may enter.
+
+global int gOnceState = 0;
+global int gOnceRuns = 0;
+global int gOncePending = 5;
+
+function private onceBody():void {
+    if (onceBegin(#gOnceState)) {
+        atomicIncrement(#gOnceRuns);
+        yield();                    // pretend initialisation takes time
+        onceEnd(#gOnceState);
+    }
+    atomicDecrement(#gOncePending);
+    eof: pass;
+}
+
+function process onceWorkerA():void { onceBody(); return; eof: pass; }
+function process onceWorkerB():void { onceBody(); return; eof: pass; }
+function process onceWorkerC():void { onceBody(); return; eof: pass; }
+function process onceWorkerD():void { onceBody(); return; eof: pass; }
+function process onceWorkerE():void { onceBody(); return; eof: pass; }
+
+// ─── main flow ─────────────────────────────────────────────────────────────
+
+function main():void {
+    //  The mutex must be initialised before any worker touches it. Declarative
+    //  initialisation is used here -- assign, then wait -- because `makeMutex` only
+    //  zeroes two fields, and the lock starts at 0 anyway.
+    gMutex = makeMutex();
+    gSem = makeSemaphore(2);
+    gBarrier = makeBarrier(3);
+    int buffer[4] = {0, 0, 0, 0};
+    gChannel = makeChannel(#buffer[0], 4);
+
+    checkAtomics();
+
+    testGroup("concurrent atomic add");
+    check(awaitCount(#gAddPending), "all four accumulators finished");
+    checkInt(gAddShared, 1000, "4 workers x 250 atomic increments");
+
+    testGroup("concurrent mutex");
+    check(awaitCount(#gLockPending), "both critical-section workers finished");
+    checkInt(gGuarded, 200, "2 workers x 100 locked sections");
+    check(!mutexIsLocked(#gMutex), "mutex released after use");
+
+    testGroup("concurrent semaphore");
+    check(awaitCount(#gSemPending), "all four semaphore workers finished");
+    checkInt(gSemFinished, 4, "all four finished");
+    check(gPeak <= 2, "never more than two inside at once");
+    check(semCount(#gSem) >= 0, "semaphore count not negative");
+
+    testGroup("concurrent channel");
+    check(awaitCount(#gChanPending), "the consumer drained the channel");
+    checkInt(gProducerDone, 1, "producer ran to completion");
+    checkInt(gConsumed, 50, "consumer drained all 50");
+    checkInt(gSum, 1275, "sum of 1..50");
+
+    testGroup("concurrent barrier");
+    check(awaitCount(#gBarPending), "all three workers crossed the barrier");
+    checkInt(gPhaseOne, 3, "all reached phase one");
+    checkInt(gPhaseTwo, 3, "all passed the barrier");
+    checkInt(gBarViolations, 0, "no worker saw an incomplete phase");
+
+    testGroup("concurrent once");
+    check(awaitCount(#gOncePending), "all five workers finished");
+    checkInt(gOnceRuns, 1, "initialization ran exactly once");
+
+    testFinish();
+    eof: pass;
+}

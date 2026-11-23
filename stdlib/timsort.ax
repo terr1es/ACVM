@@ -1,0 +1,526 @@
+//  timsort.ax — TimSort for `int` arrays, tuned for ACVM.
+//
+//  TimSort is a stable, adaptive merge sort. This implementation follows the
+//  shape of CPython's list sort:
+//
+//    * the input is cut into *natural runs* — ascending stretches, or strictly
+//      descending ones, which are reversed in place (strictly, so that equal
+//      keys keep their order and the sort stays stable);
+//    * a run shorter than `minRun` is extended to `minRun` and finished with
+//      binary insertion sort, because another merge level costs more;
+//    * runs are pushed on a stack whose lengths stay balanced (no run longer
+//      than the sum of the two below it), so merging never degenerates;
+//    * before a merge, the overlap is trimmed from both borders by galloping,
+//      so two runs that do not interleave are merged with two binary searches
+//      and one memcpy;
+//    * the smaller side of each merge is copied to a scratch buffer, which
+//      halves the element traffic when the runs are of unequal length;
+//    * the merge itself walks *streaks*: while one run keeps winning, each
+//      element costs a compare, a copy and one bound test instead of two.
+//
+//  Usage. Import the module and call `timSort`; everything else in this file is
+//  `private`, so it cannot be called from the importing file:
+//
+//      function import (return:(timsort));      // stdlib/timsort.ax
+//
+//      function main():void {
+//          int data[1000];
+//          ...
+//          timSort(#data[0], data.length);
+//          eof: pass;
+//      }
+//
+//  This file has no `main`, so `acvm check stdlib/timsort.ax` reports "no entry
+//  point" — that is the expected result for a library. Run the importer instead:
+//
+//      acvm run bench/timsort_demo.ax
+//
+//  Public entry point:
+//
+//      function timSort(ptr int data, int count):void
+//
+//  Sorts `count` integers in place, ascending and stable. Takes a heap scratch
+//  buffer of count/2 + 1 ints and releases it before returning; `count < 2` is
+//  a no-op.
+//
+//  Measured cost. `acvm run --stats`, 50000 ints, per element, against the
+//  tuned quicksort in examples/quicksort_max.ax (figures include run detection):
+//
+//      input            timsort    quicksort
+//      random, %1000      323         179
+//      random, wide       331         229
+//      ascending           17         116
+//      descending          24         122
+//      all equal           17         194
+//      organ pipe          40         422
+//      sawtooth runs       17         116
+//      nearly sorted      186         118
+//
+//  Random data is the one case merge sort cannot win here: every element moves
+//  log n times, while quicksort only swaps about n/6 per level. Structured
+//  input is where TimSort pays for itself — 5x to 11x faster than quicksort,
+//  and O(n) on anything already ordered. Sorting 200000 random ints takes
+//  1.21 s against 0.77 s for quicksort (1.56x wall clock, 1.8x instructions).
+//
+//  Cost model notes: every local lives in the frame, so
+//  `@p` on a frame-resident pointer is one instruction while `data[i]` is about
+//  twenty. The hot loops below therefore walk with pointers only, and avoid
+//  `p - q` (a pointer difference emits a DIV to turn bytes into elements).
+
+module "timsort" version "0.1.0";
+
+comptime int TIM_MAX_RUNS = 85;   // merge stack depth: < 40 for any int count
+
+//===--- runs -------------------------------------------------------------===//
+
+//  Length of the run that starts at `lo`, reversing it in place when it is
+//  descending. A descending run has to be *strictly* descending: reversing a
+//  run with equal neighbours would swap them and break stability.
+function private timRunLength(ptr int a, int lo, int hi):int {
+    int remaining = hi - lo;
+    if (remaining < 2) {
+        return remaining;
+    }
+
+    ptr int p = a + lo;
+    ptr int end = a + hi;
+    int prev = @p;
+    int v = @(p + 1);
+    p++;
+    int count = 1;
+
+    if (v < prev) {
+        while (true) {
+            prev = v;
+            p++;
+            count++;
+            if (p >= end) {
+                break;
+            }
+            v = @p;
+            if (v >= prev) {
+                break;
+            }
+        }
+        ptr int left = a + lo;
+        ptr int right = p - 1;
+        while (left < right) {
+            int t = @left;
+            @left = @right;
+            @right = t;
+            left++;
+            right--;
+        }
+        return count;
+    }
+
+    // Non-descending: equal neighbours extend the run, so ties stay put.
+    while (true) {
+        if (v < prev) {
+            break;
+        }
+        prev = v;
+        p++;
+        count++;
+        if (p >= end) {
+            break;
+        }
+        v = @p;
+    }
+    return count;
+    eof: pass;
+}
+
+//  `minRun` for an input of `n`: the smallest run length that keeps the number
+//  of merge passes at log2(n). CPython's rule — keep the high bits of n and add
+//  1 for every set bit — lands in [32, 64] for large n, which measured out as
+//  the flat part of the curve here too (16 and 256 both cost about 2% more).
+function private timMinRun(int n):int {
+    int r = 0;
+    while (n >= 64) {
+        r = r | (n & 1);
+        n = n >> 1;
+    }
+    return n + r;
+    eof: pass;
+}
+
+//  Sorts a[lo .. hi) with binary insertion sort: log2(k) comparisons per
+//  element, and one memmove for the shift instead of a per-element loop.
+//
+//  The search runs on integer offsets with a running `count` rather than on
+//  pointers, because subtracting two `ptr int` costs a DIV (byte difference to
+//  element count) and this VM would emit that division at every probe.
+function private timInsertionSort(ptr int a, int lo, int hi):void {
+    ptr int base = a + lo;
+    ptr int end = a + hi;
+    ptr int p = base + 1;
+    int count = 1;                        // elements in the sorted prefix
+    while (p < end) {
+        int key = @p;
+        // First position whose element is strictly greater than `key`.
+        int low = 0;
+        int high = count;
+        while (low < high) {
+            int mid = (low + high) >> 1;
+            if (@(base + mid) <= key) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if (low != count) {
+            memmove((base + low + 1) as ptr void, (base + low) as ptr void,
+                    (count - low) * sizeof(int));
+        }
+        @(base + low) = key;
+        count++;
+        p++;
+    }
+    eof: pass;
+}
+
+//===--- galloping --------------------------------------------------------===//
+
+//  Leftmost offset in [0, len) where `key` can be inserted into
+//  a[base .. base+len): the index of the first element that is not smaller.
+//
+//  `hint` is a known element index; callers pass a real position so the
+//  exponential search starts from evidence instead of from the middle.
+function private timGallopLeft(ptr int a, int base, int len, int key, int hint):int {
+    ptr int p = a + base;
+    int last = 0;
+    int ofs = 1;
+
+    if (@(p + hint) < key) {
+        // Gallop right: a[hint + last] < key <= a[hint + ofs].
+        int maxOfs = len - hint;
+        while (ofs < maxOfs) {
+            if (@(p + hint + ofs) < key) {
+                if (ofs >= 1073741824) {
+                    ofs = maxOfs;
+                } else {
+                    last = ofs;
+                    ofs = ofs * 2 + 1;
+                }
+            } else {
+                break;
+            }
+        }
+        if (ofs > maxOfs) {
+            ofs = maxOfs;
+        }
+        last = last + hint;
+        ofs = ofs + hint;
+    } else {
+        // Gallop left: a[hint - ofs] < key <= a[hint - last].
+        int maxOfs = hint + 1;
+        while (ofs < maxOfs) {
+            if (@(p + hint - ofs) < key) {
+                break;
+            }
+            if (ofs >= 1073741824) {
+                ofs = maxOfs;
+            } else {
+                last = ofs;
+                ofs = ofs * 2 + 1;
+            }
+        }
+        if (ofs > maxOfs) {
+            ofs = maxOfs;
+        }
+        int k = last;
+        last = hint - ofs;
+        ofs = hint - k;
+    }
+
+    last++;
+    while (last < ofs) {
+        int m = last + ((ofs - last) >> 1);
+        if (@(p + m) < key) {
+            last = m + 1;
+        } else {
+            ofs = m;
+        }
+    }
+    return ofs;
+    eof: pass;
+}
+
+//  Rightmost offset in [0, len) where `key` can be inserted into
+//  a[base .. base+len): the index of the first element that is greater. Ties
+//  therefore stay on the left, which is what keeps the sort stable.
+function private timGallopRight(ptr int a, int base, int len, int key, int hint):int {
+    ptr int p = a + base;
+    int last = 0;
+    int ofs = 1;
+
+    if (key < @(p + hint)) {
+        // Gallop left: key < a[hint - last] <= a[hint - ofs].
+        int maxOfs = hint + 1;
+        while (ofs < maxOfs) {
+            if (key < @(p + hint - ofs)) {
+                break;
+            }
+            if (ofs >= 1073741824) {
+                ofs = maxOfs;
+            } else {
+                last = ofs;
+                ofs = ofs * 2 + 1;
+            }
+        }
+        if (ofs > maxOfs) {
+            ofs = maxOfs;
+        }
+        int k = last;
+        last = hint - ofs;
+        ofs = hint - k;
+    } else {
+        // Gallop right: a[hint + last] <= key < a[hint + ofs].
+        int maxOfs = len - hint;
+        while (ofs < maxOfs) {
+            if (key < @(p + hint + ofs)) {
+                break;
+            }
+            if (ofs >= 1073741824) {
+                ofs = maxOfs;
+            } else {
+                last = ofs;
+                ofs = ofs * 2 + 1;
+            }
+        }
+        if (ofs > maxOfs) {
+            ofs = maxOfs;
+        }
+        last = last + hint;
+        ofs = ofs + hint;
+    }
+
+    last++;
+    while (last < ofs) {
+        int m = last + ((ofs - last) >> 1);
+        if (key < @(p + m)) {
+            ofs = m;
+        } else {
+            last = m + 1;
+        }
+    }
+    return ofs;
+    eof: pass;
+}
+
+//===--- merging ----------------------------------------------------------===//
+
+//  Merges a[b1 .. b1+n1) with a[b2 .. b2+n2), where b1 + n1 == b2, copying the
+//  left run into `temp`. Requires n1 <= n2, so the copy is the smaller half and
+//  `dest` can never overtake `pr`: the right run is read in place.
+//
+//  Written as alternating streaks instead of one guarded step. Inside a streak
+//  only one pointer is compared and one bound is tested — ten instructions per
+//  element, against the seventeen a two-guard loop costs on this VM.
+function private timMergeLo(ptr int a, int b1, int n1, int b2, int n2, ptr int temp):void {
+    memcpy(temp as ptr void, (a + b1) as ptr void, n1 * sizeof(int));
+
+    ptr int dest = a + b1;
+    ptr int pl = temp;
+    ptr int plEnd = temp + n1;
+    ptr int pr = a + b2;
+    ptr int prEnd = a + b2 + n2;
+
+    while (true) {
+        // Everything in the left run up to the right head goes out first; a tie
+        // goes to the left run.
+        while (@pl <= @pr) {
+            @dest = @pl;
+            dest++;
+            pl++;
+            if (pl >= plEnd) {
+                // The rest of the right run is already where it belongs.
+                return;
+            }
+        }
+        // Then the right run up to the left head.
+        while (@pr < @pl) {
+            @dest = @pr;
+            dest++;
+            pr++;
+            if (pr >= prEnd) {
+                memcpy(dest as ptr void, pl as ptr void,
+                       ((plEnd - pl) as int) * sizeof(int));
+                return;
+            }
+        }
+    }
+    eof: pass;
+}
+
+//  Mirror of `timMergeLo` for n1 > n2: copies the right run and merges
+//  backwards. Here a tie goes to the right run, again for stability.
+function private timMergeHi(ptr int a, int b1, int n1, int b2, int n2, ptr int temp):void {
+    memcpy(temp as ptr void, (a + b2) as ptr void, n2 * sizeof(int));
+
+    ptr int dest = a + b2 + n2 - 1;
+    ptr int pl = a + b1 + n1 - 1;
+    ptr int plStart = a + b1;
+    ptr int pr = temp + n2 - 1;
+    ptr int prStart = temp;
+
+    merge: while (true) {
+        // Larger elements from the left run leave first...
+        while (@pl > @pr) {
+            @dest = @pl;
+            dest--;
+            pl--;
+            if (pl < plStart) {
+                break merge;
+            }
+        }
+        // ...then the right run takes over.
+        while (@pr >= @pl) {
+            @dest = @pr;
+            dest--;
+            pr--;
+            if (pr < prStart) {
+                break merge;
+            }
+        }
+    }
+
+    // Whatever is left in the buffer slides down; a left-over left run needs no
+    // move, it is already in place.
+    if (pr >= prStart) {
+        int left = (pr - prStart) as int + 1;
+        memcpy((dest - left + 1) as ptr void, prStart as ptr void, left * sizeof(int));
+    }
+    eof: pass;
+}
+
+//  Merges run `i` with run `i + 1` and drops the second stack entry.
+//
+//  The two border gallops cut away the parts that are already in order: the
+//  left run keeps only what exceeds the right run's first element, the right
+//  run only what precedes the left run's last. Appending sorted batches, or
+//  merging runs with disjoint ranges, therefore costs two searches and one
+//  memcpy instead of a full merge.
+function private timMergeAt(ptr int a, ptr int base, ptr int lens, int i, int runs,
+                    ptr int temp):void {
+    int b1 = @(base + i);
+    int n1 = @(lens + i);
+    int b2 = @(base + i + 1);
+    int n2 = @(lens + i + 1);
+
+    // The merged run takes over slot i; trimming must not change this length.
+    @(lens + i) = n1 + n2;
+
+    int cut = timGallopRight(a, b1, n1, @(a + b2), 0);
+    b1 = b1 + cut;
+    n1 = n1 - cut;
+
+    if (n1 != 0) {
+        n2 = timGallopLeft(a, b2, n2, @(a + b1 + n1 - 1), n2 - 1);
+        if (n2 != 0) {
+            if (n1 <= n2) {
+                timMergeLo(a, b1, n1, b2, n2, temp);
+            } else {
+                timMergeHi(a, b1, n1, b2, n2, temp);
+            }
+        }
+    }
+
+    // Drop slot i + 1, pulling the tail of the stack down. The stack is short,
+    // but this runs on every merge, so each array moves with one memmove.
+    if (i + 1 < runs - 1) {
+        int tail = runs - i - 2;
+        memmove((base + i + 1) as ptr void, (base + i + 2) as ptr void,
+                tail * sizeof(int));
+        memmove((lens + i + 1) as ptr void, (lens + i + 2) as ptr void,
+                tail * sizeof(int));
+    }
+    eof: pass;
+}
+
+//===--- driver -----------------------------------------------------------===//
+
+//  Sorts `count` integers at `data` in place, ascending and stable.
+//
+//  The merge stack is two frame arrays kept in step; the invariants are
+//  enforced after every push, which bounds both the stack depth and the length
+//  ratio between neighbouring runs.
+function timSort(ptr int data, int count):void {
+    if (count < 2) {
+        return;
+    }
+
+    int minRun = timMinRun(count);
+    int runBase[TIM_MAX_RUNS];
+    int runLen[TIM_MAX_RUNS];
+    ptr int base = #runBase[0];
+    ptr int lens = #runLen[0];
+
+    ptr int temp = alloc((count / 2 + 1) * sizeof(int)) as ptr int;
+
+    int runs = 0;
+    int lo = 0;
+    while (lo < count) {
+        int len = timRunLength(data, lo, count);
+        if (len < minRun) {
+            int forced = count - lo;
+            if (forced > minRun) {
+                forced = minRun;
+            }
+            timInsertionSort(data, lo, lo + forced);
+            len = forced;
+        }
+        @(base + runs) = lo;
+        @(lens + runs) = len;
+        runs++;
+        lo = lo + len;
+
+        // Merge until the invariants hold again:
+        //     len[i-1] > len[i] + len[i+1]   and   len[i-2] > len[i-1] + len[i]
+        // The shorter pair goes first, which keeps the total element traffic at
+        // O(n log n) — merging by position instead can be quadratic.
+        while (runs > 1) {
+            int k = runs - 2;
+            bool needMerge = false;
+            if (k > 0 && @(lens + k - 1) <= @(lens + k) + @(lens + k + 1)) {
+                needMerge = true;
+            }
+            if (!needMerge && k > 1 && @(lens + k - 2) <= @(lens + k - 1) + @(lens + k)) {
+                needMerge = true;
+            }
+            if (needMerge) {
+                if (k > 0 && @(lens + k - 1) < @(lens + k + 1)) {
+                    k--;
+                }
+                timMergeAt(data, base, lens, k, runs, temp);
+                runs--;
+            } else if (@(lens + k) >= @(lens + k + 1)) {
+                break;
+            } else {
+                timMergeAt(data, base, lens, k, runs, temp);
+                runs--;
+            }
+        }
+
+        // The invariants bound the depth far below TIM_MAX_RUNS for any int
+        // count; this only keeps a bug from writing past the stack arrays.
+        if (runs >= TIM_MAX_RUNS) {
+            timMergeAt(data, base, lens, runs - 2, runs, temp);
+            runs--;
+        }
+    }
+
+    // Collapse what is left, shortest pair first.
+    while (runs > 1) {
+        int k = runs - 2;
+        if (k > 0 && @(lens + k - 1) < @(lens + k + 1)) {
+            k--;
+        }
+        timMergeAt(data, base, lens, k, runs, temp);
+        runs--;
+    }
+
+    free(temp as ptr void);
+    eof: pass;
+}

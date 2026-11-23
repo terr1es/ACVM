@@ -1,0 +1,276 @@
+//  threadpool_check.ax -- the resident thread pool and real locks.
+//
+//  ── three claims this test has to establish ─────────────────────────────────
+//
+//  1. **A batch through the pool must match the serial result value for value.**
+//     Parallelism may change speed and nothing else.
+//  2. **The real lock really excludes.** Handing a lock to `threadPoolAccumulate`
+//     yields an exact total.
+//  3. **The real atomics are really atomic.** `threadPoolHammer` makes native
+//     threads contend for a single cell, and the total must equal the count
+//     exactly. Axiom has one execution thread, so a loop written on that side
+//     proves nothing.
+//
+//  ── one signature constraint worth remembering ──────────────────────────────
+//
+//  `threadPoolHammer(pool, times, #counter[0], counter.length)` -- a `ptr` must be
+//  followed by an element count. Without it the VM hands a bare address to C and
+//  the first dereference crashes. The compiler now rejects such a declaration
+//  outright, which beats a crash at run time.
+
+function import (return:(threadpool));
+function import (return:(test));
+function import (return:(algorithm));
+
+comptime int N = 400000;
+
+function private fillLcg(ptr int data, int count, unsigned int seed):void {
+    unsigned int state = seed;
+    for (int i = 0; i < count; i++) {
+        state = state * 1664525u32 + 1013904223u32;
+        @(data + i) = ((state >> 16) as int) % 100000;
+    }
+    eof: pass;
+}
+
+function private checkLifecycle():void {
+    testGroup("lifecycle");
+
+    //  0 means "use every core".
+    int64 pool = threadPoolCreate(0);
+    check(pool != 0, "create with all cores");
+    check(threadPoolThreads(pool) >= 1, "pool reports at least one worker");
+
+    //  An explicit thread count is honoured, unless it exceeds the core count.
+    int64 small = threadPoolCreate(3);
+    check(small != 0, "create with three threads");
+    checkInt(threadPoolThreads(small), 3, "three workers requested and granted");
+
+    //  Destroy two, then destroy once more: it must fail, the handle is gone.
+    checkInt(threadPoolDestroy(small), 0, "destroy succeeds");
+    checkInt(threadPoolDestroy(small), -1, "destroy twice fails");
+
+    //  Invalid handles: 0 and out-of-range are both rejected, neither crashes.
+    checkInt(threadPoolThreads(0), -1, "handle 0 is invalid");
+    checkInt(threadPoolThreads(999), -1, "out-of-range handle is invalid");
+    checkInt64(threadPoolExecuted(0), -1, "executed on handle 0 is -1");
+    checkInt(threadPoolDestroy(0), -1, "destroy on handle 0 fails");
+
+    threadPoolDestroy(pool);
+    eof: pass;
+}
+
+function private checkReductions():void {
+    testGroup("pool reductions");
+
+    int data[N] = {0};
+    fillLcg(#data[0], N, 4242u32);
+
+    int64 pool = threadPoolCreate(0);
+    check(pool != 0, "pool for reductions");
+
+    //  The pool sum must equal the naive loop sum -- the most basic agreement.
+    int64 reference = 0;
+    for (int i = 0; i < N; i++) {
+        reference = reference + (@(#data[0] + i) as int64);
+    }
+    checkInt64(threadPoolSum(pool, #data[0], N), reference, "sum matches a plain loop");
+
+    //  Extremes must agree with the algorithm implementation, which is separate code.
+    int maxAt = maxIndex(#data[0], N);
+    int minAt = minIndex(#data[0], N);
+    checkInt(threadPoolMax(pool, #data[0], N), @(#data[0] + maxAt), "max matches algorithm");
+    checkInt(threadPoolMin(pool, #data[0], N), @(#data[0] + minAt), "min matches algorithm");
+
+    //  Counting.
+    int target = @(#data[0] + 3);
+    checkInt64(threadPoolCount(pool, #data[0], N, target),
+               countInt(#data[0], N, target) as int64, "count matches algorithm");
+
+    //  Empty array and single element: the chunking logic is most likely to fail here.
+    checkInt64(threadPoolSum(pool, 0 as ptr int, 0), 0, "sum of nothing");
+    checkInt(threadPoolMax(pool, 0 as ptr int, 0), 0, "max of nothing");
+    checkInt(threadPoolMin(pool, 0 as ptr int, 0), 0, "min of nothing");
+    int one[1] = {42};
+    checkInt64(threadPoolSum(pool, #one[0], 1), 42, "sum of one");
+    checkInt(threadPoolMax(pool, #one[0], 1), 42, "max of one");
+
+    //  Chunks run: proof the work reached the pool. Four operations, 1+ chunk each.
+    check(threadPoolExecuted(pool) > 0, "pool executed work");
+
+    threadPoolDestroy(pool);
+    eof: pass;
+}
+
+function private checkSortAndFill():void {
+    testGroup("pool sort and fill");
+
+    int data[N] = {0};
+    int copy[N] = {0};
+    fillLcg(#data[0], N, 99u32);
+    for (int i = 0; i < N; i++) {
+        @(#copy[0] + i) = @(#data[0] + i);
+    }
+
+    int64 pool = threadPoolCreate(0);
+
+    //  Serial reference.
+    sort(#copy[0], N);
+
+    int chunks = threadPoolSort(pool, #data[0], N);
+    check(chunks >= 1, "sort used at least one chunk");
+    check(isSortedAsc(#data[0], N), "pool sort is ascending");
+    check(equalInts(#data[0], N, #copy[0], N), "pool sort equals algorithm.sort");
+
+    //  Fill: every element must be written.
+    int filled[N] = {0};
+    checkInt(threadPoolFill(pool, #filled[0], N, 7), N, "fill reports count");
+    checkInt64(threadPoolSum(pool, #filled[0], N), 7 as int64 * N as int64, "fill covers all");
+
+    //  An already-ascending input must not be disturbed.
+    threadPoolSort(pool, #data[0], N);
+    check(isSortedAsc(#data[0], N), "already sorted stays sorted");
+
+    threadPoolDestroy(pool);
+    eof: pass;
+}
+
+function private checkRealLock():void {
+    testGroup("real lock");
+
+    int64 lock = threadLockCreate();
+    check(lock != 0, "lock created");
+
+    //  Axiom has one execution thread, so this acquire must succeed.
+    checkInt(threadLockAcquire(lock), 0, "acquire succeeds");
+    checkInt(threadLockRelease(lock), 0, "release succeeds");
+
+    //  try semantics: the same thread re-entering a recursive lock succeeds, so only
+    //  the range of the return value is asserted.
+    int got = threadLockTryAcquire(lock);
+    check(got == 0 || got == 1, "tryAcquire returns 0 or 1");
+    if (got == 1) {
+        threadLockRelease(lock);
+    }
+
+    //  Invalid handle.
+    checkInt(threadLockAcquire(0), -1, "acquire on handle 0 fails");
+    checkInt(threadLockRelease(0), -1, "release on handle 0 fails");
+    checkInt(threadLockTryAcquire(999), -1, "tryAcquire out of range fails");
+
+    checkInt(threadLockDestroy(lock), 0, "destroy succeeds");
+    checkInt(threadLockDestroy(lock), -1, "destroy twice fails");
+    eof: pass;
+}
+
+function private checkAccumulate():void {
+    testGroup("accumulate under a real lock");
+
+    //  All ones, so the total must equal the element count.
+    int data[N] = {0};
+    int64 pool = threadPoolCreate(0);
+    threadPoolFill(pool, #data[0], N, 1);
+    int64 lock = threadLockCreate();
+
+    int64 total[1] = {0};
+    checkInt(threadPoolAccumulate(pool, #data[0], N, lock, #total[0], total.length), 1,
+             "accumulate with a lock returns 1");
+    checkInt64(@#total[0], N as int64, "locked accumulate is exact");
+
+    //  The lock really was entered -- once per chunk.
+    check(threadLockAcquisitions(lock) > 0, "lock was acquired by pool chunks");
+
+    //  The no-lock path runs serially, so its result **is also exact**. This branch
+    //  cannot show what the lock does, but it must work: no crash, no wrong answer.
+    int64 plain[1] = {0};
+    checkInt(threadPoolAccumulate(pool, #data[0], N, 0, #plain[0], plain.length), 1,
+             "accumulate without a lock returns 1");
+    checkInt64(@#plain[0], N as int64, "serial accumulate is also exact");
+
+    //  Invalid pool handle: **not a failure, a serial fallback**. Without a pool every
+    //  operation degrades to single-threaded with the same result. That is deliberate;
+    int64 fallback[1] = {0};
+    checkInt(threadPoolAccumulate(0, #data[0], N, lock, #fallback[0], fallback.length), 1,
+             "invalid pool falls back to serial and still succeeds");
+    checkInt64(@#fallback[0], N as int64, "fallback result is exact");
+    checkInt(threadPoolAccumulate(pool, #data[0], N, lock, #total[0], 0), -1,
+             "zero out capacity rejected");
+
+    threadLockDestroy(lock);
+    threadPoolDestroy(pool);
+    eof: pass;
+}
+
+function private checkRealAtomics():void {
+    testGroup("real atomics");
+
+    //  The only way to test a *real* atomic: let native threads contend for one cell.
+    int64 pool = threadPoolCreate(0);
+    int counter[1] = {0};
+    int times = 200000;
+
+    int result = threadPoolHammer(pool, times, #counter[0], counter.length);
+    checkInt(result, times, "hammer returns the exact count");
+    checkInt(@#counter[0], times, "counter is exact after contention");
+
+    //  Run it again, accumulating into the same cell.
+    threadPoolHammer(pool, times, #counter[0], counter.length);
+    checkInt(@#counter[0], times * 2, "second hammer accumulates exactly");
+
+    //  Argument validation.
+    checkInt(threadPoolHammer(pool, 0, #counter[0], counter.length), -1, "zero times rejected");
+    checkInt(threadPoolHammer(pool, 100, #counter[0], 0), -1, "zero capacity rejected");
+
+    //  Without a pool it must still be exact, by degrading to serial.
+    int solo[1] = {0};
+    checkInt(threadPoolHammer(0, 5000, #solo[0], solo.length), 5000, "hammer without a pool");
+
+    threadPoolDestroy(pool);
+    eof: pass;
+}
+
+function private checkEdgeCases():void {
+    testGroup("edge cases");
+
+    //  More threads than elements: no extra chunk may be dispatched.
+    int64 pool = threadPoolCreate(8);
+    int three[3] = {3, 1, 2};
+    checkInt64(threadPoolSum(pool, #three[0], 3), 6, "sum with more threads than elements");
+    threadPoolSort(pool, #three[0], 3);
+    checkInt(@#three[0], 1, "sort clamps thread count");
+    checkInt(@(#three[0] + 2), 3, "sort still sorted");
+
+    //  Negative elements.
+    int negatives[8] = {-5, -1, -9, -3, -7, -2, -8, -4};
+    checkInt64(threadPoolSum(pool, #negatives[0], 8), -39, "sum of negatives");
+    checkInt(threadPoolMax(pool, #negatives[0], 8), -1, "max of negatives");
+    checkInt(threadPoolMin(pool, #negatives[0], 8), -9, "min of negatives");
+    threadPoolSort(pool, #negatives[0], 8);
+    checkInt(@#negatives[0], -9, "sort negatives first");
+
+    threadPoolDestroy(pool);
+
+    //  Pool table capacity: creating past the limit must return 0, not leak. The limit is 16.
+    //  Build three and destroy them, confirming the handles are distinct.
+    int64 a = threadPoolCreate(1);
+    int64 b = threadPoolCreate(1);
+    check(a != b, "two pools get distinct handles");
+    threadPoolDestroy(a);
+    int64 c = threadPoolCreate(1);
+    check(c != 0, "handle slot is reused after destroy");
+    threadPoolDestroy(b);
+    threadPoolDestroy(c);
+    eof: pass;
+}
+
+function main():void {
+    checkLifecycle();
+    checkReductions();
+    checkSortAndFill();
+    checkRealLock();
+    checkAccumulate();
+    checkRealAtomics();
+    checkEdgeCases();
+    testFinish();
+    eof: pass;
+}

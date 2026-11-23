@@ -1,0 +1,4 @@
+//  Misspelled member: the message must say method, not field.
+struct S { int n; };
+
+function main():void { S s = {0}; print(s.missing()); eof: pass; }

@@ -1,0 +1,10 @@
+//  The same T appears on two parameters, and the argument types differ -> conflict.
+function maxOf<T>(T a, T b):T {
+    if (a > b) { return a; }
+    return b;
+}
+
+function main():void {
+    print(maxOf(3, 1.5));
+    eof: pass;
+}

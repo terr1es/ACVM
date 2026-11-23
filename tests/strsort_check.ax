@@ -1,0 +1,133 @@
+//  strsort_check.ax -- sorting and searching string arrays from the algorithm module.
+//
+//  This group is pure Axiom. `int` and `int64` sorting goes to C, but strings cannot:
+//  an array holds 16-byte descriptors, and the C side would receive a VM address from
+//  which it cannot read characters. What matters here is correct lexicographic order,
+//  no dropped duplicates, and the search boundaries -- the only places a pure Axiom
+//  implementation can go wrong.
+//
+//  Sorting uses `sortStrings` (quicksort); the searches are their own `*Strings` set.
+
+function import (return:(algorithm));
+function import (return:(test));
+
+//  Joins the array into one line for comparison -- shorter than a per-element
+//  assertion, and a failure shows at a glance where the order went wrong.
+function private render(ptr string items, int count):string {
+    string out = "";
+    for (int i = 0; i < count; i++) {
+        if (i > 0) {
+            out = out + " ";
+        }
+        out = out + @(items + i);
+    }
+    return out;
+    eof: pass;
+}
+
+function private checkBasicSort():void {
+    testGroup("sort");
+
+    string words[5] = {"pear", "apple", "fig", "banana", "cherry"};
+    sortStrings(#words[0], 5);
+    checkString(render(#words[0], 5), "apple banana cherry fig pear", "ascending");
+    check(isSortedStrings(#words[0], 5), "is sorted");
+
+    string again[5] = {"pear", "apple", "fig", "banana", "cherry"};
+    sortStringsDesc(#again[0], 5);
+    checkString(render(#again[0], 5), "pear fig cherry banana apple", "descending");
+
+    //  Empty and single element are the boundaries, where indexing runs off the end.
+    string one[1] = {"solo"};
+    sortStrings(#one[0], 1);
+    checkString(render(#one[0], 1), "solo", "single element");
+    sortStrings(0 as ptr string, 0);
+    recordPass("empty array does not crash");
+
+    //  Sorted input must not be damaged; insertion sort fails most easily on it.
+    string ordered[4] = {"a", "b", "c", "d"};
+    sortStrings(#ordered[0], 4);
+    checkString(render(#ordered[0], 4), "a b c d", "already sorted stays sorted");
+
+    //  Descending input.
+    string reversed[4] = {"d", "c", "b", "a"};
+    sortStrings(#reversed[0], 4);
+    checkString(render(#reversed[0], 4), "a b c d", "reversed input");
+    eof: pass;
+}
+
+function private checkLargeAndStable():void {
+    testGroup("merge path and stability");
+
+    //  25 elements cross the insertion-sort threshold (20) and take the merge path,
+    //  which is the one production code actually uses.
+    string many[25] = {"m","x","a","b","z","c","q","d","e","f",
+                       "r","g","h","i","s","j","k","l","t","n",
+                       "u","o","v","p","y"};
+    sortStrings(#many[0], 25);
+    //  `render` joins with spaces and the input has no 'w', so the expected text is a..v then x y z.
+    checkString(render(#many[0], 25), "a b c d e f g h i j k l m n o p q r s t u v x y z",
+                "25 elements via merge");
+    check(isSortedStrings(#many[0], 25), "25 elements reported sorted");
+
+    //  Duplicates must all survive: sorting does not deduplicate. (Relative order is
+    //  unobservable for strings -- immutable, compared by content -- so the assertion
+    //  is only that all of them are present and ordered.)
+    string dup[6] = {"b", "a", "b", "a", "c", "c"};
+    sortStrings(#dup[0], 6);
+    checkString(render(#dup[0], 6), "a a b b c c", "duplicates preserved");
+
+    //  Prefixes: in lexicographic order the shorter comes first ("ab" < "abc").
+    string prefix[3] = {"abc", "ab", "abcd"};
+    sortStrings(#prefix[0], 3);
+    checkString(render(#prefix[0], 3), "ab abc abcd", "prefix ordering");
+
+    //  Case: in ASCII uppercase precedes lowercase ('Z' = 90 < 'a' = 97).
+    string mixed[3] = {"apple", "Zebra", "banana"};
+    sortStrings(#mixed[0], 3);
+    checkString(render(#mixed[0], 3), "Zebra apple banana", "uppercase sorts before lowercase");
+
+    //  The empty string sorts before any non-empty one.
+    string blanks[3] = {"b", "", "a"};
+    sortStrings(#blanks[0], 3);
+    checkString(render(#blanks[0], 3), " a b", "empty string sorts first");
+    eof: pass;
+}
+
+function private checkSearch():void {
+    testGroup("search");
+
+    string words[6] = {"apple", "banana", "cherry", "date", "elder", "fig"};
+    sortStrings(#words[0], 6);
+
+    checkInt(binarySearchStrings(#words[0], 6, "apple"), 0, "find first");
+    checkInt(binarySearchStrings(#words[0], 6, "fig"), 5, "find last");
+    checkInt(binarySearchStrings(#words[0], 6, "cherry"), 2, "find middle");
+    checkInt(binarySearchStrings(#words[0], 6, "aardvark"), -1, "absent before");
+    checkInt(binarySearchStrings(#words[0], 6, "zebra"), -1, "absent after");
+    checkInt(binarySearchStrings(#words[0], 6, "ban"), -1, "prefix is not a match");
+
+    //  lowerBound answers "where would this go", so both a hit and a miss give a useful value.
+    checkInt(lowerBoundStrings(#words[0], 6, "date"), 3, "lowerBound present");
+    checkInt(lowerBoundStrings(#words[0], 6, "coconut"), 3, "lowerBound absent");
+    checkInt(lowerBoundStrings(#words[0], 6, "aardvark"), 0, "lowerBound before all");
+    checkInt(lowerBoundStrings(#words[0], 6, "zebra"), 6, "lowerBound after all");
+
+    checkInt(upperBoundStrings(#words[0], 6, "date"), 4, "upperBound present");
+    checkInt(upperBoundStrings(#words[0], 6, "zebra"), 6, "upperBound after all");
+
+    //  Duplicate keys: lowerBound is the first, upperBound is one past the last.
+    string dup[4] = {"a", "b", "b", "c"};
+    checkInt(lowerBoundStrings(#dup[0], 4, "b"), 1, "lowerBound of duplicate run");
+    checkInt(upperBoundStrings(#dup[0], 4, "b"), 3, "upperBound of duplicate run");
+    check(binarySearchStrings(#dup[0], 4, "b") >= 1, "binarySearch finds one of them");
+    eof: pass;
+}
+
+function main():void {
+    checkBasicSort();
+    checkLargeAndStable();
+    checkSearch();
+    testFinish();
+    eof: pass;
+}

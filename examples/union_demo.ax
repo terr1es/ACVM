@@ -1,0 +1,132 @@
+//  union_demo.ax — one slot of memory, several views of it.
+//
+//  A union is not a variant: it carries no tag and reading a member that was not
+//  the last one written is a reinterpretation of those bytes, not an error. That
+//  makes it the right tool for two things and the wrong tool for a third:
+//
+//    * type punning -- float as bits, signed as unsigned, one integer as bytes;
+//    * crossing into a C library whose interface has a union in it, because the
+//      layout is exactly C's (every member at offset 0);
+//    * NOT for "one of several" values. Put a tag beside it in a struct for that;
+//      `Tagged` below shows the shape.
+//
+//  Run:  acvm run examples/union_demo.ax
+
+function import (return:(io));
+
+//===--- The layout ---------------------------------------------------------===//
+
+//  The size is the largest member, rounded up to the widest alignment. Here the
+//  widest is `double` (8 bytes, 8-aligned), so the union is 8 / 8.
+union Number {
+    int i;
+    double d;
+    int64 wide;
+};
+
+//  Members of different widths: the int64 still wins.
+union Small {
+    unsigned int8 byte;
+    int i;
+};
+
+//  A byte-level view needs a 1-byte member. `char` is a 2-byte UTF-16 code unit,
+//  so `char[4]` would be 8 bytes and the byte offsets would not line up.
+union FloatBits {
+    float f;
+    unsigned int u;
+    unsigned int8[4] b;
+};
+
+//  Signed and unsigned views of the same bits. `as` would range-check (and trap on
+//  0xFFFFFFFF); reading the other member is the reinterpretation.
+union SignedPair {
+    int i;
+    unsigned int u;
+};
+
+//===--- "One of several", done by hand -------------------------------------===//
+
+//  A union has no tag, so the tag lives beside it. Keeping `kind` and the payload
+//  in step is the caller's job -- that is the price of the C layout.
+comptime int KIND_INT = 1;
+comptime int KIND_DOUBLE = 2;
+
+struct Tagged {
+    int kind;
+    Number payload;
+};
+
+function taggedInt(int value):Tagged {
+    Tagged t;
+    t.kind = KIND_INT;
+    t.payload.i = value;
+    return t;
+}
+
+function taggedDouble(double value):Tagged {
+    Tagged t;
+    t.kind = KIND_DOUBLE;
+    t.payload.d = value;
+    return t;
+}
+
+function describe(Tagged t):void {
+    if (t.kind == KIND_INT) {
+        print("int    ");
+        print(t.payload.i);
+    } else if (t.kind == KIND_DOUBLE) {
+        print("double ");
+        print(t.payload.d);
+    } else {
+        print("<unknown tag>");
+    }
+    print("\n");
+    eof: pass;
+}
+
+function showInt(string label, int value):void {
+    print(label);
+    print(value);
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    print("sizeof(Number)    = "); print(sizeof(Number)); print("\n");
+    print("sizeof(Small)     = "); print(sizeof(Small)); print("\n");
+    print("sizeof(FloatBits) = "); print(sizeof(FloatBits)); print("\n");
+    print("sizeof(Tagged)    = "); print(sizeof(Tagged)); print("\n\n");
+
+    //  Same slot, different member: the last write wins and the other view shows
+    //  whatever those bytes happen to mean.
+    Number n;
+    n.i = 42;
+    showInt("n.i after n.i = 42      : ", n.i);
+
+    n.d = 1.5;
+    print("n.d after n.d = 1.5     : "); print(n.d); print("\n");
+    print("n.i now (low 32 bits of 1.5): "); print(n.i); print("\n\n");
+
+    //  Type punning: float 1.0 is 0x3F800000, and the bytes are little-endian.
+    FloatBits fb;
+    fb.f = 1.0;
+    print("fb.u after fb.f = 1.0   : "); print(fb.u as int); print("\n");
+    print("fb.b[0..3]              : ");
+    print(fb.b[0] as int); print(" ");
+    print(fb.b[1] as int); print(" ");
+    print(fb.b[2] as int); print(" ");
+    print(fb.b[3] as int); print("   (little-endian 00 00 80 3F)\n\n");
+
+    //  Signed and unsigned views of the same bits. `neg.u as int` would trap:
+    //  `as` range-checks. Reading the other member does not -- that is the point.
+    SignedPair neg;
+    neg.u = 0xFFFFFFFFu32;
+    print("neg.u = "); print(neg.u as int64); print("\n");
+    print("neg.i = "); print(neg.i); print("   (same bits, signed view)\n\n");
+
+    //  The tagged shape: the tag says which member is meaningful.
+    describe(taggedInt(7));
+    describe(taggedDouble(2.25));
+    eof: pass;
+}

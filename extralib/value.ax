@@ -1,0 +1,1397 @@
+//  value.ax -- the common foundation of the config formats: value tree, doc, arena, text.
+//
+//      function import (return:(value));
+//
+
+//  This is a **library module** and parses nothing itself. json / yaml / toml share its
+//  Value and Doc; xml / ini / csv have their own node types but reuse arena and text.
+//
+//  ── one allocation, one free ─────────────────────────────────────────────
+//
+//  The language has no defer and no destructor, so freeing by hand on every error path
+//  of a recursive-descent parser is bound to leak. So a document has **one** free point:
+//
+//      Doc d = docNew(0);              // 0 = default block size
+//      ptr Value root = jsonParse(#d, text);
+//      if (root == null) { print(docError(#d)); }
+//      ...
+//      docFree(#d);                    // success or failure, this line
+//
+//  The arena is a **chain of blocks**, each malloc'd separately. This matters: a block
+//  that moved would void every earlier string, so blocks are added, never relocated.
+//
+//  ── how strings stay zero-copy ───────────────────────────────────────────
+//
+//  `string` is a value type: {data pointer, length}, length at offset 8, **int64 wide**
+//  (an int32 store leaves the top 4 bytes stale -- learned the hard way). `.ptr` does not
+//  parse here (`ptr` is a keyword), so use the descriptor address:
+//
+//      string s = "";
+//      ptr string ps = #s;
+//      @(ps as ptr (ptr char)) = bytes;    // the data pointer
+//      @(((ps as ptr int8) + 8) as ptr int64) = len;
+//
+//  Arena bytes thus become a string with no copy and no separate free. The mechanism
+//  lives in `arenaString` alone; `tests/value_check.ax` asserts the layout assumption.
+//
+//  ── why objects use parallel arrays ──────────────────────────────────────
+//
+//  `Value.items` holds children, `Value.keys` the keys (null for arrays). Three reasons:
+//
+//    * members are **ordered**. JSON is unordered in theory, but ini/toml round trips
+//      and diffs depend on order; sorting afterwards is a disaster.
+//    * the same shape as `map.ax`: parallel arrays let memcpy/memmove work directly,
+//      with no struct padding to get wrong.
+//    * one Value is just 48 bytes, and arrays and objects share one growth path.
+
+//  depends: encoding
+//
+//  ── the error convention for all of `extralib` ───────────────────────────
+//
+//  Every entry point that can fail does it the same way: it takes a `ptr Doc` and
+//  returns null, with a message in `docError(doc)` and an offset in `docErrorPos`.
+//  `docErrorWithPosition(doc, text)` renders it as "… at line 3 column 12".
+//
+//      ptr Value root = jsonParse(#d, text);
+//      if (root == null) { print(docErrorWithPosition(#d, text)); }
+//
+//  There is exactly one exception and it is deliberate: `net` is a transport
+//  whose failures come from the operating system, so it reports `-1` plus
+//  `netErrorString()` (a thread-local errno that no document owns). Modules built
+//  on top of it -- `http` -- translate those into `docError` so callers of the
+//  protocol layer never see the errno form.
+//
+//  Why a Doc and not a `Result` type: the language has no generics over
+//  discriminated unions, and every caller already holds a Doc because the result
+//  has to live in an arena somewhere. Adding a second error channel would mean
+//  two things to check after every call.
+
+module "value" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(strbyte));
+function import (return:(io));
+function import (return:(encoding));
+
+//===--- type tags -------------------------------------------------------===//
+
+comptime int kValNull = 0;
+comptime int kValBool = 1;
+comptime int kValInt = 2;
+comptime int kValFloat = 3;
+comptime int kValString = 4;
+comptime int kValArray = 5;
+comptime int kValObject = 6;
+
+//  Source flags on strings. The parser records "the source was quoted" here so a write
+//  can keep the style; formats that do not care (JSON) ignore the flag.
+comptime int kFlagNone = 0;
+comptime int kFlagQuoted = 1;       // quoted in the source
+comptime int kFlagMultiline = 2;    // source was a block (YAML | >, TOML """)
+comptime int kFlagDateTime = 4;     // textual time (TOML / YAML), not written as a string
+
+union ValScalar {
+    int64 i;
+    double d;
+    string s;
+};
+
+struct Value {
+    int kind;
+    int flags;
+    ValScalar val;
+    ptr Value items;
+    ptr string keys;
+    int count;
+    int cap;
+};
+
+//===--- arena -----------------------------------------------------------===//
+
+struct ArenaBlock {
+    ptr ArenaBlock link;
+    ptr int8 data;
+    int size;
+    int used;
+};
+
+struct ValueArena {
+    ptr ArenaBlock first;
+    ptr ArenaBlock cur;
+    int total;
+    int blocks;
+};
+
+comptime int kArenaDefaultBlock = 16384;
+
+//  One block, `size` bytes of payload. Returns null when the allocation failed.
+function private arenaNewBlock(int size):ptr ArenaBlock {
+    ptr ArenaBlock block = alloc(sizeof(ArenaBlock)) as ptr ArenaBlock;
+    if (block == null) {
+        return null;
+    }
+    ptr int8 data = alloc(size) as ptr int8;
+    if (data == null) {
+        free(block as ptr void);
+        return null;
+    }
+    block->link = null;
+    block->data = data;
+    block->size = size;
+    block->used = 0;
+    return block;
+    eof: pass;
+}
+
+//  Prepares an arena. `blockSize` <= 0 means the default. The arena is valid even
+//  when the first block could not be taken: allocations then fail one by one,
+//  and every caller already handles a null allocation.
+function arenaInit(ptr ValueArena arena, int blockSize):void {
+    if (blockSize <= 0) {
+        blockSize = kArenaDefaultBlock;
+    }
+    arena->first = null;
+    arena->cur = null;
+    arena->total = 0;
+    arena->blocks = 0;
+    ptr ArenaBlock block = arenaNewBlock(blockSize);
+    if (block != null) {
+        arena->first = block;
+        arena->cur = block;
+        arena->total = blockSize;
+        arena->blocks = 1;
+    }
+    eof: pass;
+}
+
+//  Releases every block. After this the arena must be re-initialised before use.
+function arenaFree(ptr ValueArena arena):void {
+    ptr ArenaBlock block = arena->first;
+    while (block != null) {
+        ptr ArenaBlock following = block->link;
+        free(block->data as ptr void);
+        free(block as ptr void);
+        block = following;
+    }
+    arena->first = null;
+    arena->cur = null;
+    arena->total = 0;
+    arena->blocks = 0;
+    eof: pass;
+}
+
+//  `n` bytes aligned to 8. Strings only need 1, but Value arrays need the
+//  alignment and rounding here keeps every allocation usable for both.
+//
+//  Returning null is the only failure signal: the caller decides whether that is
+//  a parse error (it usually is -- every format here is bounded by the input).
+function arenaAlloc(ptr ValueArena arena, int n):ptr int8 {
+    if (n <= 0) {
+        n = 1;
+    }
+    int want = (n + 7) & (0 - 8);
+    ptr ArenaBlock block = arena->cur;
+    if (block == null || block->size - block->used < want) {
+        // Ask for at least the default so a run of small allocations does not
+        // turn into a run of blocks.
+        int size = want > kArenaDefaultBlock ? want : kArenaDefaultBlock;
+        ptr ArenaBlock fresh = arenaNewBlock(size);
+        if (fresh == null) {
+            return null;
+        }
+        fresh->link = arena->first;
+        arena->first = fresh;
+        arena->cur = fresh;
+        arena->total = arena->total + size;
+        arena->blocks = arena->blocks + 1;
+        block = fresh;
+    }
+    ptr int8 at = block->data + block->used;
+    block->used = block->used + want;
+    return at;
+    eof: pass;
+}
+
+//  The one place that assumes the `string` layout. See the header comment.
+function private arenaStringOf(ptr int8 bytes, int length):string {
+    string s = "";
+    ptr string ps = #s;
+    @(ps as ptr (ptr char)) = bytes as ptr char;
+    @(((ps as ptr int8) + 8) as ptr int64) = length as int64;
+    return s;
+}
+
+//  Copies `length` bytes into the arena and returns a string pointing at them.
+function arenaString(ptr ValueArena arena, ptr int8 source, int length):string {
+    if (source == null || length <= 0) {
+        return "";
+    }
+    ptr int8 copy = arenaAlloc(arena, length);
+    if (copy == null) {
+        return "";
+    }
+    memcpy(copy as ptr void, source as ptr void, length);
+    return arenaStringOf(copy, length);
+}
+
+function arenaStringOfString(ptr ValueArena arena, string text):string {
+    return arenaString(arena, strBytesOf(text), text.length);
+}
+
+//  Reserves `length` writable bytes in the arena so a caller can fill them in
+//  place and then call `arenaStringTake`. This is how a writer avoids a copy of
+//  the whole document.
+function arenaTake(ptr ValueArena arena, int length):ptr int8 {
+    return arenaAlloc(arena, length);
+}
+
+function arenaStringTake(ptr int8 bytes, int length):string {
+    return arenaStringOf(bytes, length);
+}
+
+//===--- reading a file --------------------------------------------------===//
+
+//  Reads a whole file into the document's arena and returns it as a string, or
+//  "" with `docError` set. One allocation: the size comes from `fileSize`, so the
+//  buffer is never re-read or grown.
+//
+//  This exists so every parser can offer `xParseFile` without repeating the
+//  read-file dance (and without each caller writing it). The size limit is the
+//  arena's, not a fixed constant -- a 100 MB JSON file is fine as long as the
+//  arena can hold it.
+function docReadFile(ptr Doc d, string path):string {
+    int size = fileSize(path);
+    if (size < 0) {
+        docFail(d, "cannot open '" + path + "'", 0);
+        return "";
+    }
+    if (size == 0) {
+        return "";
+    }
+    // `readTextFile` writes `size` bytes through a `ptr char`, whose elements are
+    // two bytes wide: this allocates twice the bytes it needs, which is cheaper
+    // than depending on the element width staying what it is today.
+    ptr char buffer = alloc(size + 16) as ptr char;
+    if (buffer == null) {
+        docFail(d, "out of memory reading '" + path + "'", 0);
+        return "";
+    }
+    int got = readTextFile(path, buffer, size);
+    if (got < 0) {
+        free(buffer as ptr void);
+        docFail(d, "cannot read '" + path + "'", 0);
+        return "";
+    }
+
+    // Decode before anything else touches the bytes: a UTF-16 file read as bytes
+    // produces text with NUL padding that parses into nonsense without failing.
+    Decoded decoded = decodeText(buffer as ptr unsigned int8, got);
+    free(buffer as ptr void);
+    if (decoded.converted || decoded.hadBom) {
+        // `decodeText` returns a heap string; copy it into the arena so the caller
+        // has one lifetime to manage.
+        return arenaStringOfString(#d->arena, decoded.text);
+    }
+    // Already UTF-8 with no BOM: the bytes are the text, copy them in one step.
+    return arenaString(#d->arena, strBytesOf(decoded.text) as ptr int8, decoded.text.length);
+    eof: pass;
+}
+
+//===--- documents -------------------------------------------------------===//
+
+struct Doc {
+    ValueArena arena;
+    ptr Value root;
+    string error;
+    int errorPos;
+    int errorLine;
+    int errorCol;
+};
+
+//  A document owns one arena. `reserve` <= 0 uses the default block size.
+function docNew(int reserve):Doc {
+    Doc d;
+    arenaInit(#d.arena, reserve);
+    d.root = null;
+    d.error = "";
+    d.errorPos = 0;
+    d.errorLine = 0;
+    d.errorCol = 0;
+    return d;
+}
+
+function docFree(ptr Doc d):void {
+    arenaFree(#d->arena);
+    d->root = null;
+    d->error = "";
+    eof: pass;
+}
+
+function docReset(ptr Doc d):void {
+    arenaFree(#d->arena);
+    arenaInit(#d->arena, 0);
+    d->root = null;
+    d->error = "";
+    d->errorPos = 0;
+    d->errorLine = 0;
+    d->errorCol = 0;
+    eof: pass;
+}
+
+//  Records the first error only: later messages are almost always a consequence
+//  of the first one, and reporting them buries the cause.
+function docFail(ptr Doc d, string message, int pos):ptr Value {
+    if (d->error.length == 0) {
+        d->error = arenaStringOfString(#d->arena, message);
+        d->errorPos = pos;
+    }
+    return null;
+    eof: pass;
+}
+
+function docFailed(ptr Doc d):bool {
+    return d->error.length != 0;
+    eof: pass;
+}
+
+function docError(ptr Doc d):string {
+    return d->error;
+    eof: pass;
+}
+
+//  "unexpected ',' at line 3 column 12" -- one line, ready to print or log.
+function docErrorWithPosition(ptr Doc d, string text):string {
+    if (d->error.length == 0) {
+        return "";
+    }
+    int line = 1;
+    int col = 1;
+    int pos = d->errorPos;
+    if (pos > text.length) {
+        pos = text.length;
+    }
+    ptr unsigned int8 bytes = strBytesOf(text) as ptr unsigned int8;
+    int i = 0;
+    while (i < pos) {
+        if (@(bytes + i) as int == 10) {
+            line = line + 1;
+            col = 1;
+        } else {
+            col = col + 1;
+        }
+        i = i + 1;
+    }
+    return d->error + " at line " + itoa(line, 10) + " column " + itoa(col, 10);
+    eof: pass;
+}
+
+//===--- construction ----------------------------------------------------===//
+
+//  Every constructor takes the Doc because every node lives in its arena. A
+//  null return means the arena is exhausted; callers of the public formats never
+//  see it because `docFail` has already recorded a message.
+function valAlloc(ptr Doc d):ptr Value {
+    ptr Value v = arenaAlloc(#d->arena, sizeof(Value)) as ptr Value;
+    if (v == null) {
+        return docFail(d, "out of memory", 0);
+    }
+    v->kind = kValNull;
+    v->flags = kFlagNone;
+    v->val.i = 0;
+    v->items = null;
+    v->keys = null;
+    v->count = 0;
+    v->cap = 0;
+    return v;
+    eof: pass;
+}
+
+function valNull(ptr Doc d):ptr Value {
+    return valAlloc(d);
+    eof: pass;
+}
+
+function valBool(ptr Doc d, bool value):ptr Value {
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = kValBool;
+    v->val.i = (value ? 1 : 0) as int64;
+    return v;
+    eof: pass;
+}
+
+function valInt(ptr Doc d, int64 value):ptr Value {
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = kValInt;
+    v->val.i = value;
+    return v;
+    eof: pass;
+}
+
+function valFloat(ptr Doc d, double value):ptr Value {
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = kValFloat;
+    v->val.d = value;
+    return v;
+    eof: pass;
+}
+
+function valString(ptr Doc d, string text):ptr Value {
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = kValString;
+    v->val.s = arenaStringOfString(#d->arena, text);
+    return v;
+    eof: pass;
+}
+
+//  Stores a string that the caller guarantees already lives in this document's
+//  arena (a literal or an arena slice). No copy: the parser has just built the
+//  bytes and only needs a node pointing at them.
+function valStringRaw(ptr Doc d, string text):ptr Value {
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = kValString;
+    v->val.s = text;
+    return v;
+    eof: pass;
+}
+
+//  A string that already lives in this document's arena: no copy at all. Used by
+//  the parsers, which build the text during unescaping.
+function valStringTake(ptr Doc d, ptr int8 bytes, int length):ptr Value {
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = kValString;
+    v->val.s = arenaStringOf(bytes, length);
+    return v;
+    eof: pass;
+}
+
+function valArray(ptr Doc d):ptr Value {
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = kValArray;
+    return v;
+    eof: pass;
+}
+
+function valObject(ptr Doc d):ptr Value {
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = kValObject;
+    return v;
+    eof: pass;
+}
+
+//===--- growth ----------------------------------------------------------===//
+
+//  Grows the children of an array or object to hold `want` entries.
+//
+//  The old array is **not** freed: it lives in the arena, which is released as a
+//  whole. That waste (at most the sum of the previous powers of two) is the price
+//  of having no individual free, and it is bounded by 2x the final size.
+function private valReserve(ptr Doc d, ptr Value v, int want):bool {
+    if (v->cap >= want) {
+        return true;
+    }
+    int cap = v->cap < 4 ? 4 : v->cap;
+    while (cap < want) {
+        cap = cap * 2;
+    }
+    ptr Value items = arenaAlloc(#d->arena, cap * sizeof(Value)) as ptr Value;
+    if (items == null) {
+        return false;
+    }
+    if (v->count > 0) {
+        memcpy(items as ptr void, v->items as ptr void, v->count * sizeof(Value));
+    }
+    v->items = items;
+    if (v->kind == kValObject) {
+        ptr string keys = arenaAlloc(#d->arena, cap * sizeof(string)) as ptr string;
+        if (keys == null) {
+            return false;
+        }
+        if (v->count > 0) {
+            memcpy(keys as ptr void, v->keys as ptr void, v->count * sizeof(string));
+        }
+        v->keys = keys;
+    }
+    v->cap = cap;
+    return true;
+    eof: pass;
+}
+
+//  Appends one child to an array. The object form is `valSet`.
+function valPush(ptr Doc d, ptr Value array, ptr Value child):bool {
+    if (array == null || child == null || array->kind != kValArray) {
+        return false;
+    }
+    if (!valReserve(d, array, array->count + 1)) {
+        docFail(d, "out of memory", 0);
+        return false;
+    }
+    array->items[array->count] = @child;
+    array->count = array->count + 1;
+    return true;
+    eof: pass;
+}
+
+//  Index of `key` in an object, or -1. Linear, which is what "tens of keys"
+//  configuration files want: a hash table per object would cost more than the
+//  scan it replaces.
+function valIndexOf(ptr Value object, string key):int {
+    if (object == null || object->kind != kValObject) {
+        return -1;
+    }
+    int i = 0;
+    while (i < object->count) {
+        if (object->keys[i] == key) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+    eof: pass;
+}
+
+//  Sets `key`, replacing the existing value when the key is already there (the
+//  position is kept, so a round trip does not reorder the file).
+function valSet(ptr Doc d, ptr Value object, string key, ptr Value child):bool {
+    if (object == null || child == null || object->kind != kValObject) {
+        return false;
+    }
+    int at = valIndexOf(object, key);
+    if (at >= 0) {
+        object->items[at] = @child;
+        return true;
+    }
+    if (!valReserve(d, object, object->count + 1)) {
+        docFail(d, "out of memory", 0);
+        return false;
+    }
+    object->keys[object->count] = arenaStringOfString(#d->arena, key);
+    object->items[object->count] = @child;
+    object->count = object->count + 1;
+    return true;
+    eof: pass;
+}
+
+//  Sets a raw key without copying it -- for parsers whose key already lives in
+//  the arena (JSON after unescaping, for instance).
+function valSetKeyTake(ptr Doc d, ptr Value object, string key, ptr Value child):bool {
+    if (object == null || child == null || object->kind != kValObject) {
+        return false;
+    }
+    if (!valReserve(d, object, object->count + 1)) {
+        docFail(d, "out of memory", 0);
+        return false;
+    }
+    object->keys[object->count] = key;
+    object->items[object->count] = @child;
+    object->count = object->count + 1;
+    return true;
+    eof: pass;
+}
+
+//  Creates an empty container under `key` and returns a pointer **into the
+//  parent's storage**, so later writes are visible through `valGet`.
+//
+//  `valSet` copies the node it is given (children live in a contiguous array),
+//  so the common mistake
+//
+//      valSet(d, root, "server", valObject(d));   // detached: writes are lost
+//
+//  silently builds a tree nobody can see. These two functions exist to make the
+//  correct form the short one; every parser uses them.
+function valSetNew(ptr Doc d, ptr Value object, string key, int kind):ptr Value {
+    ptr Value node = valAlloc(d);
+    if (node == null) {
+        return null;
+    }
+    node->kind = kind;
+    if (!valSet(d, object, key, node)) {
+        return null;
+    }
+    int at = valIndexOf(object, key);
+    if (at < 0) {
+        return null;
+    }
+    return object->items + at;
+    eof: pass;
+}
+
+function valSetObject(ptr Doc d, ptr Value object, string key):ptr Value {
+    return valSetNew(d, object, key, kValObject);
+    eof: pass;
+}
+
+function valSetArray(ptr Doc d, ptr Value object, string key):ptr Value {
+    return valSetNew(d, object, key, kValArray);
+    eof: pass;
+}
+
+//  Appends an empty container to an array and returns a pointer into the array's
+//  storage. Same reasoning as `valSetNew`.
+function valPushNew(ptr Doc d, ptr Value array, int kind):ptr Value {
+    ptr Value node = valAlloc(d);
+    if (node == null) {
+        return null;
+    }
+    node->kind = kind;
+    if (!valPush(d, array, node)) {
+        return null;
+    }
+    return array->items + (array->count - 1);
+    eof: pass;
+}
+
+//  Removes `key` by shifting the tail, the way an array delete works. Returns
+//  false when the key is not there.
+function valRemove(ptr Value object, string key):bool {
+    int at = valIndexOf(object, key);
+    if (at < 0) {
+        return false;
+    }
+    return valErase(object, at);
+    eof: pass;
+}
+
+function valErase(ptr Value container, int index):bool {
+    if (container == null || index < 0 || index >= container->count) {
+        return false;
+    }
+    int tail = container->count - index - 1;
+    if (tail > 0) {
+        memmove((container->items + index) as ptr void, (container->items + index + 1) as ptr void,
+                tail * sizeof(Value));
+        if (container->kind == kValObject) {
+            memmove((container->keys + index) as ptr void, (container->keys + index + 1) as ptr void,
+                    tail * sizeof(string));
+        }
+    }
+    container->count = container->count - 1;
+    return true;
+    eof: pass;
+}
+
+//===--- access ----------------------------------------------------------===//
+
+function valTypeName(ptr Value v):string {
+    if (v == null) {
+        return "nothing";
+    }
+    switch (v->kind) {
+    case kValNull: return "null";
+    case kValBool: return "bool";
+    case kValInt: return "int";
+    case kValFloat: return "float";
+    case kValString: return "string";
+    case kValArray: return "array";
+    case kValObject: return "object";
+    default: return "unknown";
+    }
+    eof: pass;
+}
+
+function valCount(ptr Value v):int {
+    if (v == null) {
+        return 0;
+    }
+    if (v->kind != kValArray && v->kind != kValObject) {
+        return 0;
+    }
+    return v->count;
+    eof: pass;
+}
+
+//  The i-th child of an array or object. Null when out of range, which is what
+//  lets callers write `if (valAt(v, 0) != null)` without a separate size check.
+function valAt(ptr Value v, int index):ptr Value {
+    if (v == null || index < 0 || index >= v->count) {
+        return null;
+    }
+    if (v->kind != kValArray && v->kind != kValObject) {
+        return null;
+    }
+    return v->items + index;
+    eof: pass;
+}
+
+function valKeyAt(ptr Value v, int index):string {
+    if (v == null || v->kind != kValObject || index < 0 || index >= v->count) {
+        return "";
+    }
+    return v->keys[index];
+    eof: pass;
+}
+
+function valGet(ptr Value object, string key):ptr Value {
+    int at = valIndexOf(object, key);
+    if (at < 0) {
+        return null;
+    }
+    return object->items + at;
+    eof: pass;
+}
+
+//  Dotted lookup: `valPath(root, "server.port")`. Empty segment means the whole
+//  key, so a key that contains a dot still works as a single call.
+function valPath(ptr Value object, string path):ptr Value {
+    if (path.length == 0) {
+        return object;
+    }
+    ptr Value cur = object;
+    int start = 0;
+    int i = 0;
+    while (i <= path.length) {
+        bool atEnd = i == path.length;
+        if (atEnd || strByteAt(path, i) == 46) {
+            if (i > start) {
+                cur = valGet(cur, path[start .. i]);
+                if (cur == null) {
+                    return null;
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return cur;
+    eof: pass;
+}
+
+//===--- getting values (with defaults) ----------------------------------===//
+
+//  Deterministic casts: an int is accepted where a float is wanted (JSON has one
+//  number type), everything else must match. That rule is what makes
+//  `valFloatOf(v, 0.0)` usable on a document that spells `1` instead of `1.0`.
+function valIntOf(ptr Value v, int64 fallback):int64 {
+    if (v == null) {
+        return fallback;
+    }
+    if (v->kind == kValInt) {
+        return v->val.i;
+    }
+    if (v->kind == kValBool) {
+        return v->val.i;
+    }
+    if (v->kind == kValFloat) {
+        return v->val.d as int64;
+    }
+    return fallback;
+    eof: pass;
+}
+
+function valInt(ptr Value v, int fallback):int {
+    int64 wide = valIntOf(v, fallback as int64);
+    if (wide > 2147483647i64) {
+        return 2147483647;
+    }
+    if (wide < -2147483647i64 - 1i64) {
+        return -2147483647 - 1;
+    }
+    return wide as int;
+    eof: pass;
+}
+
+function valFloatOf(ptr Value v, double fallback):double {
+    if (v == null) {
+        return fallback;
+    }
+    if (v->kind == kValFloat) {
+        return v->val.d;
+    }
+    if (v->kind == kValInt || v->kind == kValBool) {
+        return v->val.i as double;
+    }
+    return fallback;
+    eof: pass;
+}
+
+function valStrOf(ptr Value v, string fallback):string {
+    if (v == null || v->kind != kValString) {
+        return fallback;
+    }
+    return v->val.s;
+    eof: pass;
+}
+
+function valBoolOf(ptr Value v, bool fallback):bool {
+    if (v == null) {
+        return fallback;
+    }
+    if (v->kind == kValBool) {
+        return v->val.i != 0;
+    }
+    if (v->kind == kValInt) {
+        return v->val.i != 0;
+    }
+    return fallback;
+    eof: pass;
+}
+
+//  A string for anything printable: numbers are formatted, null becomes "",
+//  collections become their type name. For messages, not for serialisation.
+function valText(ptr Value v):string {
+    if (v == null) {
+        return "";
+    }
+    switch (v->kind) {
+    case kValString: return v->val.s;
+    case kValInt: return itoa(v->val.i, 10);
+    case kValBool: return v->val.i != 0 ? "true" : "false";
+    case kValFloat: return ftoa(v->val.d);
+    case kValNull: return "";
+    default: return valTypeName(v);
+    }
+    eof: pass;
+}
+
+//===--- deep copy -------------------------------------------------------===//
+
+//  Copies a subtree into another document's arena (or the same one). Recursive,
+//  and bounded by the document depth -- a 10000 level nested array would blow the
+//  stack, which is why the parsers cap depth well below that.
+function valCopy(ptr Doc d, ptr Value src):ptr Value {
+    if (src == null) {
+        return null;
+    }
+    ptr Value v = valAlloc(d);
+    if (v == null) {
+        return null;
+    }
+    v->kind = src->kind;
+    v->flags = src->flags;
+
+    if (src->kind == kValString) {
+        v->val.s = arenaStringOfString(#d->arena, src->val.s);
+        return v;
+    }
+    if (src->kind == kValFloat) {
+        v->val.d = src->val.d;
+        return v;
+    }
+    if (src->kind == kValArray) {
+        int i = 0;
+        while (i < src->count) {
+            ptr Value child = valCopy(d, src->items + i);
+            if (child == null) {
+                return null;
+            }
+            valPush(d, v, child);
+            i = i + 1;
+        }
+        return v;
+    }
+    if (src->kind == kValObject) {
+        int i = 0;
+        while (i < src->count) {
+            ptr Value child = valCopy(d, src->items + i);
+            if (child == null) {
+                return null;
+            }
+            valSet(d, v, src->keys[i], child);
+            i = i + 1;
+        }
+        return v;
+    }
+    v->val.i = src->val.i;
+    return v;
+    eof: pass;
+}
+
+//===--- string builder --------------------------------------------------===//
+
+//  `string + string` is O(n) per call, so building a document by concatenation is
+//  O(n^2). Every writer here goes through this buffer and copies once at the end.
+struct StrBuf {
+    ptr int8 data;
+    int length;
+    int capacity;
+};
+
+function sbInit(ptr StrBuf b, int capacity):void {
+    if (capacity < 64) {
+        capacity = 64;
+    }
+    b->data = alloc(capacity) as ptr int8;
+    b->length = 0;
+    b->capacity = b->data == null ? 0 : capacity;
+    eof: pass;
+}
+
+function sbFree(ptr StrBuf b):void {
+    if (b->data != null) {
+        free(b->data as ptr void);
+    }
+    b->data = null;
+    b->length = 0;
+    b->capacity = 0;
+    eof: pass;
+}
+
+function private sbGrow(ptr StrBuf b, int need):bool {
+    if (b->length + need <= b->capacity) {
+        return true;
+    }
+    int cap = b->capacity < 64 ? 64 : b->capacity;
+    while (cap < b->length + need) {
+        cap = cap * 2;
+    }
+    ptr int8 grown = alloc(cap) as ptr int8;
+    if (grown == null) {
+        return false;
+    }
+    if (b->length > 0) {
+        memcpy(grown as ptr void, b->data as ptr void, b->length);
+    }
+    if (b->data != null) {
+        free(b->data as ptr void);
+    }
+    b->data = grown;
+    b->capacity = cap;
+    return true;
+    eof: pass;
+}
+
+//  A byte is written through an `unsigned int8` view. An `int8` store would trap
+//  on anything >= 128 (signed range is -128..127), and every UTF-8 continuation
+//  byte is in that range -- so writing "é" through an int8 view aborts the
+//  program with "cast out of range".
+function sbPutByte(ptr StrBuf b, int byte):void {
+    if (!sbGrow(b, 1)) {
+        return;
+    }
+    @((b->data + b->length) as ptr unsigned int8) = (byte & 255) as unsigned int8;
+    b->length = b->length + 1;
+    eof: pass;
+}
+
+function sbPut(ptr StrBuf b, string text):void {
+    if (text.length <= 0) {
+        return;
+    }
+    if (!sbGrow(b, text.length)) {
+        return;
+    }
+    memcpy((b->data + b->length) as ptr void, strBytesOf(text) as ptr void, text.length);
+    b->length = b->length + text.length;
+    eof: pass;
+}
+
+function sbPutBytes(ptr StrBuf b, ptr int8 bytes, int count):void {
+    if (count <= 0) {
+        return;
+    }
+    if (!sbGrow(b, count)) {
+        return;
+    }
+    memcpy((b->data + b->length) as ptr void, bytes as ptr void, count);
+    b->length = b->length + count;
+    eof: pass;
+}
+
+function sbPutInt(ptr StrBuf b, int64 value):void {
+    sbPut(b, itoa(value, 10));
+    eof: pass;
+}
+
+function sbPutIntBase(ptr StrBuf b, int64 value, int base):void {
+    sbPut(b, itoa(value, base));
+    eof: pass;
+}
+
+function sbPutSpaces(ptr StrBuf b, int count):void {
+    int i = 0;
+    while (i < count) {
+        sbPutByte(b, 32);
+        i = i + 1;
+    }
+    eof: pass;
+}
+
+//  Hands the bytes to the document's arena and releases the scratch buffer, so
+//  the result outlives `sbFree` and never needs its own free.
+function sbFinishInto(ptr Doc d, ptr StrBuf b):string {
+    if (b->length == 0) {
+        sbFree(b);
+        return "";
+    }
+    ptr int8 at = arenaTake(#d->arena, b->length);
+    if (at == null) {
+        sbFree(b);
+        docFail(d, "out of memory", 0);
+        return "";
+    }
+    memcpy(at as ptr void, b->data as ptr void, b->length);
+    int total = b->length;
+    sbFree(b);
+    return arenaStringTake(at, total);
+    eof: pass;
+}
+
+//===--- text helpers ----------------------------------------------------===//
+
+function txtIsSpace(int b):bool {
+    return b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12;
+    eof: pass;
+}
+
+function txtIsDigit(int b):bool {
+    return b >= 48 && b <= 57;
+    eof: pass;
+}
+
+function txtIsAlpha(int b):bool {
+    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 128;
+    eof: pass;
+}
+
+function txtIsAlphaNum(int b):bool {
+    return txtIsAlpha(b) || txtIsDigit(b);
+    eof: pass;
+}
+
+//  -1 for "not a hex digit", which is what lets a caller test and convert in one
+//  call instead of checking twice.
+function txtHexValue(int b):int {
+    if (b >= 48 && b <= 57) {
+        return b - 48;
+    }
+    if (b >= 97 && b <= 102) {
+        return b - 87;
+    }
+    if (b >= 65 && b <= 70) {
+        return b - 55;
+    }
+    return -1;
+    eof: pass;
+}
+
+//  Encodes one code point as UTF-8 into the buffer. Returns the byte count.
+//  Surrogates and values above U+10FFFF are written as U+FFFD, because a parser
+//  that accepted them would produce a string no other tool can read.
+function txtUtf8Encode(ptr StrBuf b, int code):int {
+    if (code < 0 || code > 1114111 || (code >= 55296 && code <= 57343)) {
+        code = 65533;
+    }
+    if (code < 128) {
+        sbPutByte(b, code);
+        return 1;
+    }
+    if (code < 2048) {
+        sbPutByte(b, 192 | (code >> 6));
+        sbPutByte(b, 128 | (code & 63));
+        return 2;
+    }
+    if (code < 65536) {
+        sbPutByte(b, 224 | (code >> 12));
+        sbPutByte(b, 128 | ((code >> 6) & 63));
+        sbPutByte(b, 128 | (code & 63));
+        return 3;
+    }
+    sbPutByte(b, 240 | (code >> 18));
+    sbPutByte(b, 128 | ((code >> 12) & 63));
+    sbPutByte(b, 128 | ((code >> 6) & 63));
+    sbPutByte(b, 128 | (code & 63));
+    return 4;
+    eof: pass;
+}
+
+//  Decodes one UTF-8 sequence at `p[0..count)`. Writes the code point and the
+//  number of bytes consumed. Invalid sequences yield U+FFFD and 1 byte, so a
+//  reader can always make progress.
+function txtUtf8Decode(ptr unsigned int8 p, int count, ptr int code, ptr int used):void {
+    @code = 65533;
+    @used = 1;
+    if (count <= 0) {
+        return;
+    }
+    int b0 = @p as int;
+    if (b0 < 128) {
+        @code = b0;
+        return;
+    }
+    int need = 0;
+    int value = 0;
+    if ((b0 & 224) == 192) {
+        need = 1;
+        value = b0 & 31;
+    } else if ((b0 & 240) == 224) {
+        need = 2;
+        value = b0 & 15;
+    } else if ((b0 & 248) == 240) {
+        need = 3;
+        value = b0 & 7;
+    } else {
+        return;
+    }
+    if (count < need + 1) {
+        return;
+    }
+    int i = 1;
+    while (i <= need) {
+        int b = @(p + i) as int;
+        if ((b & 192) != 128) {
+            return;
+        }
+        value = (value << 6) | (b & 63);
+        i = i + 1;
+    }
+    @code = value;
+    @used = need + 1;
+    eof: pass;
+}
+
+//  Parses the digits at `p[0..count)` as a signed 64 bit integer. Returns the
+//  byte count consumed (0 when there is no digit). Overflow saturates rather
+//  than trapping: a config file with a huge number should be readable, and the
+//  saturation is visible as the clamped value.
+function txtParseInt64(ptr int8 p, int count, ptr int64 out):int {
+    int i = 0;
+    bool negative = false;
+    if (i < count && (@(p + i) as int == 45 || @(p + i) as int == 43)) {
+        negative = @(p + i) as int == 45;
+        i = i + 1;
+    }
+    int start = i;
+    int64 value = 0i64;
+    bool overflow = false;
+    while (i < count) {
+        int b = @(p + i) as int;
+        if (b < 48 || b > 57) {
+            break;
+        }
+        int digit = b - 48;
+        if (value > 922337203685477580i64) {
+            overflow = true;
+        } else {
+            value = value * 10i64 + digit as int64;
+            if (value < 0) {
+                overflow = true;
+                value = 0i64;
+            }
+        }
+        i = i + 1;
+    }
+    if (i == start) {
+        return 0;
+    }
+    if (overflow) {
+        value = 9223372036854775807i64;
+    }
+    @out = negative ? 0i64 - value : value;
+    return i;
+    eof: pass;
+}
+
+//  Parses a JSON/TOML/YAML style floating point number: digits, optional
+//  fraction, optional exponent, plus the three named forms. Returns the byte
+//  count consumed.
+function txtParseFloat(ptr int8 p, int count, ptr double out):int {
+    int i = 0;
+    bool negative = false;
+    if (i < count && (@(p + i) as int == 45 || @(p + i) as int == 43)) {
+        negative = @(p + i) as int == 45;
+        i = i + 1;
+    }
+    double value = 0.0;
+    int start = i;
+    while (i < count) {
+        int b = @(p + i) as int;
+        if (b < 48 || b > 57) {
+            break;
+        }
+        value = value * 10.0 + (b - 48) as double;
+        i = i + 1;
+    }
+    int digits = i - start;
+    if (i < count && @(p + i) as int == 46) {
+        i = i + 1;
+        double scale = 0.1;
+        while (i < count) {
+            int b = @(p + i) as int;
+            if (b < 48 || b > 57) {
+                break;
+            }
+            value = value + (b - 48) as double * scale;
+            scale = scale * 0.1;
+            i = i + 1;
+            digits = digits + 1;
+        }
+    }
+    if (digits == 0) {
+        return 0;
+    }
+    if (i < count && (@(p + i) as int == 101 || @(p + i) as int == 69)) {
+        int mark = i;
+        i = i + 1;
+        bool expNegative = false;
+        if (i < count && (@(p + i) as int == 45 || @(p + i) as int == 43)) {
+            expNegative = @(p + i) as int == 45;
+            i = i + 1;
+        }
+        int expStart = i;
+        int exponent = 0;
+        while (i < count) {
+            int b = @(p + i) as int;
+            if (b < 48 || b > 57) {
+                break;
+            }
+            if (exponent < 10000) {
+                exponent = exponent * 10 + (b - 48);
+            }
+            i = i + 1;
+        }
+        if (i == expStart) {
+            i = mark;
+        } else {
+            double factor = 1.0;
+            int e = 0;
+            while (e < exponent) {
+                factor = factor * 10.0;
+                e = e + 1;
+            }
+            if (expNegative) {
+                value = value / factor;
+            } else {
+                value = value * factor;
+            }
+        }
+    }
+    @out = negative ? 0.0 - value : value;
+    return i;
+    eof: pass;
+}
+
+//===--- equality --------------------------------------------------------===//
+
+//  Structural equality. `==` on two `Value`s would compare storage bytes (D8),
+//  which the union and the capacity field make meaningless, so this is a
+//  function rather than an operator.
+function valEqual(ptr Value a, ptr Value b):bool {
+    if (a == null || b == null) {
+        return a == b;
+    }
+    if (a->kind != b->kind) {
+        // 1 and 1.0 are the same number in every format that has one number type.
+        bool numericA = a->kind == kValInt || a->kind == kValFloat;
+        bool numericB = b->kind == kValInt || b->kind == kValFloat;
+        if (numericA && numericB) {
+            return valFloatOf(a, 0.0) == valFloatOf(b, 0.0);
+        }
+        return false;
+    }
+    if (a->kind == kValNull) {
+        return true;
+    }
+    if (a->kind == kValBool || a->kind == kValInt) {
+        return a->val.i == b->val.i;
+    }
+    if (a->kind == kValFloat) {
+        return a->val.d == b->val.d;
+    }
+    if (a->kind == kValString) {
+        return a->val.s == b->val.s;
+    }
+    if (a->count != b->count) {
+        return false;
+    }
+    int i = 0;
+    if (a->kind == kValArray) {
+        while (i < a->count) {
+            if (!valEqual(a->items + i, b->items + i)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if (a->kind == kValObject) {
+        while (i < a->count) {
+            if (a->keys[i] != b->keys[i]) {
+                return false;
+            }
+            if (!valEqual(a->items + i, b->items + i)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    return true;
+    eof: pass;
+}
+
+//  Order-insensitive equality: objects match when they hold the same keys with
+//  equal values, in any order. `valEqual` is byte-for-byte positional and is the
+//  right check for "did the file keep its order"; this one answers "is this the
+//  same configuration", which is what a round-trip test through a format that
+//  reorders (TOML hoists scalars above sub-tables) actually needs.
+function valEquivalent(ptr Value a, ptr Value b):bool {
+    if (a == null || b == null) {
+        return a == b;
+    }
+    if (a->kind != b->kind) {
+        bool numericA = a->kind == kValInt || a->kind == kValFloat;
+        bool numericB = b->kind == kValInt || b->kind == kValFloat;
+        if (numericA && numericB) {
+            return valFloatOf(a, 0.0) == valFloatOf(b, 0.0);
+        }
+        return false;
+    }
+    if (a->kind == kValObject) {
+        if (a->count != b->count) {
+            return false;
+        }
+        int i = 0;
+        while (i < a->count) {
+            ptr Value other = valGet(b, a->keys[i]);
+            if (other == null) {
+                return false;
+            }
+            if (!valEquivalent(a->items + i, other)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if (a->kind == kValArray) {
+        if (a->count != b->count) {
+            return false;
+        }
+        int i = 0;
+        while (i < a->count) {
+            if (!valEquivalent(a->items + i, b->items + i)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    return valEqual(a, b);
+    eof: pass;
+}

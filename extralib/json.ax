@@ -1,0 +1,812 @@
+//  json.ax -- reading and writing JSON and JSON Lines.
+//
+//      function import (return:(json));
+//
+//      Doc d = docNew(0);
+//      ptr Value root = jsonParse(#d, "{\"port\": 8080}");
+//      if (root == null) {
+//          print(docErrorWithPosition(#d, text));    // with line and column
+//      }
+//      print(valInt(valGet(root, "port"), 0));       // 8080
+//      print(jsonWrite(#d, root));                   // {"port":8080}
+//      docFree(#d);
+//
+//  ── numbers keep the int/float distinction ───────────────────────────────
+//
+//  JSON has one `number` type; this module keeps two kinds, `int` (int64) and `float`
+//  (double). `9007199254740993` through a double goes silently to ...992, breaking
+//  port numbers, IDs and timestamps. The test is the literal form: no fraction and no
+//  exponent means int. Integers write as integers, floats get `.0`, so types survive.
+//
+//  ── strictness ───────────────────────────────────────────────────────────
+//
+//  Per RFC 8259: no comments, trailing commas, single quotes, `NaN`/`Infinity`, no
+//  leading `+` or zero (`01`), no raw control bytes -- all "some parser accepts" tics
+//  that make a file fail elsewhere. **The one leniency is a UTF-8 BOM**: skipped at
+//  the start, too common in real files, and an encoding issue, not a syntax one.
+//
+//  ── depth limit ──────────────────────────────────────────────────────────
+//
+//  Recursive descent costs one stack frame per level, so 1000 levels of nesting blows
+//  the stack. The cap is 200: real files rarely exceed 20, and 200 stops abuse.
+//
+//  depends: value
+
+module "json" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(value));
+
+comptime int kJsonMaxDepth = 200;
+
+//  The parser state lives in one struct instead of five arguments per recursive call:
+//  a bigger frame is more expensive to clear on every call.
+struct JsonReader {
+    //  Bytes are read through an `unsigned int8` view: an `int8` load gives -61
+    //  for 0xC3, and every comparison against a control character would fire.
+    ptr unsigned int8 bytes;
+    int length;
+    int pos;
+    ptr Doc doc;
+    int depth;
+};
+
+//===--- lexer helpers ---------------------------------------------------===//
+
+//  The byte at `pos`, or -1 at end of input. -1 is impossible as a real byte, so
+//  callers can compare against it without a separate bounds test.
+function private jsonPeek(ptr JsonReader r):int {
+    if (r->pos >= r->length) {
+        return -1;
+    }
+    return @(r->bytes + r->pos) as int;
+    eof: pass;
+}
+
+function private jsonPeekAt(ptr JsonReader r, int offset):int {
+    int at = r->pos + offset;
+    if (at < 0 || at >= r->length) {
+        return -1;
+    }
+    return @(r->bytes + at) as int;
+    eof: pass;
+}
+
+function private jsonSkipSpace(ptr JsonReader r):bool {
+    while (r->pos < r->length) {
+        int b = @(r->bytes + r->pos) as int;
+        if (b != 32 && b != 9 && b != 10 && b != 13) {
+            return true;
+        }
+        r->pos = r->pos + 1;
+    }
+    return false;
+    eof: pass;
+}
+
+function private jsonFail(ptr JsonReader r, string message):ptr Value {
+    return docFail(r->doc, message, r->pos);
+    eof: pass;
+}
+
+//===--- strings ---------------------------------------------------------===//
+
+//  Scans from the opening quote to the closing quote, honouring backslash
+//  escapes, and returns the index of the closing quote (or -1). This is a single
+//  pass that tells the string parser how many bytes it may need, so the
+//  unescaped result can be written straight into the arena with no second buffer
+//  and no reallocation.
+function private jsonStringSpan(ptr JsonReader r):int {
+    int i = r->pos + 1;
+    while (i < r->length) {
+        int b = @(r->bytes + i) as int;
+        if (b == 92) {
+            i = i + 2;
+        } else if (b == 34) {
+            return i;
+        } else if (b < 32) {
+            return -1 - i;      // control byte: caller reports it with the offset
+        } else {
+            i = i + 1;
+        }
+    }
+    return -1;
+    eof: pass;
+}
+
+//  Reads a string whose opening quote is at `pos`, writes the decoded bytes into
+//  the arena, and advances past the closing quote. Returns "" and records an
+//  error on failure -- an empty string is a legal value, so callers check
+//  `docFailed` rather than the result.
+function private jsonReadStringRaw(ptr JsonReader r):string {
+    if (jsonPeek(r) != 34) {
+        jsonFail(r, "expected '\"'");
+        return "";
+    }
+    int close = jsonStringSpan(r);
+    if (close < 0) {
+        if (close < -1) {
+            r->pos = -1 - close;
+            jsonFail(r, "control character in a string must be escaped");
+            return "";
+        }
+        jsonFail(r, "unterminated string");
+        return "";
+    }
+
+    // The decoded form is never longer than the source span, so one reservation
+    // is enough; the unused tail is simply not claimed. Arena space is released
+    // as a whole, so the slack costs nothing at free time.
+    int span = close - r->pos - 1;
+    ptr unsigned int8 at = arenaTake(#r->doc->arena, span + 4) as ptr unsigned int8;
+    if (at == null) {
+        jsonFail(r, "out of memory");
+        return "";
+    }
+
+    int i = r->pos + 1;
+    int out = 0;
+    while (i < close) {
+        int b = @(r->bytes + i) as int;
+        if (b != 92) {
+            @(at + out) = (b as unsigned int8);
+            out = out + 1;
+            i = i + 1;
+        } else {
+            int esc = @(r->bytes + i + 1) as int;
+            i = i + 2;
+            int literal = -1;
+            if (esc == 34) {
+                literal = 34;
+            } else if (esc == 92) {
+                literal = 92;
+            } else if (esc == 47) {
+                literal = 47;
+            } else if (esc == 98) {
+                literal = 8;
+            } else if (esc == 102) {
+                literal = 12;
+            } else if (esc == 110) {
+                literal = 10;
+            } else if (esc == 114) {
+                literal = 13;
+            } else if (esc == 116) {
+                literal = 9;
+            } else if (esc == 117) {
+                int code = 0;
+                int k = 0;
+                bool ok = true;
+                while (k < 4) {
+                    int hex = jsonHexAt(r, i + k);
+                    if (hex < 0) {
+                        ok = false;
+                        k = 4;
+                    } else {
+                        code = (code << 4) | hex;
+                        k = k + 1;
+                    }
+                }
+                if (!ok) {
+                    r->pos = i;
+                    jsonFail(r, "\\u needs four hexadecimal digits");
+                    return "";
+                }
+                i = i + 4;
+                // A high surrogate must be followed by a low one: they are two
+                // escapes spelling one code point, and encoding them separately
+                // would produce WTF-8 that no reader accepts.
+                if (code >= 55296 && code <= 56319 && i + 6 <= close) {
+                    if (@(r->bytes + i) as int == 92 && @(r->bytes + i + 1) as int == 117) {
+                        int low = 0;
+                        int k2 = 0;
+                        while (k2 < 4) {
+                            int hex2 = jsonHexAt(r, i + 2 + k2);
+                            if (hex2 < 0) {
+                                k2 = 4;
+                                low = -1;
+                            } else {
+                                low = (low << 4) | hex2;
+                                k2 = k2 + 1;
+                            }
+                        }
+                        if (low >= 56320 && low <= 57343) {
+                            code = 65536 + ((code - 55296) << 10) + (low - 56320);
+                            i = i + 6;
+                        }
+                    }
+                }
+                out = out + txtUtf8EncodeAt(at, out, code);
+            } else {
+                r->pos = i - 1;
+                jsonFail(r, "unknown escape sequence");
+                return "";
+            }
+            if (literal >= 0) {
+                @(at + out) = (literal as unsigned int8);
+                out = out + 1;
+            }
+        }
+    }
+    r->pos = close + 1;
+    return arenaStringTake(at as ptr int8, out);
+    eof: pass;
+}
+
+//  Hex digit at an absolute input offset, or -1.
+function private jsonHexAt(ptr JsonReader r, int at):int {
+    if (at < 0 || at >= r->length) {
+        return -1;
+    }
+    return txtHexValue(@(r->bytes + at) as int);
+    eof: pass;
+}
+
+//  UTF-8 encoding straight into a buffer, used while unescaping. `txtUtf8Encode`
+//  writes into a StrBuf; a string body needs the raw form.
+function private txtUtf8EncodeAt(ptr unsigned int8 at, int offset, int code):int {
+    if (code < 0 || code > 1114111 || (code >= 55296 && code <= 57343)) {
+        code = 65533;
+    }
+    if (code < 128) {
+        @(at + offset) = (code as unsigned int8);
+        return 1;
+    }
+    if (code < 2048) {
+        @(at + offset) = ((192 | (code >> 6)) as unsigned int8);
+        @(at + offset + 1) = ((128 | (code & 63)) as unsigned int8);
+        return 2;
+    }
+    if (code < 65536) {
+        @(at + offset) = ((224 | (code >> 12)) as unsigned int8);
+        @(at + offset + 1) = ((128 | ((code >> 6) & 63)) as unsigned int8);
+        @(at + offset + 2) = ((128 | (code & 63)) as unsigned int8);
+        return 3;
+    }
+    @(at + offset) = ((240 | (code >> 18)) as unsigned int8);
+    @(at + offset + 1) = ((128 | ((code >> 12) & 63)) as unsigned int8);
+    @(at + offset + 2) = ((128 | ((code >> 6) & 63)) as unsigned int8);
+    @(at + offset + 3) = ((128 | (code & 63)) as unsigned int8);
+    return 4;
+    eof: pass;
+}
+
+//===--- numbers ---------------------------------------------------------===//
+
+//  A number is an int when its literal form has no fraction and no exponent.
+//  Anything that fails the syntax check is an error rather than a lenient parse:
+//  `01`, `1.`, `.5`, `+1` and `0x10` are all rejected, as RFC 8259 requires.
+function private jsonReadNumber(ptr JsonReader r):ptr Value {
+    int start = r->pos;
+    if (jsonPeek(r) == 45) {
+        r->pos = r->pos + 1;
+    }
+    int digits = jsonPeek(r);
+    if (digits == 48) {
+        r->pos = r->pos + 1;
+        int after = jsonPeek(r);
+        if (after >= 48 && after <= 57) {
+            return jsonFail(r, "a leading zero is not allowed in a number");
+        }
+    } else if (digits >= 49 && digits <= 57) {
+        while (jsonPeek(r) >= 48 && jsonPeek(r) <= 57) {
+            r->pos = r->pos + 1;
+        }
+    } else {
+        return jsonFail(r, "expected a number");
+    }
+
+    bool isFloat = false;
+    if (jsonPeek(r) == 46) {
+        isFloat = true;
+        r->pos = r->pos + 1;
+        if (!(jsonPeek(r) >= 48 && jsonPeek(r) <= 57)) {
+            return jsonFail(r, "expected a digit after '.'");
+        }
+        while (jsonPeek(r) >= 48 && jsonPeek(r) <= 57) {
+            r->pos = r->pos + 1;
+        }
+    }
+    int mark = jsonPeek(r);
+    if (mark == 101 || mark == 69) {
+        isFloat = true;
+        r->pos = r->pos + 1;
+        int sign = jsonPeek(r);
+        if (sign == 43 || sign == 45) {
+            r->pos = r->pos + 1;
+        }
+        if (!(jsonPeek(r) >= 48 && jsonPeek(r) <= 57)) {
+            return jsonFail(r, "expected a digit in the exponent");
+        }
+        while (jsonPeek(r) >= 48 && jsonPeek(r) <= 57) {
+            r->pos = r->pos + 1;
+        }
+    }
+
+    int length = r->pos - start;
+    if (isFloat) {
+        double value = 0.0;
+        txtParseFloat((r->bytes + start) as ptr int8, length, #value);
+        return valFloat(r->doc, value);
+    }
+    int64 value = 0i64;
+    txtParseInt64((r->bytes + start) as ptr int8, length, #value);
+    return valInt(r->doc, value);
+    eof: pass;
+}
+
+//===--- values ----------------------------------------------------------===//
+
+function private jsonReadValue(ptr JsonReader r):ptr Value {
+    if (!jsonSkipSpace(r)) {
+        return jsonFail(r, "unexpected end of input");
+    }
+    if (r->depth >= kJsonMaxDepth) {
+        return jsonFail(r, "nesting is too deep");
+    }
+    int b = jsonPeek(r);
+    if (b == 123) {
+        return jsonReadObject(r);
+    }
+    if (b == 91) {
+        return jsonReadArray(r);
+    }
+    if (b == 34) {
+        string text = jsonReadStringRaw(r);
+        if (docFailed(r->doc)) {
+            return null;
+        }
+        return valStringRaw(r->doc, text);
+    }
+    if (b == 116) {
+        return jsonReadWord(r, "true", valBool(r->doc, true));
+    }
+    if (b == 102) {
+        return jsonReadWord(r, "false", valBool(r->doc, false));
+    }
+    if (b == 110) {
+        return jsonReadWord(r, "null", valNull(r->doc));
+    }
+    if (b == 45 || (b >= 48 && b <= 57)) {
+        return jsonReadNumber(r);
+    }
+    return jsonFail(r, "unexpected character");
+    eof: pass;
+}
+
+function private jsonReadWord(ptr JsonReader r, string word, ptr Value value):ptr Value {
+    int i = 0;
+    while (i < word.length) {
+        if (jsonPeekAt(r, i) != strByteAt(word, i)) {
+            return jsonFail(r, "unexpected character");
+        }
+        i = i + 1;
+    }
+    r->pos = r->pos + word.length;
+    return value;
+    eof: pass;
+}
+
+function private jsonReadArray(ptr JsonReader r):ptr Value {
+    ptr Value array = valArray(r->doc);
+    if (array == null) {
+        return null;
+    }
+    r->pos = r->pos + 1;      // '['
+    r->depth = r->depth + 1;
+    if (!jsonSkipSpace(r)) {
+        return jsonFail(r, "unterminated array");
+    }
+    if (jsonPeek(r) == 93) {
+        r->pos = r->pos + 1;
+        r->depth = r->depth - 1;
+        return array;
+    }
+    while (true) {
+        ptr Value item = jsonReadValue(r);
+        if (item == null) {
+            return null;
+        }
+        if (!valPush(r->doc, array, item)) {
+            return jsonFail(r, "out of memory");
+        }
+        if (!jsonSkipSpace(r)) {
+            return jsonFail(r, "unterminated array");
+        }
+        int b = jsonPeek(r);
+        if (b == 44) {
+            r->pos = r->pos + 1;
+        } else if (b == 93) {
+            r->pos = r->pos + 1;
+            r->depth = r->depth - 1;
+            return array;
+        } else {
+            return jsonFail(r, "expected ',' or ']'");
+        }
+    }
+    // Unreachable: the loop only exits through one of the returns above. The
+    // path checker does not treat `while (true)` as non-terminating, so the
+    // explicit return documents the fact and keeps the checker quiet.
+    return null;
+    eof: pass;
+}
+
+function private jsonReadObject(ptr JsonReader r):ptr Value {
+    ptr Value object = valObject(r->doc);
+    if (object == null) {
+        return null;
+    }
+    r->pos = r->pos + 1;      // '{'
+    r->depth = r->depth + 1;
+    if (!jsonSkipSpace(r)) {
+        return jsonFail(r, "unterminated object");
+    }
+    if (jsonPeek(r) == 125) {
+        r->pos = r->pos + 1;
+        r->depth = r->depth - 1;
+        return object;
+    }
+    while (true) {
+        if (!jsonSkipSpace(r)) {
+            return jsonFail(r, "unterminated object");
+        }
+        if (jsonPeek(r) != 34) {
+            return jsonFail(r, "expected a string key");
+        }
+        string key = jsonReadStringRaw(r);
+        if (docFailed(r->doc)) {
+            return null;
+        }
+        if (!jsonSkipSpace(r)) {
+            return jsonFail(r, "unterminated object");
+        }
+        if (jsonPeek(r) != 58) {
+            return jsonFail(r, "expected ':' after the key");
+        }
+        r->pos = r->pos + 1;
+        ptr Value item = jsonReadValue(r);
+        if (item == null) {
+            return null;
+        }
+        if (!valSetKeyTake(r->doc, object, key, item)) {
+            return jsonFail(r, "out of memory");
+        }
+        if (!jsonSkipSpace(r)) {
+            return jsonFail(r, "unterminated object");
+        }
+        int b = jsonPeek(r);
+        if (b == 44) {
+            r->pos = r->pos + 1;
+        } else if (b == 125) {
+            r->pos = r->pos + 1;
+            r->depth = r->depth - 1;
+            return object;
+        } else {
+            return jsonFail(r, "expected ',' or '}'");
+        }
+    }
+    return null;
+    eof: pass;
+}
+
+//===--- public entry: parse ---------------------------------------------===//
+
+//  Parses `text` into the document's arena. Returns null on failure, with the
+//  message in `docError` and the offset in `errorPos`.
+function jsonParse(ptr Doc doc, string text):ptr Value {
+    JsonReader reader;
+    reader.bytes = strBytesOf(text) as ptr unsigned int8;
+    reader.length = text.length;
+    reader.pos = 0;
+    reader.doc = doc;
+    reader.depth = 0;
+
+    // A UTF-8 BOM is an encoding marker, not part of the document. Skipping it
+    // is the one deliberate leniency; everything else follows RFC 8259.
+    if (text.length >= 3) {
+        if (@(reader.bytes) as int == 239 && @(reader.bytes + 1) as int == 187 &&
+            @(reader.bytes + 2) as int == 191) {
+            reader.pos = 3;
+        }
+    }
+
+    ptr Value root = jsonReadValue(#reader);
+    if (root == null) {
+        return null;
+    }
+    if (!jsonSkipSpace(#reader)) {
+        doc->root = root;
+        return root;
+    }
+    docFail(doc, "trailing characters after the value", reader.pos);
+    return null;
+    eof: pass;
+}
+
+//===--- serialising -----------------------------------------------------===//
+
+function private jsonEscape(ptr StrBuf b, string text):void {
+    sbPutByte(b, 34);
+    ptr unsigned int8 bytes = strBytesOf(text) as ptr unsigned int8;
+    int i = 0;
+    while (i < text.length) {
+        int c = @(bytes + i) as int;
+        i = i + 1;
+        if (c == 34) {
+            sbPut(b, "\\\"");
+        } else if (c == 92) {
+            sbPut(b, "\\\\");
+        } else if (c == 10) {
+            sbPut(b, "\\n");
+        } else if (c == 13) {
+            sbPut(b, "\\r");
+        } else if (c == 9) {
+            sbPut(b, "\\t");
+        } else if (c == 8) {
+            sbPut(b, "\\b");
+        } else if (c == 12) {
+            sbPut(b, "\\f");
+        } else if (c < 32) {
+            sbPut(b, "\\u");
+            sbPutHex4(b, c);
+        } else {
+            // Everything else, including all non-ASCII bytes, passes through.
+            // JSON is defined on Unicode text, and the source is already UTF-8,
+            // so re-encoding would only risk double encoding.
+            sbPutByte(b, c);
+        }
+    }
+    sbPutByte(b, 34);
+    eof: pass;
+}
+
+function private sbPutHex4(ptr StrBuf b, int value):void {
+    int shift = 12;
+    while (shift >= 0) {
+        int digit = (value >> shift) & 15;
+        sbPutByte(b, digit < 10 ? 48 + digit : 87 + digit);
+        shift = shift - 4;
+    }
+    eof: pass;
+}
+
+//  Floats go through `ftoa` (shortest round-trip form) with two corrections:
+//  JSON has no `inf`/`nan`, so those become `null`; and an integral value is
+//  written with `.0` so re-reading it gives a float again.
+function private jsonWriteFloat(ptr StrBuf b, double value):void {
+    if (value != value) {
+        sbPut(b, "null");
+        return;
+    }
+    if (value > 1.7976931348623157e308 || value < -1.7976931348623157e308) {
+        sbPut(b, "null");
+        return;
+    }
+    string text = ftoa(value);
+    bool hasMark = false;
+    int i = 0;
+    while (i < text.length) {
+        int c = strByteAt(text, i);
+        if (c == 46 || c == 101 || c == 69) {
+            hasMark = true;
+            i = text.length;
+        } else {
+            i = i + 1;
+        }
+    }
+    sbPut(b, text);
+    if (!hasMark) {
+        sbPut(b, ".0");
+    }
+    eof: pass;
+}
+
+//  The shared writer. `indent` <= 0 means compact output; a positive value means
+//  pretty output with that many spaces per level.
+function private jsonWriteValue(ptr StrBuf b, ptr Value v, int indent, int level):void {
+    if (v == null) {
+        sbPut(b, "null");
+        return;
+    }
+    if (v->kind == kValNull) {
+        sbPut(b, "null");
+        return;
+    }
+    if (v->kind == kValBool) {
+        sbPut(b, v->val.i != 0 ? "true" : "false");
+        return;
+    }
+    if (v->kind == kValInt) {
+        sbPut(b, itoa(v->val.i, 10));
+        return;
+    }
+    if (v->kind == kValFloat) {
+        jsonWriteFloat(b, v->val.d);
+        return;
+    }
+    if (v->kind == kValString) {
+        jsonEscape(b, v->val.s);
+        return;
+    }
+    if (v->kind == kValArray) {
+        if (v->count == 0) {
+            sbPut(b, "[]");
+            return;
+        }
+        sbPutByte(b, 91);
+        int i = 0;
+        while (i < v->count) {
+            if (i > 0) {
+                sbPutByte(b, 44);
+            }
+            if (indent > 0) {
+                sbPutByte(b, 10);
+                sbPutSpaces(b, indent * (level + 1));
+            }
+            jsonWriteValue(b, v->items + i, indent, level + 1);
+            i = i + 1;
+        }
+        if (indent > 0) {
+            sbPutByte(b, 10);
+            sbPutSpaces(b, indent * level);
+        }
+        sbPutByte(b, 93);
+        return;
+    }
+    if (v->kind == kValObject) {
+        if (v->count == 0) {
+            sbPut(b, "{}");
+            return;
+        }
+        sbPutByte(b, 123);
+        int i = 0;
+        while (i < v->count) {
+            if (i > 0) {
+                sbPutByte(b, 44);
+            }
+            if (indent > 0) {
+                sbPutByte(b, 10);
+                sbPutSpaces(b, indent * (level + 1));
+            }
+            jsonEscape(b, v->keys[i]);
+            sbPutByte(b, 58);
+            if (indent > 0) {
+                sbPutByte(b, 32);
+            }
+            jsonWriteValue(b, v->items + i, indent, level + 1);
+            i = i + 1;
+        }
+        if (indent > 0) {
+            sbPutByte(b, 10);
+            sbPutSpaces(b, indent * level);
+        }
+        sbPutByte(b, 125);
+        return;
+    }
+    sbPut(b, "null");
+    eof: pass;
+}
+
+//  Compact form: `{"a":1,"b":[2,3]}`.
+function jsonWrite(ptr Doc doc, ptr Value v):string {
+    StrBuf b;
+    sbInit(#b, 256);
+    jsonWriteValue(#b, v, 0, 0);
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+//  Pretty form. `spaces` is per level; 2 is what most tools emit.
+function jsonWriteIndent(ptr Doc doc, ptr Value v, int spaces):string {
+    if (spaces <= 0) {
+        spaces = 2;
+    }
+    StrBuf b;
+    sbInit(#b, 256);
+    jsonWriteValue(#b, v, spaces, 0);
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+//===--- JSON Lines ------------------------------------------------------===//
+
+//  One value per line, no commas, no enclosing array. Parses the whole text into
+//  an array of the line values; blank lines are skipped, so a trailing newline
+//  does not produce an empty entry. A parse failure names the line, which is the
+//  only useful coordinate in this format.
+function jsonlParse(ptr Doc doc, string text):ptr Value {
+    ptr Value array = valArray(doc);
+    if (array == null) {
+        return null;
+    }
+    ptr unsigned int8 bytes = strBytesOf(text) as ptr unsigned int8;
+    int length = text.length;
+    int i = 0;
+    int lineNumber = 0;
+    while (i < length) {
+        int lineStart = i;
+        while (i < length && @(bytes + i) as int != 10) {
+            i = i + 1;
+        }
+        int lineEnd = i;
+        if (i < length) {
+            i = i + 1;
+        }
+        lineNumber = lineNumber + 1;
+        if (lineEnd > lineStart && @(bytes + lineEnd - 1) as int == 13) {
+            lineEnd = lineEnd - 1;
+        }
+
+        int from = lineStart;
+        while (from < lineEnd) {
+            int c = @(bytes + from) as int;
+            if (c == 32 || c == 9) {
+                from = from + 1;
+            } else {
+                from = lineEnd;      // stop on the first non-space
+            }
+        }
+        // `from` stops at lineEnd whether the line was blank or not; re-scan to
+        // tell the two apart, because only "no content at all" should be skipped.
+        int content = lineStart;
+        while (content < lineEnd) {
+            int c = @(bytes + content) as int;
+            if (c == 32 || c == 9) {
+                content = content + 1;
+            } else {
+                content = lineEnd + content;   // nonzero marker: has content
+                content = lineEnd * 2;
+            }
+        }
+        bool hasContent = content != lineEnd;
+        if (hasContent) {
+            string line = arenaString(#doc->arena, (bytes + lineStart) as ptr int8,
+                                      lineEnd - lineStart);
+            ptr Value item = jsonParse(doc, line);
+            if (item == null) {
+                string reason = docError(doc);
+                doc->error = arenaStringOfString(#doc->arena,
+                                                 "line " + itoa(lineNumber, 10) + ": " + reason);
+                return null;
+            }
+            if (!valPush(doc, array, item)) {
+                return null;
+            }
+        }
+    }
+    return array;
+    eof: pass;
+}
+
+//  Writes an array as JSON Lines. A non-array is written as a single line, which
+//  makes the function usable without checking the shape first.
+function jsonlWrite(ptr Doc doc, ptr Value values):string {
+    StrBuf b;
+    sbInit(#b, 256);
+    if (values != null && values->kind == kValArray) {
+        int i = 0;
+        while (i < values->count) {
+            jsonWriteValue(#b, values->items + i, 0, 0);
+            sbPutByte(#b, 10);
+            i = i + 1;
+        }
+    } else {
+        jsonWriteValue(#b, values, 0, 0);
+        sbPutByte(#b, 10);
+    }
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+//  Reads `path` and parses it. The error convention is `value.ax`'s: null means
+//  failure, `docError` says why (including "cannot open" for the file itself).
+function jsonParseFile(ptr Doc doc, string path):ptr Value {
+    string text = docReadFile(doc, path);
+    if (docFailed(doc)) {
+        return null;
+    }
+    return jsonParse(doc, text);
+    eof: pass;
+}

@@ -1,0 +1,1146 @@
+//  toml.ax -- reading and writing TOML 1.0.
+//
+//      function import (return:(toml));
+//
+//      Doc d = docNew(0);
+//      ptr Value root = tomlParse(#d, "[db]\nhost = \"h\"\nport = 5432\n");
+//      print(valStrOf(valPath(root, "db.host"), "?"));   // h
+//      print(tomlWrite(#d, root));
+//      docFree(#d);
+//
+//  ── shape ────────────────────────────────────────────────────────────────
+//
+//  A table becomes an object, `[[array of tables]]` an array of objects, and scalars
+//  keep Value's int / float / bool / string. **Times are not timestamps**: TOML has
+//  four kinds (offset/local date-time, local date, local time) and seconds would lose
+//  "no time zone". They stay strings flagged `kFlagDateTime`, written back unquoted.
+//
+//  ── why write order matters ──────────────────────────────────────────────
+//
+//  TOML requires **key/value pairs before sub-tables** (`a.x = 1` after `[a]` reopens
+//  the table, which is illegal). So a table is written in two passes: every non-table
+//  value, then the sub-tables. Otherwise a legal input would be written back illegal.
+//
+//  ── what is parsed ───────────────────────────────────────────────────────
+//
+//  Supported: `[table]`, `[[array]]`, dotted keys (`a.b.c = 1`), inline tables, arrays of
+//  mixed types, four string forms (basic, literal, multi-line each), dec/hex/octal/binary
+//  integers with underscores, floats with `inf`/`nan`, booleans, four time kinds, comments.
+//
+//  Rejected with an explicit error: `+`/`-` on a non-number, characters TOML forbids in
+//  a bare key, redefined keys, a table used as a value, array/table name conflicts.
+//
+//  depends: value
+
+module "toml" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(value));
+
+//===--- parser state ----------------------------------------------------===//
+
+struct TomlReader {
+    ptr unsigned int8 bytes;
+    int length;
+    int pos;
+    int line;
+    ptr Doc doc;
+};
+
+function private tomlByteAt(ptr TomlReader r, int at):int {
+    if (at < 0 || at >= r->length) {
+        return -1;
+    }
+    return @(r->bytes + at) as int;
+    eof: pass;
+}
+
+function private tomlFail(ptr TomlReader r, string message):ptr Value {
+    return docFail(r->doc, message + " (line " + itoa(r->line, 10) + ")", r->pos);
+    eof: pass;
+}
+
+function private tomlSpace(int b):bool {
+    return b == 32 || b == 9;
+    eof: pass;
+}
+
+function private tomlSkipInlineSpace(ptr TomlReader r):void {
+    while (r->pos < r->length && tomlSpace(@(r->bytes + r->pos) as int)) {
+        r->pos = r->pos + 1;
+    }
+    eof: pass;
+}
+
+//  Skips spaces, then a comment if one starts there. Does not cross a newline:
+//  the caller decides what a newline means in its context.
+function private tomlSkipTrailing(ptr TomlReader r):void {
+    tomlSkipInlineSpace(r);
+    if (r->pos < r->length && @(r->bytes + r->pos) as int == 35) {
+        while (r->pos < r->length && @(r->bytes + r->pos) as int != 10) {
+            r->pos = r->pos + 1;
+        }
+    }
+    eof: pass;
+}
+
+function private tomlAtNewline(ptr TomlReader r):bool {
+    if (r->pos >= r->length) {
+        return true;
+    }
+    int c = @(r->bytes + r->pos) as int;
+    return c == 10 || c == 13;
+    eof: pass;
+}
+
+//  Consumes one newline (CRLF or LF) and bumps the line counter.
+function private tomlNewline(ptr TomlReader r):void {
+    if (r->pos < r->length && @(r->bytes + r->pos) as int == 13) {
+        r->pos = r->pos + 1;
+    }
+    if (r->pos < r->length && @(r->bytes + r->pos) as int == 10) {
+        r->pos = r->pos + 1;
+    }
+    r->line = r->line + 1;
+    eof: pass;
+}
+
+//===--- strings ---------------------------------------------------------===//
+
+//  Reads a basic string (`"..."`) with escapes. The opening quote must be at
+//  `pos`. Multi-line forms are handled by the caller, which peeks for `"""`.
+function private tomlReadBasic(ptr TomlReader r, bool multiline):string {
+    int quoteRun = multiline ? 3 : 1;
+    r->pos = r->pos + quoteRun;
+    if (multiline) {
+        // A newline immediately after the opening delimiter is trimmed.
+        if (r->pos < r->length && @(r->bytes + r->pos) as int == 13) {
+            r->pos = r->pos + 1;
+        }
+        if (r->pos < r->length && @(r->bytes + r->pos) as int == 10) {
+            r->pos = r->pos + 1;
+            r->line = r->line + 1;
+        }
+    }
+    // Worst case the decoded text is as long as the rest of the file.
+    ptr int8 buffer = arenaTake(#r->doc->arena, r->length - r->pos + 4);
+    if (buffer == null) {
+        tomlFail(r, "out of memory");
+        return "";
+    }
+    int out = 0;
+    while (true) {
+        if (r->pos >= r->length) {
+            tomlFail(r, "unterminated string");
+            return "";
+        }
+        int c = @(r->bytes + r->pos) as int;
+        if (c == 34) {
+            if (!multiline) {
+                r->pos = r->pos + 1;
+                return arenaStringTake(buffer, out);
+            }
+            if (tomlByteAt(r, r->pos + 1) == 34 && tomlByteAt(r, r->pos + 2) == 34) {
+                // Up to two extra quotes may close the block, e.g. `"""a""""`.
+                int extra = 0;
+                while (extra < 2 && tomlByteAt(r, r->pos + 3 + extra) == 34) {
+                    extra = extra + 1;
+                }
+                int k = 0;
+                while (k < extra) {
+                    @((buffer + out) as ptr unsigned int8) = ((34) & 255) as unsigned int8;
+                    out = out + 1;
+                    k = k + 1;
+                }
+                r->pos = r->pos + 3 + extra;
+                return arenaStringTake(buffer, out);
+            }
+            @((buffer + out) as ptr unsigned int8) = ((34) & 255) as unsigned int8;
+            out = out + 1;
+            r->pos = r->pos + 1;
+            continue;
+        }
+        if (c == 10 || c == 13) {
+            if (!multiline) {
+                tomlFail(r, "unterminated string (newline inside a single-line string)");
+                return "";
+            }
+            tomlNewline(r);
+            @((buffer + out) as ptr unsigned int8) = ((10) & 255) as unsigned int8;
+            out = out + 1;
+            continue;
+        }
+        if (c != 92) {
+            @((buffer + out) as ptr unsigned int8) = ((c) & 255) as unsigned int8;
+            out = out + 1;
+            r->pos = r->pos + 1;
+            continue;
+        }
+        // Escape.
+        int esc = tomlByteAt(r, r->pos + 1);
+        r->pos = r->pos + 2;
+        if (esc == 110) {
+            @((buffer + out) as ptr unsigned int8) = ((10) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (esc == 116) {
+            @((buffer + out) as ptr unsigned int8) = ((9) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (esc == 114) {
+            @((buffer + out) as ptr unsigned int8) = ((13) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (esc == 98) {
+            @((buffer + out) as ptr unsigned int8) = ((8) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (esc == 102) {
+            @((buffer + out) as ptr unsigned int8) = ((12) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (esc == 34) {
+            @((buffer + out) as ptr unsigned int8) = ((34) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (esc == 92) {
+            @((buffer + out) as ptr unsigned int8) = ((92) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (esc == 101) {
+            @((buffer + out) as ptr unsigned int8) = ((27) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (esc == 117 || esc == 85) {
+            int digits = esc == 117 ? 4 : 8;
+            int code = 0;
+            int k = 0;
+            bool ok = true;
+            while (k < digits) {
+                int digit = txtHexValue(tomlByteAt(r, r->pos + k));
+                if (digit < 0) {
+                    ok = false;
+                    k = digits;
+                } else {
+                    code = (code << 4) | digit;
+                    k = k + 1;
+                }
+            }
+            if (!ok) {
+                tomlFail(r, "a \\u escape needs hexadecimal digits");
+                return "";
+            }
+            r->pos = r->pos + digits;
+            out = out + tomlUtf8Encode(buffer, out, code);
+        } else if (multiline && (esc == 10 || esc == 13 || tomlSpace(esc))) {
+            // Line-ending backslash: trims the newline and all following
+            // whitespace, which is how TOML spells a long logical line.
+            while (r->pos < r->length && tomlSpace(@(r->bytes + r->pos) as int)) {
+                r->pos = r->pos + 1;
+            }
+            if (r->pos < r->length && @(r->bytes + r->pos) as int == 13) {
+                r->pos = r->pos + 1;
+            }
+            if (r->pos < r->length && @(r->bytes + r->pos) as int == 10) {
+                r->pos = r->pos + 1;
+                r->line = r->line + 1;
+            }
+            while (r->pos < r->length) {
+                int b = @(r->bytes + r->pos) as int;
+                if (b == 32 || b == 9 || b == 10 || b == 13) {
+                    if (b == 10) {
+                        r->line = r->line + 1;
+                    }
+                    r->pos = r->pos + 1;
+                } else {
+                    r->pos = r->length - r->pos + r->length;   // break
+                    r->pos = r->length;
+                }
+            }
+        } else {
+            tomlFail(r, "unknown escape sequence");
+            return "";
+        }
+    }
+    return "";
+    eof: pass;
+}
+
+//  Literal strings have no escapes: `'C:\path'` is taken verbatim.
+function private tomlReadLiteral(ptr TomlReader r, bool multiline):string {
+    int quoteRun = multiline ? 3 : 1;
+    r->pos = r->pos + quoteRun;
+    if (multiline) {
+        if (r->pos < r->length && @(r->bytes + r->pos) as int == 13) {
+            r->pos = r->pos + 1;
+        }
+        if (r->pos < r->length && @(r->bytes + r->pos) as int == 10) {
+            r->pos = r->pos + 1;
+            r->line = r->line + 1;
+        }
+    }
+    ptr int8 buffer = arenaTake(#r->doc->arena, r->length - r->pos + 4);
+    if (buffer == null) {
+        tomlFail(r, "out of memory");
+        return "";
+    }
+    int out = 0;
+    while (true) {
+        if (r->pos >= r->length) {
+            tomlFail(r, "unterminated literal string");
+            return "";
+        }
+        int c = @(r->bytes + r->pos) as int;
+        if (c == 39) {
+            if (!multiline) {
+                r->pos = r->pos + 1;
+                return arenaStringTake(buffer, out);
+            }
+            if (tomlByteAt(r, r->pos + 1) == 39 && tomlByteAt(r, r->pos + 2) == 39) {
+                int extra = 0;
+                while (extra < 2 && tomlByteAt(r, r->pos + 3 + extra) == 39) {
+                    extra = extra + 1;
+                }
+                int k = 0;
+                while (k < extra) {
+                    @((buffer + out) as ptr unsigned int8) = ((39) & 255) as unsigned int8;
+                    out = out + 1;
+                    k = k + 1;
+                }
+                r->pos = r->pos + 3 + extra;
+                return arenaStringTake(buffer, out);
+            }
+            @((buffer + out) as ptr unsigned int8) = ((39) & 255) as unsigned int8;
+            out = out + 1;
+            r->pos = r->pos + 1;
+            continue;
+        }
+        if (c == 10 || c == 13) {
+            if (!multiline) {
+                tomlFail(r, "unterminated literal string");
+                return "";
+            }
+            tomlNewline(r);
+            @((buffer + out) as ptr unsigned int8) = ((10) & 255) as unsigned int8;
+            out = out + 1;
+            continue;
+        }
+        @((buffer + out) as ptr unsigned int8) = ((c) & 255) as unsigned int8;
+        out = out + 1;
+        r->pos = r->pos + 1;
+    }
+    return "";
+    eof: pass;
+}
+
+function private tomlUtf8Encode(ptr int8 at, int offset, int code):int {
+    if (code < 0 || code > 1114111 || (code >= 55296 && code <= 57343)) {
+        code = 65533;
+    }
+    ptr unsigned int8 out = at as ptr unsigned int8;
+    if (code < 128) {
+        @(out + offset) = code as unsigned int8;
+        return 1;
+    }
+    if (code < 2048) {
+        @(out + offset) = (192 | (code >> 6)) as unsigned int8;
+        @(out + offset + 1) = (128 | (code & 63)) as unsigned int8;
+        return 2;
+    }
+    if (code < 65536) {
+        @(out + offset) = (224 | (code >> 12)) as unsigned int8;
+        @(out + offset + 1) = (128 | ((code >> 6) & 63)) as unsigned int8;
+        @(out + offset + 2) = (128 | (code & 63)) as unsigned int8;
+        return 3;
+    }
+    @(out + offset) = (240 | (code >> 18)) as unsigned int8;
+    @(out + offset + 1) = (128 | ((code >> 12) & 63)) as unsigned int8;
+    @(out + offset + 2) = (128 | ((code >> 6) & 63)) as unsigned int8;
+    @(out + offset + 3) = (128 | (code & 63)) as unsigned int8;
+    return 4;
+    eof: pass;
+}
+
+//===--- keys ------------------------------------------------------------===//
+
+function private tomlBareKeyByte(int c):bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+           c == 95 || c == 45;
+    eof: pass;
+}
+
+//  Reads a single key segment: bare, or quoted (basic or literal).
+function private tomlReadKeySegment(ptr TomlReader r):string {
+    tomlSkipInlineSpace(r);
+    int c = tomlByteAt(r, r->pos);
+    if (c == 34) {
+        if (tomlByteAt(r, r->pos + 1) == 34 && tomlByteAt(r, r->pos + 2) == 34) {
+            tomlFail(r, "a multi-line string cannot be a key");
+            return "";
+        }
+        return tomlReadBasic(r, false);
+    }
+    if (c == 39) {
+        if (tomlByteAt(r, r->pos + 1) == 39 && tomlByteAt(r, r->pos + 2) == 39) {
+            tomlFail(r, "a multi-line string cannot be a key");
+            return "";
+        }
+        return tomlReadLiteral(r, false);
+    }
+    int start = r->pos;
+    while (r->pos < r->length && tomlBareKeyByte(@(r->bytes + r->pos) as int)) {
+        r->pos = r->pos + 1;
+    }
+    if (r->pos == start) {
+        tomlFail(r, "expected a key");
+        return "";
+    }
+    return arenaString(#r->doc->arena, (r->bytes + start) as ptr int8, r->pos - start);
+    eof: pass;
+}
+
+//  Reads a dotted key into `segments` (an array of strings held by the caller),
+//  returning the count.
+function private tomlReadKeyPath(ptr TomlReader r, ptr string segments, int capacity):int {
+    int count = 0;
+    while (true) {
+        string segment = tomlReadKeySegment(r);
+        if (docFailed(r->doc)) {
+            return 0;
+        }
+        if (count < capacity) {
+            segments[count] = segment;
+        }
+        count = count + 1;
+        tomlSkipInlineSpace(r);
+        if (tomlByteAt(r, r->pos) == 46) {
+            r->pos = r->pos + 1;
+        } else {
+            return count;
+        }
+    }
+    return count;
+    eof: pass;
+}
+
+//  Walks (and creates) a path of tables. Returns the table the last segment
+//  names, or null on failure (a scalar already occupying the path is an error).
+function private tomlEnsureTable(ptr Doc doc, ptr Value root, ptr string segments, int count):ptr Value {
+    ptr Value current = root;
+    int i = 0;
+    while (i < count) {
+        ptr Value existing = valGet(current, segments[i]);
+        if (existing == null) {
+            current = valSetObject(doc, current, segments[i]);
+            if (current == null) {
+                return null;
+            }
+        } else if (existing->kind == kValObject) {
+            current = existing;
+        } else {
+            docFail(doc, "'" + segments[i] + "' is not a table", 0);
+            return null;
+        }
+        i = i + 1;
+    }
+    return current;
+    eof: pass;
+}
+
+//===--- values ----------------------------------------------------------===//
+
+function private tomlReadValue(ptr TomlReader r):ptr Value;
+
+//  Reads a bare token (number, bool, datetime) up to a delimiter, then classifies
+//  it. TOML has no unquoted strings, so an unrecognised token is an error rather
+//  than a string.
+function private tomlReadScalar(ptr TomlReader r):ptr Value {
+    int start = r->pos;
+    while (r->pos < r->length) {
+        int c = @(r->bytes + r->pos) as int;
+        bool stop = c == 32 || c == 9 || c == 10 || c == 13 || c == 44 || c == 93 ||
+                    c == 125 || c == 35;
+        if (stop) {
+            break;
+        }
+        r->pos = r->pos + 1;
+    }
+    int length = r->pos - start;
+    if (length == 0) {
+        return tomlFail(r, "expected a value");
+    }
+    string text = arenaString(#r->doc->arena, (r->bytes + start) as ptr int8, length);
+
+    if (text == "true") {
+        return valBool(r->doc, true);
+    }
+    if (text == "false") {
+        return valBool(r->doc, false);
+    }
+    if (text == "inf" || text == "+inf") {
+        return valFloat(r->doc, 1.0 / 0.0);
+    }
+    if (text == "-inf") {
+        return valFloat(r->doc, -1.0 / 0.0);
+    }
+    if (text == "nan" || text == "+nan" || text == "-nan") {
+        return valFloat(r->doc, 0.0 / 0.0);
+    }
+
+    // A date or time has '-' or ':' inside and starts with a digit.
+    bool looksTemporal = false;
+    if (txtIsDigit(strByteAt(text, 0))) {
+        int i = 0;
+        while (i < text.length) {
+            int c = strByteAt(text, i);
+            if ((c == 45 && i == 4) || (c == 58 && i == 2)) {
+                looksTemporal = true;
+                i = text.length;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+    if (looksTemporal) {
+        ptr Value node = valStringRaw(r->doc, text);
+        if (node != null) {
+            node->flags = kFlagDateTime;
+        }
+        return node;
+    }
+
+    // Underscores are digit separators in TOML, and only between digits.
+    ptr int8 cleaned = arenaTake(#r->doc->arena, length + 1);
+    if (cleaned == null) {
+        return tomlFail(r, "out of memory");
+    }
+    int out = 0;
+    int i = 0;
+    bool isFloat = false;
+    bool isHex = false;
+    while (i < length) {
+        int c = strByteAt(text, i);
+        if (c == 95) {
+            bool before = i > 0 && txtIsDigit(strByteAt(text, i - 1));
+            bool after = i + 1 < length && txtIsDigit(strByteAt(text, i + 1));
+            if (!before || !after) {
+                return tomlFail(r, "'_' must sit between two digits");
+            }
+            i = i + 1;
+            continue;
+        }
+        if (c == 46 || c == 101 || c == 69) {
+            isFloat = true;
+        }
+        if (c == 120 || c == 88) {
+            isHex = true;
+        }
+        @((cleaned + out) as ptr unsigned int8) = ((c) & 255) as unsigned int8;
+        out = out + 1;
+        i = i + 1;
+    }
+
+    if (isHex) {
+        int sign = 1;
+        int from = 0;
+        if (out > 0 && @(cleaned) as int == 45) {
+            sign = -1;
+            from = 1;
+        }
+        if (from + 1 < out && @(cleaned + from) as int == 48) {
+            int marker = @(cleaned + from + 1) as int;
+            int base = 0;
+            if (marker == 120 || marker == 88) {
+                base = 16;
+            } else if (marker == 111 || marker == 79) {
+                base = 8;
+            } else if (marker == 98 || marker == 66) {
+                base = 2;
+            }
+            if (base != 0) {
+                int64 value = 0i64;
+                int k = from + 2;
+                bool ok = k < out;
+                while (k < out) {
+                    int digit = txtHexValue(@(cleaned + k) as int);
+                    if (digit < 0 || digit >= base) {
+                        ok = false;
+                        k = out;
+                    } else {
+                        value = value * base as int64 + digit as int64;
+                        k = k + 1;
+                    }
+                }
+                if (!ok) {
+                    return tomlFail(r, "malformed based integer");
+                }
+                if (sign < 0) {
+                    value = 0i64 - value;
+                }
+                return valInt(r->doc, value);
+            }
+        }
+        return tomlFail(r, "malformed integer");
+    }
+
+    if (isFloat) {
+        double value = 0.0;
+        int used = txtParseFloat(cleaned, out, #value);
+        if (used != out) {
+            return tomlFail(r, "malformed float");
+        }
+        return valFloat(r->doc, value);
+    }
+
+    int64 value = 0i64;
+    int used = txtParseInt64(cleaned, out, #value);
+    if (used != out) {
+        return tomlFail(r, "malformed number or unknown bare value '" + text + "'");
+    }
+    return valInt(r->doc, value);
+    eof: pass;
+}
+
+function private tomlReadArray(ptr TomlReader r):ptr Value {
+    ptr Value array = valArray(r->doc);
+    if (array == null) {
+        return null;
+    }
+    r->pos = r->pos + 1;      // '['
+    while (true) {
+        // Newlines are allowed anywhere inside an array.
+        while (true) {
+            tomlSkipInlineSpace(r);
+            if (r->pos < r->length) {
+                int c = @(r->bytes + r->pos) as int;
+                if (c == 10 || c == 13) {
+                    tomlNewline(r);
+                } else if (c == 35) {
+                    tomlSkipTrailing(r);
+                } else {
+                    r->pos = r->pos + 0;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if (tomlByteAt(r, r->pos) == 93) {
+            r->pos = r->pos + 1;
+            return array;
+        }
+        ptr Value item = tomlReadValue(r);
+        if (item == null) {
+            return null;
+        }
+        if (!valPush(r->doc, array, item)) {
+            return null;
+        }
+        while (true) {
+            tomlSkipInlineSpace(r);
+            if (r->pos < r->length) {
+                int c = @(r->bytes + r->pos) as int;
+                if (c == 10 || c == 13) {
+                    tomlNewline(r);
+                } else if (c == 35) {
+                    tomlSkipTrailing(r);
+                } else {
+                    r->pos = r->pos + 0;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        int c = tomlByteAt(r, r->pos);
+        if (c == 44) {
+            r->pos = r->pos + 1;
+        } else if (c == 93) {
+            r->pos = r->pos + 1;
+            return array;
+        } else {
+            return tomlFail(r, "expected ',' or ']' in an array");
+        }
+    }
+    return null;
+    eof: pass;
+}
+
+function private tomlReadInlineTable(ptr TomlReader r):ptr Value {
+    ptr Value table = valObject(r->doc);
+    if (table == null) {
+        return null;
+    }
+    r->pos = r->pos + 1;      // '{'
+    tomlSkipInlineSpace(r);
+    if (tomlByteAt(r, r->pos) == 125) {
+        r->pos = r->pos + 1;
+        return table;
+    }
+    while (true) {
+        string segments[16] = {};
+        int count = tomlReadKeyPath(r, #segments[0], 16);
+        if (docFailed(r->doc)) {
+            return null;
+        }
+        tomlSkipInlineSpace(r);
+        if (tomlByteAt(r, r->pos) != 61) {
+            return tomlFail(r, "expected '=' in an inline table");
+        }
+        r->pos = r->pos + 1;
+        tomlSkipInlineSpace(r);
+        ptr Value value = tomlReadValue(r);
+        if (value == null) {
+            return null;
+        }
+        // Dotted keys inside an inline table create sub-tables.
+        ptr Value target = table;
+        int i = 0;
+        while (i < count - 1) {
+            ptr Value sub = valGet(target, segments[i]);
+            if (sub == null) {
+                sub = valSetObject(r->doc, target, segments[i]);
+                if (sub == null) {
+                    return null;
+                }
+            }
+            target = sub;
+            i = i + 1;
+        }
+        valSet(r->doc, target, segments[count - 1], value);
+        tomlSkipInlineSpace(r);
+        int c = tomlByteAt(r, r->pos);
+        if (c == 44) {
+            r->pos = r->pos + 1;
+        } else if (c == 125) {
+            r->pos = r->pos + 1;
+            return table;
+        } else {
+            return tomlFail(r, "expected ',' or '}' in an inline table");
+        }
+    }
+    return null;
+    eof: pass;
+}
+
+function private tomlReadValue(ptr TomlReader r):ptr Value {
+    tomlSkipInlineSpace(r);
+    int c = tomlByteAt(r, r->pos);
+    if (c == 34) {
+        if (tomlByteAt(r, r->pos + 1) == 34 && tomlByteAt(r, r->pos + 2) == 34) {
+            return valStringRaw(r->doc, tomlReadBasic(r, true));
+        }
+        ptr Value node = valString(r->doc, tomlReadBasic(r, false));
+        if (node != null) {
+            node->flags = kFlagQuoted;
+        }
+        return node;
+    }
+    if (c == 39) {
+        if (tomlByteAt(r, r->pos + 1) == 39 && tomlByteAt(r, r->pos + 2) == 39) {
+            return valStringRaw(r->doc, tomlReadLiteral(r, true));
+        }
+        ptr Value node = valString(r->doc, tomlReadLiteral(r, false));
+        if (node != null) {
+            node->flags = kFlagQuoted;
+        }
+        return node;
+    }
+    if (c == 91) {
+        return tomlReadArray(r);
+    }
+    if (c == 123) {
+        return tomlReadInlineTable(r);
+    }
+    return tomlReadScalar(r);
+    eof: pass;
+}
+
+//===--- documents -------------------------------------------------------===//
+
+//  Parses TOML. Table headers switch the target; `[[name]]` appends a fresh
+//  object to an array of tables.
+function tomlParse(ptr Doc doc, string text):ptr Value {
+    TomlReader reader;
+    reader.bytes = strBytesOf(text) as ptr unsigned int8;
+    reader.length = text.length;
+    reader.pos = 0;
+    reader.line = 1;
+    reader.doc = doc;
+
+    if (text.length >= 3) {
+        if (@(reader.bytes) as int == 239 && @(reader.bytes + 1) as int == 187 &&
+            @(reader.bytes + 2) as int == 191) {
+            reader.pos = 3;
+        }
+    }
+
+    ptr Value root = valObject(doc);
+    if (root == null) {
+        return null;
+    }
+    ptr Value current = root;
+
+    while (reader.pos < reader.length) {
+        tomlSkipInlineSpace(#reader);
+        if (tomlAtNewline(#reader)) {
+            tomlNewline(#reader);
+            continue;
+        }
+        if (tomlByteAt(#reader, reader.pos) == 35) {
+            tomlSkipTrailing(#reader);
+            continue;
+        }
+
+        // ── table header ──
+        if (tomlByteAt(#reader, reader.pos) == 91) {
+            bool isArray = tomlByteAt(#reader, reader.pos + 1) == 91;
+            reader.pos = reader.pos + (isArray ? 2 : 1);
+            string segments[16] = {};
+            int count = tomlReadKeyPath(#reader, #segments[0], 16);
+            if (docFailed(doc)) {
+                return null;
+            }
+            if (count == 0 || count > 16) {
+                docFail(doc, "invalid table header", reader.pos);
+                return null;
+            }
+            tomlSkipInlineSpace(#reader);
+            if (tomlByteAt(#reader, reader.pos) != 93) {
+                docFail(doc, "expected ']' after a table name", reader.pos);
+                return null;
+            }
+            reader.pos = reader.pos + 1;
+            if (isArray) {
+                if (tomlByteAt(#reader, reader.pos) != 93) {
+                    docFail(doc, "expected ']]' after an array table name", reader.pos);
+                    return null;
+                }
+                reader.pos = reader.pos + 1;
+            }
+            tomlSkipTrailing(#reader);
+
+            if (isArray) {
+                ptr Value parent = tomlEnsureTable(doc, root, #segments[0], count - 1);
+                if (parent == null) {
+                    return null;
+                }
+                ptr Value existing = valGet(parent, segments[count - 1]);
+                if (existing == null) {
+                    existing = valSetArray(doc, parent, segments[count - 1]);
+                    if (existing == null) {
+                        return null;
+                    }
+                } else if (existing->kind != kValArray) {
+                    docFail(doc, "cannot redefine '" + segments[count - 1] + "' as an array table",
+                            reader.pos);
+                    return null;
+                }
+                current = valPushNew(doc, existing, kValObject);
+                if (current == null) {
+                    return null;
+                }
+            } else {
+                current = tomlEnsureTable(doc, root, #segments[0], count);
+                if (current == null) {
+                    return null;
+                }
+            }
+            continue;
+        }
+
+        // ── key = value ──
+        string segments[16] = {};
+        int count = tomlReadKeyPath(#reader, #segments[0], 16);
+        if (docFailed(doc)) {
+            return null;
+        }
+        if (count == 0 || count > 16) {
+            docFail(doc, "invalid key", reader.pos);
+            return null;
+        }
+        tomlSkipInlineSpace(#reader);
+        if (tomlByteAt(#reader, reader.pos) != 61) {
+            docFail(doc, "expected '=' after a key", reader.pos);
+            return null;
+        }
+        reader.pos = reader.pos + 1;
+        ptr Value value = tomlReadValue(#reader);
+        if (value == null) {
+            return null;
+        }
+        ptr Value target = current;
+        int i = 0;
+        while (i < count - 1) {
+            ptr Value sub = valGet(target, segments[i]);
+            if (sub == null) {
+                sub = valSetObject(doc, target, segments[i]);
+                if (sub == null) {
+                    return null;
+                }
+            } else if (sub->kind != kValObject) {
+                docFail(doc, "'" + segments[i] + "' is already a value, not a table", reader.pos);
+                return null;
+            }
+            target = sub;
+            i = i + 1;
+        }
+        string leaf = segments[count - 1];
+        if (valGet(target, leaf) != null) {
+            docFail(doc, "duplicate key '" + leaf + "'", reader.pos);
+            return null;
+        }
+        if (!valSet(doc, target, leaf, value)) {
+            return null;
+        }
+        tomlSkipTrailing(#reader);
+    }
+    doc->root = root;
+    return root;
+    eof: pass;
+}
+
+//===--- serialising -----------------------------------------------------===//
+
+function private tomlWriteString(ptr StrBuf b, string text):void {
+    sbPutByte(b, 34);
+    ptr unsigned int8 bytes = strBytesOf(text) as ptr unsigned int8;
+    int i = 0;
+    while (i < text.length) {
+        int c = @(bytes + i) as int;
+        if (c == 34) {
+            sbPut(b, "\\\"");
+        } else if (c == 92) {
+            sbPut(b, "\\\\");
+        } else if (c == 10) {
+            sbPut(b, "\\n");
+        } else if (c == 13) {
+            sbPut(b, "\\r");
+        } else if (c == 9) {
+            sbPut(b, "\\t");
+        } else if (c < 32) {
+            sbPut(b, "\\u");
+            int shift = 12;
+            while (shift >= 0) {
+                int digit = (c >> shift) & 15;
+                sbPutByte(b, digit < 10 ? 48 + digit : 87 + digit);
+                shift = shift - 4;
+            }
+        } else {
+            sbPutByte(b, c);
+        }
+        i = i + 1;
+    }
+    sbPutByte(b, 34);
+    eof: pass;
+}
+
+//  A key is bare when TOML allows it; quoting is the fallback for names with
+//  spaces or dots.
+function private tomlWriteKey(ptr StrBuf b, string key):void {
+    bool bare = key.length > 0;
+    int i = 0;
+    while (i < key.length) {
+        if (!tomlBareKeyByte(strByteAt(key, i))) {
+            bare = false;
+            i = key.length;
+        } else {
+            i = i + 1;
+        }
+    }
+    if (bare) {
+        sbPut(b, key);
+    } else {
+        tomlWriteString(b, key);
+    }
+    eof: pass;
+}
+
+function private tomlWriteInline(ptr StrBuf b, ptr Value v):void;
+
+function private tomlWriteFloatInto(ptr StrBuf b, double value):void {
+    if (value != value) {
+        sbPut(b, "nan");
+        return;
+    }
+    if (value > 1.7976931348623157e308) {
+        sbPut(b, "inf");
+        return;
+    }
+    if (value < -1.7976931348623157e308) {
+        sbPut(b, "-inf");
+        return;
+    }
+    string text = ftoa(value);
+    bool hasMark = false;
+    bool hasDot = false;
+    int i = 0;
+    while (i < text.length) {
+        int c = strByteAt(text, i);
+        if (c == 101 || c == 69) {
+            hasMark = true;
+        }
+        if (c == 46) {
+            hasDot = true;
+        }
+        i = i + 1;
+    }
+    // TOML wants a float to be recognisable as one: `1` is an integer.
+    if (!hasDot) {
+        sbPut(b, text);
+        sbPut(b, ".0");
+        return;
+    }
+    if (hasMark) {
+        sbPut(b, text);
+        return;
+    }
+    sbPut(b, text);
+    eof: pass;
+}
+
+function private tomlWriteInline(ptr StrBuf b, ptr Value v):void {
+    if (v == null) {
+        sbPut(b, "\"\"");
+        return;
+    }
+    if (v->kind == kValBool) {
+        sbPut(b, v->val.i != 0 ? "true" : "false");
+        return;
+    }
+    if (v->kind == kValInt) {
+        sbPut(b, itoa(v->val.i, 10));
+        return;
+    }
+    if (v->kind == kValFloat) {
+        tomlWriteFloatInto(b, v->val.d);
+        return;
+    }
+    if (v->kind == kValString) {
+        if (v->flags == kFlagDateTime) {
+            // Written bare: a quoted timestamp would come back as a string.
+            sbPut(b, v->val.s);
+        } else {
+            tomlWriteString(b, v->val.s);
+        }
+        return;
+    }
+    if (v->kind == kValArray) {
+        sbPutByte(b, 91);
+        int i = 0;
+        while (i < v->count) {
+            if (i > 0) {
+                sbPut(b, ", ");
+            }
+            tomlWriteInline(b, v->items + i);
+            i = i + 1;
+        }
+        sbPutByte(b, 93);
+        return;
+    }
+    if (v->kind == kValObject) {
+        sbPut(b, "{ ");
+        int i = 0;
+        while (i < v->count) {
+            if (i > 0) {
+                sbPut(b, ", ");
+            }
+            tomlWriteKey(b, v->keys[i]);
+            sbPut(b, " = ");
+            tomlWriteInline(b, v->items + i);
+            i = i + 1;
+        }
+        sbPut(b, " }");
+        return;
+    }
+    sbPut(b, "\"\"");
+    eof: pass;
+}
+
+//  True when every element is a table -- the shape `[[array of tables]]` writes.
+function private tomlIsTableArray(ptr Value v):bool {
+    if (v == null || v->kind != kValArray || v->count == 0) {
+        return false;
+    }
+    int i = 0;
+    while (i < v->count) {
+        if (v->items[i].kind != kValObject) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+    eof: pass;
+}
+
+function private tomlWritePath(ptr StrBuf b, string prefix, string name):void {
+    if (prefix.length > 0) {
+        sbPut(b, prefix);
+        sbPutByte(b, 46);
+    }
+    tomlWriteKey(b, name);
+    eof: pass;
+}
+
+//  Writes one table. Two passes, because TOML requires a table's own keys before
+//  its sub-tables; writing in source order would reopen tables and fail to parse.
+function private tomlWriteTable(ptr Doc doc, ptr StrBuf b, ptr Value table, string prefix):void {
+    int i = 0;
+    while (i < table->count) {
+        ptr Value value = table->items + i;
+        bool isSubTable = value->kind == kValObject;
+        bool isTableArray = tomlIsTableArray(value);
+        if (!isSubTable && !isTableArray) {
+            // Relative to the current header: `[db]` already scopes them, and
+            // writing `db.host` inside `[db]` would create `db.db.host`.
+            tomlWriteKey(b, table->keys[i]);
+            sbPut(b, " = ");
+            tomlWriteInline(b, value);
+            sbPutByte(b, 10);
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < table->count) {
+        ptr Value value = table->items + i;
+        string name = table->keys[i];
+        if (value->kind == kValObject) {
+            string path = prefix.length == 0 ? name : prefix + "." + name;
+            sbPutByte(b, 10);
+            sbPutByte(b, 91);
+            sbPut(b, path);
+            sbPut(b, "]\n");
+            tomlWriteTable(doc, b, value, path);
+        } else if (tomlIsTableArray(value)) {
+            string path = prefix.length == 0 ? name : prefix + "." + name;
+            int k = 0;
+            while (k < value->count) {
+                sbPutByte(b, 10);
+                sbPut(b, "[[");
+                sbPut(b, path);
+                sbPut(b, "]]\n");
+                tomlWriteTable(doc, b, value->items + k, path);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    eof: pass;
+}
+
+function tomlWrite(ptr Doc doc, ptr Value root):string {
+    StrBuf b;
+    sbInit(#b, 256);
+    if (root != null && root->kind == kValObject) {
+        tomlWriteTable(doc, #b, root, "");
+    }
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+//  Reads `path` and parses it. The error convention is `value.ax`'s: null means
+//  failure, `docError` says why (including "cannot open" for the file itself).
+function tomlParseFile(ptr Doc doc, string path):ptr Value {
+    string text = docReadFile(doc, path);
+    if (docFailed(doc)) {
+        return null;
+    }
+    return tomlParse(doc, text);
+    eof: pass;
+}

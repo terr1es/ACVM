@@ -1,0 +1,11 @@
+//  A static method has no receiver, so it cannot be called on a value.
+struct S {
+    int n;
+    function make():S { S s = {0}; return s; }
+};
+
+function main():void {
+    S s = S.make();
+    print(s.make());
+    eof: pass;
+}

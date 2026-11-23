@@ -1,0 +1,197 @@
+//  quicksort.ax — in-place quicksort tuned for ACVM's cost model.
+//
+//  ACVM is a stack machine: there are no registers, every local read is a
+//  memory load, and indexing is far more expensive than walking a pointer.
+//  The five choices below are what actually matter here, not the usual C lore.
+//  Measured on 50000 integers against the textbook Lomuto version, these
+//  choices cut the sort's own running time by roughly 4x. For the version
+//  pushed all the way to the instruction floor, see examples/quicksort_max.ax;
+//  bench/README.md has the numbers against C++.
+//
+//    1. Walk with `ptr int` instead of indexing.
+//         data[i]  stages the index, runs two bounds checks, scales by
+//                  sizeof(T) and adds          →  ~20 instructions
+//         @p       two loads                   →  ~3 instructions
+//
+//    2. Take the pivot from the median of three, so already-sorted input does
+//       not degrade to O(n²). This matters more than in C: Axiom traps on
+//       signed overflow, and deep recursion also eats the fixed stack.
+//
+//    3. Partition with Hoare's scheme. It swaps about n/6 elements instead of
+//       n/2, and its inner loops need no bounds test, because the pivot value
+//       itself stops the scan.
+//
+//    4. Finish short ranges with insertion sort. A call zeroes the whole
+//       callee frame, so avoiding calls is worth more here than in C; a
+//       threshold of 8..12 measured best, 12 is used.
+//
+//    5. Recurse only into the smaller half and loop on the larger one. That
+//       keeps recursion depth at O(log n) instead of O(n), which bounds both
+//       stack use and frame-zeroing work.
+//
+//  Run:  acvm run examples/quicksort.ax
+//
+//  This file is also a library: `function import (return:(quicksort));` merges
+//  its members into the importing file. Only `quicksort` is meant for outside
+//  use -- everything else is `private`, which makes it visible in this file and
+//  nowhere else (spec §2.2.1.2). That is how a module controls what it exports:
+//  there is no selective `import`, the file decides.
+
+// ─── data ------------------------------------------------------------------
+
+//  A small linear congruential generator, so every run sorts the same data.
+//  The state is `unsigned int` on purpose: the multiply overflows, and
+//  unsigned arithmetic wraps by definition, whereas signed overflow traps.
+function private fillPseudoRandom(ptr int out, int count, unsigned int seed):void {
+    unsigned int state = seed;
+    for (int i = 0; i < count; i++) {
+        state = state * 1664525u32 + 1013904223u32;
+        int value = (state >> 16) as int;      // keep the high bits
+        @(out + i) = value % 1000;
+    }
+    eof: pass;
+}
+
+// ─── sorting ---------------------------------------------------------------
+
+//  Insertion sort over data[lo .. hi]. Used for short ranges, where its low
+//  constant factor beats another partitioning pass.
+function private insertionSort(ptr int data, int lo, int hi):void {
+    ptr int base = data + lo;
+    int span = hi - lo;
+    for (int i = 1; i <= span; i++) {
+        ptr int hole = base + i;
+        int key = @hole;
+        ptr int scan = hole - 1;
+        while (scan >= base && @scan > key) {
+            @(scan + 1) = @scan;
+            scan--;
+        }
+        @(scan + 1) = key;
+    }
+    eof: pass;
+}
+
+//  Sorts data[lo .. hi] in place.
+function quicksort(ptr int data, int lo, int hi):void {
+    while (lo < hi) {
+        int span = hi - lo;
+        if (span < 12) {
+            insertionSort(data, lo, hi);
+            return;
+        }
+
+        // Order data[lo], data[mid], data[hi], then use the middle one. The
+        // resulting data[lo] <= pivot <= data[hi] invariant is what lets the
+        // partition scans below run without bounds tests.
+        int mid = lo + span / 2;
+        if (@(data + mid) < @(data + lo)) {
+            int t = @(data + mid);
+            @(data + mid) = @(data + lo);
+            @(data + lo) = t;
+        }
+        if (@(data + hi) < @(data + lo)) {
+            int t = @(data + hi);
+            @(data + hi) = @(data + lo);
+            @(data + lo) = t;
+        }
+        if (@(data + hi) < @(data + mid)) {
+            int t = @(data + hi);
+            @(data + hi) = @(data + mid);
+            @(data + mid) = t;
+        }
+        int pivot = @(data + mid);
+
+        // Hoare partition. `left` and `right` start one element outside the
+        // range so the pre-increment inside the loop lands on lo and hi.
+        ptr int left = data + lo - 1;
+        ptr int right = data + hi + 1;
+        while (true) {
+            left++;
+            while (@left < pivot) {
+                left++;
+            }
+            right--;
+            while (@right > pivot) {
+                right--;
+            }
+            if (left >= right) {
+                break;
+            }
+            int t = @left;
+            @left = @right;
+            @right = t;
+        }
+
+        // Hoare guarantees lo <= j < hi, so both halves are strictly smaller
+        // and the loop below always makes progress.
+        int j = (right - data) as int;
+        if (j - lo < hi - j) {
+            quicksort(data, lo, j);      // smaller half: recurse
+            lo = j + 1;                  // larger half: iterate
+        } else {
+            quicksort(data, j + 1, hi);
+            hi = j;
+        }
+    }
+    eof: pass;
+}
+
+// ─── verification and reporting -------------------------------------------
+
+//  Counts adjacent pairs that are out of order; 0 means sorted.
+function private countInversions(ptr int data, int count):int {
+    int inversions = 0;
+    for (int i = 1; i < count; i++) {
+        if (@(data + i - 1) > @(data + i)) {
+            inversions++;
+        }
+    }
+    return inversions;
+}
+
+function private printRun(ptr int data, int from, int count):void {
+    for (int i = 0; i < count; i++) {
+        print(@(data + from + i));
+        print(" ");
+    }
+    eof: pass;
+}
+
+// ─── demo ------------------------------------------------------------------
+
+function main():void {
+    int data[2000];
+    int count = 2000;
+
+    fillPseudoRandom(#data[0], count, 12345u32);
+    int before = countInversions(#data[0], count);
+
+    quicksort(#data[0], 0, count - 1);
+
+    int after = countInversions(#data[0], count);
+    ptr int first = #data[0];
+
+    print("values:            ");
+    print(count);
+    print("\n");
+    print("inversions before: ");
+    print(before);
+    print("\n");
+    print("inversions after:  ");
+    print(after);
+    print(after == 0 ? "  (sorted)\n" : "  (NOT sorted)\n");
+    print("smallest:          ");
+    print(@first);
+    print("\n");
+    print("largest:           ");
+    print(@(first + count - 1));
+    print("\n");
+    print("first 10:          ");
+    printRun(first, 0, 10);
+    print("\n");
+    print("last 10:           ");
+    printRun(first, count - 10, 10);
+    print("\n");
+    eof: pass;
+}

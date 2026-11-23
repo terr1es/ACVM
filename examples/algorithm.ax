@@ -1,0 +1,73 @@
+// algorithm.ax (example) — using the stdlib `algorithm` module.
+//
+// The sorting itself runs in C (stdlib/algorithm.c); Axiom only calls in. One
+// call marshals the array into a contiguous buffer, sorts it natively and
+// copies it back, so the interpreter never touches an element.
+//
+// Run:  acvm run examples/algorithm.ax
+//       acvm run examples/algorithm.ax --stats     (interpreter instruction count)
+
+function import (return:(algorithm));    // stdlib/ is on the module search path
+
+function private fillRandom(ptr int out, int count, unsigned int seed):void {
+    unsigned int state = seed;
+    for (int i = 0; i < count; i++) {
+        state = state * 1664525u32 + 1013904223u32;
+        @(out + i) = ((state >> 16) as int) % 1000;
+    }
+    eof: pass;
+}
+
+function private countInversions(ptr int data, int count):int {
+    int inversions = 0;
+    for (int i = 1; i < count; i++) {
+        if (@(data + i - 1) > @(data + i)) {
+            inversions++;
+        }
+    }
+    return inversions;
+}
+
+function main():void {
+    int values[200];
+    fillRandom(#values[0], 200, 12345u32);
+
+    print("inversions before: ");
+    print(countInversions(#values[0], 200));
+    print("\n");
+
+    sort(#values[0], 200);
+
+    print("inversions after:  ");
+    print(countInversions(#values[0], 200));
+    print("\n");
+
+    ptr int p = #values[0];
+    print("smallest: ");
+    print(@p);
+    print("   largest: ");
+    print(@(p + 199));
+    print("\n");
+
+    // `reverse` is the same marshalling path, opposite order.
+    reverse(#values[0], 200);
+    print("reversed first three: ");
+    print(@p);
+    print(" ");
+    print(@(p + 1));
+    print(" ");
+    print(@(p + 2));
+    print("\n");
+
+    // Doubles take the same route with a different element kind.
+    double samples[5] = {2.5, -1.0, 3.75, 0.0, 1.5};
+    sortDouble(#samples[0], 5);
+    print("doubles: ");
+    for i in 0..5 {
+        print(@(#samples[0] + i));
+        print(" ");
+    }
+    print("\n");
+
+    eof: pass;
+}

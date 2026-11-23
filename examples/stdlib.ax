@@ -1,0 +1,52 @@
+// Pointers, heap allocation and the built-in library.
+function main():void {
+    ptr int p = alloc(10 * sizeof(int)) as ptr int;
+    @p = 42;
+    @(p + 1) = 43;
+    print("heap: ");
+    print(@p);
+    print(" ");
+    print(@(p + 1));
+    print("\n");
+    free(p as ptr void);
+
+    string a = "Hello";
+    string b = trim("  world  ");
+    print(a + ", " + b + "!\n");
+    print(toUpper(a));
+    print(" / ");
+    print(toLower(a));
+    print("\n");
+    print("itoa(255,16)=");
+    print(itoa(255, 16));
+    print(" ftoa(1.5)=");
+    print(ftoa(1.5));
+    print(" atoi(\"123\")+1=");
+    print(atoi("123") + 1);
+    print("\n");
+    print("indexOf=");
+    print(indexOf(a, "ll"));
+    print(" substring=");
+    print(substring(a, 1, 3));
+    print(" startsWith=");
+    print(startsWith(a, "He"));
+    print("\n");
+
+    arena_scope {
+        string tmp = a + " from the arena";
+        print(tmp);
+        print("\n");
+    }
+
+    print("sqrt(9)=");
+    print(sqrt(9.0));
+    print(" fabs(-2.5)=");
+    print(fabs(-2.5));
+    print(" pow(2,10)=");
+    print(pow(2.0, 10.0));
+    print("\n");
+
+    assert(1 + 1 == 2);
+    print("assert passed\n");
+    eof: pass;
+}

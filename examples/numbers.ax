@@ -1,0 +1,43 @@
+function main():void {
+    int8  a = 100;
+    int8  b = 20;
+    print("a+b=");
+    print(a + b);
+    print("\n");
+
+    unsigned int8 u = 255;
+    u = u + 1;
+    print("u wraps to ");
+    print(u);
+    print("\n");
+
+    int8 neg = -128;
+    print("neg=");
+    print(neg);
+    print("\n");
+
+    int   wide = 300;
+    int16 mid = wide as int16;
+    print("cast 300 -> int16 = ");
+    print(mid);
+    print("\n");
+
+    double d = 7.0 / 2.0;
+    print("7.0/2.0=");
+    print(d);
+    print("\n");
+
+    print("7/2=");
+    print(7 / 2);
+    print("\n");
+
+    int127 huge = 85070591730234615865843651857942052863;
+    print("int127 max=");
+    print(huge);
+    print("\n");
+
+    print("1.5 as int = ");
+    print(1.5 as int);
+    print("\n");
+    eof: pass;
+}

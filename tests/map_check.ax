@@ -1,0 +1,220 @@
+//  map_check.ax -- the five key/value combinations of the map module.
+//
+//  Three things that go wrong easily:
+//
+//    1. **Both columns must grow together.** The map is two parallel arrays, so an
+//       insert that succeeds on one side and fails on the other leaves them
+//       permanently misaligned -- every later lookup then reads somebody else's
+//       value, without crashing. Each combination below is read back item by item
+//       after a resize.
+//    2. **Ordered iteration.** The map is a sorted array, so `*KeyAt(i)` must be
+//       strictly ascending.
+//    3. **Empty value vs missing key.** After `mapStrPut(&m, "k", "")`,
+//       `mapStrGet` must return true with an empty string. Only the return value
+//       can tell those apart; the language has no nullable type.
+
+function import (return:(map));
+function import (return:(test));
+
+//  Renders the whole map as `k=v k=v`, so the full contents compare in one go.
+function private renderStrStr(ptr MapStrStr m):string {
+    string out = "";
+    for (int i = 0; i < mapStrCount(m); i++) {
+        if (i > 0) { out = out + " "; }
+        out = out + mapStrKeyAt(m, i) + "=" + mapStrValueAt(m, i);
+    }
+    return out;
+    eof: pass;
+}
+
+function private checkStrStr():void {
+    testGroup("MapStrStr (config table)");
+
+    string keys[8];
+    string values[8];
+    MapStrStr m = makeMapStrStr(#keys[0], #values[0], 8);
+
+    check(mapStrPut(#m, "host", "localhost"), "put host");
+    check(mapStrPut(#m, "port", "8080"), "put port");
+    check(mapStrPut(#m, "path", "/api"), "put path");
+    checkInt(mapStrCount(#m), 3, "count after 3 puts");
+
+    //  Ascending: host < path < port (ASCII lexicographic order).
+    checkString(renderStrStr(#m), "host=localhost path=/api port=8080", "ascending order");
+
+    string out = "";
+    check(mapStrGet(#m, "port", #out), "get port");
+    checkString(out, "8080", "get port value");
+    check(!mapStrGet(#m, "absent", #out), "absent key reports false");
+    check(mapStrHas(#m, "host"), "has host");
+    check(!mapStrHas(#m, "nope"), "has nope is false");
+
+    //  Overwriting is not inserting.
+    check(mapStrPut(#m, "port", "9090"), "overwrite port");
+    checkInt(mapStrCount(#m), 3, "count unchanged after overwrite");
+    mapStrGet(#m, "port", #out);
+    checkString(out, "9090", "overwritten value");
+
+    check(mapStrRemove(#m, "path"), "remove path");
+    checkInt(mapStrCount(#m), 2, "count after remove");
+    check(!mapStrRemove(#m, "path"), "remove twice reports false");
+
+    //  An empty value is a value, not an absent key.
+    check(mapStrPut(#m, "empty", ""), "put empty value");
+    check(mapStrHas(#m, "empty"), "empty value still counts as present");
+    out = "sentinel";
+    check(mapStrGet(#m, "empty", #out), "get empty value");
+    checkString(out, "", "empty value reads back empty");
+
+    //  Passing null for out is a plain lookup.
+    check(mapStrGet(#m, "host", 0 as ptr string), "get with null out");
+    mapStrStrFree(#m);
+    eof: pass;
+}
+
+function private checkStrStrGrowth():void {
+    testGroup("MapStrStr growth");
+
+    //  Capacity 2 holding 20: several resizes, and the two columns must stay aligned.
+    string keys[2];
+    string values[2];
+    MapStrStr m = makeMapStrStr(#keys[0], #values[0], 2);
+
+    for (int i = 0; i < 20; i++) {
+        string k = "k" + itoa(i, 10);
+        string v = "v" + itoa(i, 10);
+        if (!mapStrPut(#m, k, v)) {
+            fail("put " + k + " during growth");
+        }
+    }
+    checkInt(mapStrCount(#m), 20, "count after growth");
+    checkInt(m.keys.capacity, m.values.capacity, "both columns grew to same capacity");
+
+    int wrong = 0;
+    for (int i = 0; i < 20; i++) {
+        string k = "k" + itoa(i, 10);
+        string expect = "v" + itoa(i, 10);
+        string got = "";
+        if (!mapStrGet(#m, k, #got) || got != expect) {
+            wrong = wrong + 1;
+        }
+    }
+    checkInt(wrong, 0, "no mismatches after growth");
+
+    //  Remove half, then read the rest: removal must keep both columns in step.
+    for (int i = 0; i < 20; i = i + 2) {
+        mapStrRemove(#m, "k" + itoa(i, 10));
+    }
+    checkInt(mapStrCount(#m), 10, "count after removing every other key");
+
+    int survivorsWrong = 0;
+    for (int i = 1; i < 20; i = i + 2) {
+        string got = "";
+        if (!mapStrGet(#m, "k" + itoa(i, 10), #got) || got != "v" + itoa(i, 10)) {
+            survivorsWrong = survivorsWrong + 1;
+        }
+    }
+    checkInt(survivorsWrong, 0, "survivors still readable after mass removal");
+    mapStrStrFree(#m);
+    eof: pass;
+}
+
+function private checkIntStr():void {
+    testGroup("MapIntStr (error codes)");
+
+    int keys[8];
+    string values[8];
+    MapIntStr m = makeMapIntStr(#keys[0], #values[0], 8);
+
+    mapIntPut(#m, 404, "not found");
+    mapIntPut(#m, 200, "ok");
+    mapIntPut(#m, 500, "server error");
+    checkInt(mapIntCount(#m), 3, "count");
+
+    //  Keys ascending: 200 < 404 < 500.
+    checkInt(mapIntKeyAt(#m, 0), 200, "smallest key first");
+    checkString(mapIntValueAt(#m, 0), "ok", "smallest key's value");
+    checkInt(mapIntKeyAt(#m, 2), 500, "largest key last");
+
+    string msg = "";
+    check(mapIntGet(#m, 404, #msg), "get 404");
+    checkString(msg, "not found", "404 message");
+    check(!mapIntGet(#m, 999, #msg), "get 999 reports false");
+    check(mapIntHas(#m, 200), "has 200");
+
+    //  Negative keys: the binary search must handle them, not only positives.
+    mapIntPut(#m, -1, "negative");
+    checkInt(mapIntKeyAt(#m, 0), -1, "negative key sorts first");
+    string got = "";
+    check(mapIntGet(#m, -1, #got), "get negative key");
+    checkString(got, "negative", "negative key value");
+
+    //  The extremes of int.
+    mapIntPut(#m, 2147483647, "max");
+    check(mapIntHas(#m, 2147483647), "has int max");
+
+    check(mapIntRemove(#m, 200), "remove 200");
+    checkInt(mapIntCount(#m), 4, "count after remove");
+    mapIntStrFree(#m);
+    eof: pass;
+}
+
+function private checkInt64Map():void {
+    testGroup("MapInt64Int (timestamps)");
+
+    int64 keys[4];
+    int values[4];
+    MapInt64Int m = makeMapInt64Int(#keys[0], #values[0], 4);
+
+    //  Values beyond int32 must survive intact -- the only reason int64 keys exist.
+    int64 big = 9000000000000;
+    check(mapInt64Put(#m, big, 1), "put 9e12");
+    check(mapInt64Put(#m, 1, 10), "put 1");
+    check(mapInt64Put(#m, 5000000000, 50), "put 5e9");
+
+    int out = 0;
+    check(mapInt64Get(#m, big, #out), "get 9e12");
+    checkInt(out, 1, "9e12 value");
+    check(mapInt64Get(#m, 5000000000, #out), "get 5e9");
+    checkInt(out, 50, "5e9 value");
+
+    //  Ordering: 1 < 5e9 < 9e12.
+    checkInt64(mapInt64KeyAt(#m, 0), 1, "smallest first");
+    checkInt64(mapInt64KeyAt(#m, 1), 5000000000, "middle");
+    checkInt64(mapInt64KeyAt(#m, 2), big, "largest last");
+
+    check(!mapInt64Get(#m, 2, #out), "absent reports false");
+    check(mapInt64Remove(#m, big), "remove 9e12");
+    checkInt(mapInt64Count(#m), 2, "count after remove");
+
+    //  Load: capacity 4 holding 30, checking resize alignment for int64 keys. Step
+    //  1000 rather than 1e9: this is about resizing, not large values (covered
+    //  above), and a 1e9 step overflows int32 multiplication by i >= 3.
+    for (int i = 0; i < 30; i++) {
+        int64 key = i as int64 * 1000;
+        if (!mapInt64Put(#m, key, i)) {
+            fail("put during int64 growth");
+        }
+    }
+    checkInt(m.keys.capacity, m.values.capacity, "int64 columns grew together");
+
+    int wrong = 0;
+    for (int i = 0; i < 30; i++) {
+        int probe = 0;
+        if (!mapInt64Get(#m, i as int64 * 1000, #probe) || probe != i) {
+            wrong = wrong + 1;
+        }
+    }
+    checkInt(wrong, 0, "int64 lookups correct after growth");
+    mapInt64IntFree(#m);
+    eof: pass;
+}
+
+function main():void {
+    checkStrStr();
+    checkStrStrGrowth();
+    checkIntStr();
+    checkInt64Map();
+    testFinish();
+    eof: pass;
+}

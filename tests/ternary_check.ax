@@ -1,0 +1,178 @@
+//  ternary_check.ax -- `?:` must read the condition in every context.
+//
+//  Where this file came from: the optimizer once returned 5 (the else arm) for
+//  `int a = cond ? 3 : 5;` regardless of whether `cond` was true. Correct at O0 and
+//  O1, wrong from O2 up.
+//
+//  The cause was not the ternary itself but constant forwarding, which read "the
+//  instruction before `STORE_LOCAL` is a `CONST`" as "this slot now holds that
+//  constant". A ternary is lowered to
+//
+//      JUMP_IF_FALSE -> else
+//      CONST 3
+//      JUMP          -> merge
+//    else:
+//      CONST 5
+//    merge:
+//      STORE_LOCAL a
+//
+//  so `CONST 5` sits immediately before the store in **linear order**, without
+//  dominating it. `a` was therefore taken to be 5, and every later `LOAD_LOCAL a`
+//  was replaced by the constant 5.
+//
+//  So this checks more than the ternary: any shape where "the instruction before a
+//  store is a constant" without that constant being the store's only predecessor is
+//  dangerous. Each context is tested separately, because each is lowered differently.
+//
+//  Run:  acvm run tests/ternary_check.ax
+
+function import (return:(test));
+
+comptime int K = 7;
+
+struct Point {
+    int x;
+    int y;
+};
+
+function pickTrue(int c):int {
+    if (c > 0) { return 10; }
+    return 20;
+    eof: pass;
+}
+
+function pickFalse(int c):int {
+    if (c > 0) { return 10; }
+    return 20;
+    eof: pass;
+}
+
+//  The return value is the ternary: the last store is preceded by an arm's constant.
+function signOf(int x):int {
+    return (x > 0) ? 1 : -1;
+    eof: pass;
+}
+
+//  Both arms are variables: no constant involved, but the same merge point.
+function chooseVar(int x, int a, int b):int {
+    return (x > 0) ? a : b;
+    eof: pass;
+}
+
+//===--- checks -------------------------------------------------------------===//
+
+function checkAssignment():void {
+    testGroup("assignment");
+
+    int one = 1;
+    int minus = -1;
+
+    //  The original bug's shape: a local assigned a ternary whose arms are literals.
+    int t = (one > 0) ? 3 : 5;
+    checkInt(t, 3, "initialiser takes the true arm");
+
+    int f = (one > 9) ? 3 : 5;
+    checkInt(f, 5, "initialiser takes the false arm");
+
+    //  The same code with both conditions: each run must follow its condition.
+    int byArg = (minus > 0) ? 3 : 5;
+    checkInt(byArg, 5, "the same shape with a negative condition");
+
+    //  An assignment followed by another must not be polluted by the first.
+    int again = 0;
+    again = (one > 0) ? 11 : 13;
+    checkInt(again, 11, "assigning a ternary after declaring the local");
+    again = (one > 99) ? 11 : 13;
+    checkInt(again, 13, "the second assignment follows its own condition");
+}
+
+function checkComptimeArm():void {
+    testGroup("comptime arm");
+
+    int one = 1;
+
+    //  A comptime constant as one arm: the shape first suspected in the report.
+    int a = (one > 0) ? K : 5;
+    checkInt(a, 7, "a comptime constant as the true arm");
+
+    int b = (one > 9) ? K : 5;
+    checkInt(b, 5, "…and the false arm when the condition is false");
+
+    int c = (one > 0) ? 3 : (K + 1);
+    checkInt(c, 3, "a comptime expression as the false arm");
+}
+
+function checkOtherContexts():void {
+    testGroup("other contexts");
+
+    int one = 1;
+
+    //  Passed directly as an argument: already correct before the fix; kept as a guard.
+    checkInt(signOf(one), 1, "returning a ternary from a function");
+    checkInt(signOf(-one), -1, "…both arms");
+
+    checkInt(chooseVar(one, 4, 6), 4, "a ternary with variable arms");
+    checkInt(chooseVar(-one, 4, 6), 6, "…both arms");
+
+    //  A call result as an arm: the stack top comes from a call, not a constant.
+    checkInt(pickTrue(one), 10, "a call as the true arm");
+    checkInt(pickFalse(one), 10, "a call as the false arm");
+}
+
+function checkAggregate():void {
+    testGroup("aggregate");
+
+    int one = 1;
+
+    //  Stored into a struct field: member address + STORE, a different path.
+    Point p;
+    p.x = (one > 0) ? 21 : 22;
+    p.y = (one > 9) ? 21 : 22;
+    checkInt(p.x, 21, "a ternary stored into a struct field");
+    checkInt(p.y, 22, "…the false arm");
+
+    //  Stored into an array element.
+    int values[2];
+    values[0] = (one > 0) ? 31 : 32;
+    values[1] = (one > 9) ? 31 : 32;
+    checkInt(values[0], 31, "a ternary stored into an array element");
+    checkInt(values[1], 32, "…the false arm");
+}
+
+function checkNested():void {
+    testGroup("nested");
+
+    int one = 1;
+
+    //  Nested ternaries: the inner result feeds an outer arm, two merge points.
+    int n = (one > 0) ? ((one > 9) ? 1 : 2) : 3;
+    checkInt(n, 2, "a nested ternary inside the true arm");
+
+    int m = (one > 9) ? 1 : ((one > 0) ? 2 : 3);
+    checkInt(m, 2, "a nested ternary inside the false arm");
+}
+
+function checkInLoop():void {
+    testGroup("in a loop");
+
+    //  The important one: inside a loop the "preceding constant" changes every
+    //  iteration, so forwarding must give up on the slot at the back edge.
+    int total = 0;
+    for (int i = 0; i < 4; i++) {
+        int v = (i % 2 == 0) ? 10 : 1;
+        total += v;
+    }
+    //  i = 0,1,2,3 -> 10 + 1 + 10 + 1
+    checkInt(total, 22, "a ternary whose condition changes each iteration");
+}
+
+function main():void {
+    checkAssignment();
+    checkComptimeArm();
+    checkOtherContexts();
+    checkAggregate();
+    checkNested();
+    checkInLoop();
+    testFinish();
+    eof: pass;
+}

@@ -1,0 +1,16 @@
+// `int128` addition past 2^127−1 must trap, at every optimization level.
+//
+// The level matters more than the trap. The optimizer's constant folder computes
+// `max + 1` while folding, and if it does that with a bare `a + b` the result wraps
+// to −2^127 -- which is *inside* `int128`, so the range check approves it and the
+// folder deletes the instruction that would have trapped. The program then prints a
+// number where O0 raises an error. Same source, different answers.
+
+function main():void {
+    int128 maxv = 170141183460469231731687303715884105727i128;
+    int128 one = 1;
+    print("before\n");
+    int128 boom = maxv + one;
+    print(boom);
+    eof: pass;
+}

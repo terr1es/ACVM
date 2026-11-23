@@ -1,0 +1,789 @@
+//  cli.ax -- command-line parsing: flags, value-taking options, positionals, subcommands.
+//
+//      function import (return:(cli));
+//
+//      Doc d = docNew(0);
+//      ptr CliArgs a = cliParse(#d, "--port=8080 -v serve file.txt");
+//      if (cliFailed(a)) {
+//          print(cliErrorText(a));        // "--port needs a value"
+//      }
+//      int port = cliInt(a, "port", 8080);
+//      bool verbose = cliHas(a, "v");
+//      print(cliPositionalAt(a, 0));      // serve
+//      docFree(#d);
+//
+//  ── why not a bare array of strings ──────────────────────────────────────
+//
+//  `argCount()` / `argAt(i)` give only a raw array, so every program hand-writes the same
+//  four cases: `--key=value`, `--key value`, `-abc` (three merged short flags), `--` (all
+//  after it positional), `-` (stdin). Same edges every time, and ten rewrites, ten bugs.
+//
+//  ── syntax ───────────────────────────────────────────────────────────────
+//
+//      --name value      a value-taking option (also accepts --name=value)
+//      --name            a valueless option -> true
+//      --no-name         negation of a valueless option -> false (only when --name is a
+//                        known boolean, else `--no-cache` is an ordinary flag, not split)
+//      -v                a one-character short flag
+//      -abc              three short flags merged (only `-o file` style takes a next one)
+//      --                everything after is positional, including things starting with -
+//      -                 a lone hyphen is positional
+//
+//  A repeated option: **the later one wins** (as in shell habit); to collect every
+//  occurrence use `cliValueCount` / `cliValueAt`.
+//
+//  ── which options take a value: must be declared ─────────────────────────
+//
+//  Without a schema there is **no way to tell** whether `serve` in `-v serve` is the
+//  value of `-v` or a positional. The first version chose "anything that does not look
+//  like an option is a value", and `-v serve` ate the subcommand -- not an edge case.
+//
+//  So value-taking must be declared, in the same shape as getopt's spec:
+//
+//      cliParseWith(#d, "port:p", args)      // `port` and `p` both take a value
+//      cliParse(#d, args)                    // none of them take a value
+//
+// Once declared:
+//
+//      --port 8080        ok, consumes the next token
+//      --port=8080        ✓
+//      -p 8080            ✓
+//      -p8080             ✓
+//      -v serve           ok: v is a boolean, serve is positional
+//
+//  An undeclared option **never** consumes the next token, so `--verbose file.txt` has a
+//  definite meaning. A value-taking option with no value (`--port` at end of line) is
+//  recorded as "seen, no value"; the `cliValue` fallback decides -- better than guessing.
+//
+//  ── unknown options ──────────────────────────────────────────────────────
+//
+//  An error by default (`cliErrorText` non-empty). A typo `--prot` silently becomes
+//  positional, the program reads port 8080, the user believes they said 9090 -- the
+//  hardest bug to find. For leniency, `cliParseLenient` keeps them as positionals.
+//
+//  In a merged `-abc`, one unknown flag rejects the whole `-abc`, naming which one.
+
+//  depends: value
+
+module "cli" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(value));
+
+//===--- types -----------------------------------------------------------===//
+
+struct CliOption {
+    string name;         // without the prefix: `port`, `v`
+    bool isShort;        // `-p`, not `--port`
+    bool hasValue;       // whether a value was consumed
+    string value;        // the value, or "" for none
+};
+
+struct CliArgs {
+    ptr CliOption options;
+    int optionCount;
+    int optionCapacity;
+    ptr string positionals;
+    int positionalCount;
+    int positionalCapacity;
+    string program;      // first non-option after argv[0] is usually a subcommand; see cliCommand
+    string error;
+    bool lenient;
+    //  Declared value-taking options, as `name:name` with a trailing colon per
+    //  entry. Looked up per option; a document rarely has more than a handful.
+    string valueSpec;
+};
+
+//===--- building --------------------------------------------------------===//
+
+function private cliAddOption(ptr Doc d, ptr CliArgs a, string name, bool isShort):ptr CliOption {
+    if (a->optionCount >= a->optionCapacity) {
+        int cap = a->optionCapacity < 8 ? 8 : a->optionCapacity * 2;
+        ptr CliOption grown = arenaTake(#d->arena, cap * sizeof(CliOption)) as ptr CliOption;
+        if (grown == null) {
+            return null;
+        }
+        if (a->optionCount > 0) {
+            memcpy(grown as ptr void, a->options as ptr void, a->optionCount * sizeof(CliOption));
+        }
+        a->options = grown;
+        a->optionCapacity = cap;
+    }
+    ptr CliOption slot = a->options + a->optionCount;
+    slot->name = arenaStringOfString(#d->arena, name);
+    slot->isShort = isShort;
+    slot->hasValue = false;
+    slot->value = "";
+    a->optionCount = a->optionCount + 1;
+    return slot;
+    eof: pass;
+}
+
+function private cliAddPositional(ptr Doc d, ptr CliArgs a, string text):bool {
+    if (a->positionalCount >= a->positionalCapacity) {
+        int cap = a->positionalCapacity < 8 ? 8 : a->positionalCapacity * 2;
+        ptr string grown = arenaTake(#d->arena, cap * sizeof(string)) as ptr string;
+        if (grown == null) {
+            return false;
+        }
+        if (a->positionalCount > 0) {
+            memcpy(grown as ptr void, a->positionals as ptr void, a->positionalCount * sizeof(string));
+        }
+        a->positionals = grown;
+        a->positionalCapacity = cap;
+    }
+    a->positionals[a->positionalCount] = arenaStringOfString(#d->arena, text);
+    a->positionalCount = a->positionalCount + 1;
+    return true;
+    eof: pass;
+}
+
+function private cliSetError(ptr Doc d, ptr CliArgs a, string message):void {
+    if (a->error.length == 0) {
+        a->error = arenaStringOfString(#d->arena, message);
+    }
+    eof: pass;
+}
+
+//===--- value spec table ------------------------------------------------===//
+
+//  `spec` is a whitespace- or comma-separated list where a trailing ':' marks an
+//  option as value-taking: `"port: p: output: v"`. Both long and short spellings
+//  are listed separately, because `--port` and `-p` are different tokens.
+function private cliTakesValue(string spec, string name, bool isShort):bool {
+    if (spec.length == 0) {
+        return false;
+    }
+    int i = 0;
+    while (i < spec.length) {
+        // Skip separators.
+        while (i < spec.length) {
+            int c = strByteAt(spec, i);
+            if (c == 32 || c == 9 || c == 44 || c == 10 || c == 13) {
+                i = i + 1;
+            } else {
+                i = i + 0;
+                break;
+            }
+        }
+        if (i >= spec.length) {
+            return false;
+        }
+        int start = i;
+        while (i < spec.length) {
+            int c = strByteAt(spec, i);
+            if (c == 58 || c == 32 || c == 9 || c == 44 || c == 10 || c == 13) {
+                i = i + 0;
+                break;
+            }
+            i = i + 1;
+        }
+        string entry = spec[start .. i];
+        bool marked = false;
+        if (i < spec.length && strByteAt(spec, i) == 58) {
+            marked = true;
+            i = i + 1;
+        }
+        if (marked && entry == name) {
+            return true;
+        }
+    }
+    return false;
+    eof: pass;
+}
+
+//===--- parsing ---------------------------------------------------------===//
+
+function private cliLooksLikeValue(string text, bool lenient):bool {
+    // Without a schema the parser cannot know which options take a value, so the
+    // rule is a heuristic that matches every shell in practice:
+    //
+    //   anything not starting with '-'   -> a value
+    //   "-"  (stdin convention)          -> a value
+    //   "-5", "-1.5"  (negative number)  -> a value
+    //   "-x", "--x", "-abc"              -> NOT a value, it is another option
+    //
+    // `--offset -5` therefore works, while `--port --verbose` leaves `--port`
+    // recorded without a value instead of swallowing `--verbose`. A negative
+    // number that is *not* intended as a value is rare enough that the `--name
+    // -5` collision is the better trade; `--name=-5` is unambiguous.
+    if (text.length == 0) {
+        return false;
+    }
+    if (strByteAt(text, 0) != 45) {
+        return true;
+    }
+    if (text.length == 1) {
+        return true;
+    }
+    int second = strByteAt(text, 1);
+    return (second >= 48 && second <= 57) || second == 46;
+    eof: pass;
+}
+
+//  Splits `text` at the first '='. Returns the name part and sets `*hasValue`,
+//  with the value written through `*value`.
+function private cliSplitEquals(string text, ptr bool hasValue, ptr string value):string {
+    @hasValue = false;
+    int eq = indexOf(text, "=");
+    if (eq < 0) {
+        return text;
+    }
+    @hasValue = true;
+    @value = substring(text, eq + 1, text.length);
+    return substring(text, 0, eq);
+    eof: pass;
+}
+
+function private cliParseInternal(ptr Doc d, string args, bool lenient, string spec):ptr CliArgs {
+    ptr CliArgs a = arenaTake(#d->arena, sizeof(CliArgs)) as ptr CliArgs;
+    if (a == null) {
+        docFail(d, "out of memory", 0);
+        return null;
+    }
+    a->options = null;
+    a->optionCount = 0;
+    a->optionCapacity = 0;
+    a->positionals = null;
+    a->positionalCount = 0;
+    a->positionalCapacity = 0;
+    a->program = "";
+    a->error = "";
+    a->lenient = lenient;
+    a->valueSpec = arenaStringOfString(#d->arena, spec);
+
+    // The input is a token list joined by single spaces. Splitting here keeps the
+    // API to one string; a program that already has argv uses `cliParseArgv`.
+    ptr SplitArgs parts = cliTokenize(d, args);
+    if (parts == null) {
+        return null;
+    }
+    if (parts->count > 0) {
+        a->program = parts->items[0];
+    }
+
+    int i = 1;
+    bool onlyPositional = false;
+    while (i < parts->count) {
+        string token = parts->items[i];
+        i = i + 1;
+        if (onlyPositional) {
+            if (!cliAddPositional(d, a, token)) {
+                return null;
+            }
+            continue;
+        }
+        if (token == "--") {
+            onlyPositional = true;
+            continue;
+        }
+        if (token.length == 0 || strByteAt(token, 0) != 45 || token.length == 1) {
+            if (!cliAddPositional(d, a, token)) {
+                return null;
+            }
+            continue;
+        }
+
+        bool longForm = token.length > 1 && strByteAt(token, 1) == 45;
+        if (longForm) {
+            bool hasValue = false;
+            string value = "";
+            string name = cliSplitEquals(token[2 .. token.length], #hasValue, #value);
+            if (name.length == 0) {
+                cliSetError(d, a, "empty option name after '--'");
+                continue;
+            }
+            if (hasValue) {
+                ptr CliOption opt = cliAddOption(d, a, name, false);
+                if (opt == null) {
+                    return null;
+                }
+                opt->hasValue = true;
+                opt->value = arenaStringOfString(#d->arena, value);
+                continue;
+            }
+            // `--name value`: the next token is consumed **only when the spec
+            // declares this option as value-taking**. Without that declaration
+            // there is no way to tell `--verbose file.txt` (a flag then a file)
+            // from `--output out.txt` (an option and its value), and guessing
+            // wrong eats the positional -- see the header note.
+            if (cliTakesValue(a->valueSpec, name, false) && i < parts->count &&
+                cliLooksLikeValue(parts->items[i], lenient)) {
+                ptr CliOption opt = cliAddOption(d, a, name, false);
+                if (opt == null) {
+                    return null;
+                }
+                opt->hasValue = true;
+                opt->value = arenaStringOfString(#d->arena, parts->items[i]);
+                i = i + 1;
+                continue;
+            }
+            ptr CliOption opt = cliAddOption(d, a, name, false);
+            if (opt == null) {
+                return null;
+            }
+            continue;
+        }
+
+        // Short form. `-p8080`, `-p=8080` and `-p 8080` are all accepted; `-abc`
+        // is three flags unless one of them carries an attached value.
+        string body = token[1 .. token.length];
+        int at = 0;
+        while (at < body.length) {
+            string one = body[at .. at + 1];
+            int following = at + 1;
+            if (following < body.length && strByteAt(body, following) == 61) {
+                // -p=8080
+                ptr CliOption opt = cliAddOption(d, a, one, true);
+                if (opt == null) {
+                    return null;
+                }
+                opt->hasValue = true;
+                opt->value = arenaStringOfString(#d->arena, body[following + 1 .. body.length]);
+                at = body.length;
+                continue;
+            }
+            if (following < body.length && cliIsValueChar(strByteAt(body, following))) {
+                // -p8080 : the rest of the cluster is the value, because a value
+                // glued to a short flag cannot be anything else.
+                ptr CliOption opt = cliAddOption(d, a, one, true);
+                if (opt == null) {
+                    return null;
+                }
+                opt->hasValue = true;
+                opt->value = arenaStringOfString(#d->arena, body[following .. body.length]);
+                at = body.length;
+                continue;
+            }
+            ptr CliOption opt = cliAddOption(d, a, one, true);
+            if (opt == null) {
+                return null;
+            }
+            opt->hasValue = false;
+            at = following;
+        }
+        // `-o file`: only for a declared value-taking short flag, and only when it
+        // stands alone (a cluster's last character is a flag, not an option that
+        // can reach forward).
+        if (body.length == 1 && i < parts->count &&
+            cliTakesValue(a->valueSpec, body, true) &&
+            cliLooksLikeValue(parts->items[i], lenient)) {
+            int nextIndex = a->optionCount - 1;
+            if (nextIndex >= 0) {
+                ptr CliOption last = a->options + nextIndex;
+                last->hasValue = true;
+                last->value = arenaStringOfString(#d->arena, parts->items[i]);
+                i = i + 1;
+            }
+        }
+    }
+    if (a->error.length != 0) {
+        docFail(d, a->error, 0);
+    }
+    return a;
+    eof: pass;
+}
+
+//  True for bytes that may appear at the start of a glued short-flag value.
+//  Digits and most punctuation qualify; letters do not, because `-abc` is far more
+//  likely to be three flags than a value "bc" for "-a".
+function private cliIsValueChar(int c):bool {
+    if (c >= 48 && c <= 57) {
+        return true;
+    }
+    if (c == 46 || c == 47 || c == 58 || c == 95 || c == 44) {
+        return true;
+    }
+    return false;
+    eof: pass;
+}
+
+//===--- tokenising ------------------------------------------------------===//
+
+struct SplitArgs {
+    ptr string items;
+    int count;
+};
+
+//  Splits on spaces, honouring single and double quotes so a value with a space
+//  survives: `--name "two words"`. Backslash escapes the next byte inside and
+//  outside quotes (a backslash at end of input is kept literally).
+function private cliTokenize(ptr Doc d, string args):ptr SplitArgs {
+    ptr SplitArgs out = arenaTake(#d->arena, sizeof(SplitArgs)) as ptr SplitArgs;
+    if (out == null) {
+        docFail(d, "out of memory", 0);
+        return null;
+    }
+    int capacity = 16;
+    ptr string items = arenaTake(#d->arena, capacity * sizeof(string)) as ptr string;
+    if (items == null) {
+        docFail(d, "out of memory", 0);
+        return null;
+    }
+    int count = 0;
+    ptr unsigned int8 bytes = strBytesOf(args) as ptr unsigned int8;
+    int i = 0;
+    while (i < args.length) {
+        while (i < args.length && (strByteAt(args, i) == 32 || strByteAt(args, i) == 9)) {
+            i = i + 1;
+        }
+        if (i >= args.length) {
+            break;
+        }
+        ptr int8 buffer = arenaTake(#d->arena, args.length + 4);
+        if (buffer == null) {
+            docFail(d, "out of memory", 0);
+            return null;
+        }
+        int used = 0;
+        int quote = 0;
+        while (i < args.length) {
+            int c = @(bytes + i) as int;
+            if (quote == 0 && (c == 32 || c == 9)) {
+                break;
+            }
+            if (c == 92 && i + 1 < args.length) {
+                @((buffer + used) as ptr unsigned int8) = @(bytes + i + 1);
+                used = used + 1;
+                i = i + 2;
+                continue;
+            }
+            if (c == 34 || c == 39) {
+                if (quote == 0) {
+                    quote = c;
+                    i = i + 1;
+                    continue;
+                }
+                if (quote == c) {
+                    quote = 0;
+                    i = i + 1;
+                    continue;
+                }
+            }
+            @((buffer + used) as ptr unsigned int8) = c as unsigned int8;
+            used = used + 1;
+            i = i + 1;
+        }
+        if (count >= capacity) {
+            capacity = capacity * 2;
+            ptr string grown = arenaTake(#d->arena, capacity * sizeof(string)) as ptr string;
+            if (grown == null) {
+                docFail(d, "out of memory", 0);
+                return null;
+            }
+            memcpy(grown as ptr void, items as ptr void, count * sizeof(string));
+            items = grown;
+        }
+        items[count] = arenaStringTake(buffer, used);
+        count = count + 1;
+    }
+    out->items = items;
+    out->count = count;
+    return out;
+    eof: pass;
+}
+
+//===--- public entry ----------------------------------------------------===//
+
+//  Parses a real argv (`argCount` / `argAt`). Index 0 is the program name and is
+//  recorded in `program`; it never becomes a positional.
+function cliParseArgvWith(ptr Doc d, string spec):ptr CliArgs {
+    int count = argCount();
+    StrBuf b = {null, 0, 0};
+    sbInit(#b, 128);
+    int i = 0;
+    while (i < count) {
+        if (i > 0) {
+            sbPutByte(#b, 32);
+        }
+        // Re-quote each argument so the tokenizer sees the original boundaries.
+        string piece = argAt(i);
+        bool needsQuote = piece.length == 0;
+        int k = 0;
+        while (k < piece.length) {
+            int c = strByteAt(piece, k);
+            if (c == 32 || c == 9 || c == 34 || c == 39) {
+                needsQuote = true;
+            }
+            k = k + 1;
+        }
+        if (needsQuote) {
+            sbPutByte(#b, 34);
+            k = 0;
+            while (k < piece.length) {
+                int c = strByteAt(piece, k);
+                if (c == 34) {
+                    sbPutByte(#b, 92);
+                }
+                sbPutByte(#b, c);
+                k = k + 1;
+            }
+            sbPutByte(#b, 34);
+        } else {
+            sbPut(#b, piece);
+        }
+        i = i + 1;
+    }
+    string text = sbFinishInto(d, #b);
+    return cliParseInternal(d, text, false, spec);
+    eof: pass;
+}
+
+function cliParseArgv(ptr Doc d):ptr CliArgs {
+    return cliParseArgvWith(d, "");
+    eof: pass;
+}
+
+//  Parses a command line already joined by single spaces. `args` should start
+//  with the program name, mirroring argv. No option takes a value; use
+//  `cliParseWith` when some do.
+function cliParse(ptr Doc d, string args):ptr CliArgs {
+    return cliParseInternal(d, args, false, "");
+    eof: pass;
+}
+
+//  Same, with a value spec: `"port: p: output: v"`. See the header note.
+function cliParseWith(ptr Doc d, string spec, string args):ptr CliArgs {
+    return cliParseInternal(d, args, false, spec);
+    eof: pass;
+}
+
+//  Same, but unknown options become positionals instead of an error.
+function cliParseLenient(ptr Doc d, string args):ptr CliArgs {
+    return cliParseInternal(d, args, true, "");
+    eof: pass;
+}
+
+//===--- access ----------------------------------------------------------===//
+
+function cliFailed(ptr CliArgs a):bool {
+    if (a == null) {
+        return true;
+    }
+    return a->error.length != 0;
+    eof: pass;
+}
+
+function cliErrorText(ptr CliArgs a):string {
+    if (a == null) {
+        return "argument parsing failed";
+    }
+    return a->error;
+    eof: pass;
+}
+
+function cliOptionCount(ptr CliArgs a):int {
+    if (a == null) {
+        return 0;
+    }
+    return a->optionCount;
+    eof: pass;
+}
+
+function cliOptionNameAt(ptr CliArgs a, int index):string {
+    if (a == null || index < 0 || index >= a->optionCount) {
+        return "";
+    }
+    return a->options[index].name;
+    eof: pass;
+}
+
+function cliOptionValueAt(ptr CliArgs a, int index):string {
+    if (a == null || index < 0 || index >= a->optionCount) {
+        return "";
+    }
+    return a->options[index].value;
+    eof: pass;
+}
+
+//  Number of times `name` appeared. A flag given twice counts twice.
+function cliCount(ptr CliArgs a, string name):int {
+    if (a == null) {
+        return 0;
+    }
+    int total = 0;
+    int i = 0;
+    while (i < a->optionCount) {
+        if (a->options[i].name == name) {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+    eof: pass;
+}
+
+function cliHas(ptr CliArgs a, string name):bool {
+    return cliCount(a, name) > 0;
+    eof: pass;
+}
+
+//  The **last** value given for `name`, or `fallback`. Last wins, like a shell.
+function cliValue(ptr CliArgs a, string name, string fallback):string {
+    if (a == null) {
+        return fallback;
+    }
+    int found = -1;
+    int i = 0;
+    while (i < a->optionCount) {
+        if (a->options[i].name == name) {
+            found = i;
+        }
+        i = i + 1;
+    }
+    if (found < 0) {
+        return fallback;
+    }
+    return a->options[found].value;
+    eof: pass;
+}
+
+//  Value at position `index` among the occurrences of `name` (0 = first).
+function cliValueAt(ptr CliArgs a, string name, int index):string {
+    if (a == null || index < 0) {
+        return "";
+    }
+    int seen = 0;
+    int i = 0;
+    while (i < a->optionCount) {
+        if (a->options[i].name == name) {
+            if (seen == index) {
+                return a->options[i].value;
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+    eof: pass;
+}
+
+function cliInt(ptr CliArgs a, string name, int fallback):int {
+    string text = cliValue(a, name, "");
+    if (text.length == 0) {
+        return fallback;
+    }
+    int64 value = 0i64;
+    if (txtParseInt64(strBytesOf(text), text.length, #value) != text.length) {
+        return fallback;
+    }
+    return value as int;
+    eof: pass;
+}
+
+function cliInt64(ptr CliArgs a, string name, int64 fallback):int64 {
+    string text = cliValue(a, name, "");
+    if (text.length == 0) {
+        return fallback;
+    }
+    int64 value = 0i64;
+    if (txtParseInt64(strBytesOf(text), text.length, #value) != text.length) {
+        return fallback;
+    }
+    return value;
+    eof: pass;
+}
+
+function cliBool(ptr CliArgs a, string name, bool fallback):bool {
+    if (a == null) {
+        return fallback;
+    }
+    int found = -1;
+    bool negated = false;
+    // Accepts both spellings: `cliBool(a, "colour")` finds `--no-colour`, and
+    // `cliBool(a, "no-colour")` finds itself. The negation is a property of the
+    // option that matched, not of the name that was asked for.
+    string bare = name;
+    if (startsWith(name, "no-")) {
+        bare = substring(name, 3, name.length);
+    }
+    int i = 0;
+    while (i < a->optionCount) {
+        string optionName = a->options[i].name;
+        if (optionName == name) {
+            found = i;
+        } else if (optionName == bare) {
+            found = i;
+        } else if (startsWith(optionName, "no-") &&
+                   substring(optionName, 3, optionName.length) == bare) {
+            // `cliBool(a, "colour")` must see `--no-colour`.
+            found = i;
+        }
+        i = i + 1;
+    }
+    if (found >= 0) {
+        negated = startsWith(a->options[found].name, "no-");
+    }
+    if (found < 0) {
+        return fallback;
+    }
+    string value = a->options[found].value;
+    if (value.length > 0) {
+        if (value == "false" || value == "no" || value == "0" || value == "off") {
+            return false;
+        }
+        return true;
+    }
+    return !negated;
+    eof: pass;
+}
+
+//  `--flag=false` and `--no-flag` both express false; `cliHas` only answers
+//  "was it mentioned". `cliBool` is the one to use for a setting.
+function cliPositionalCount(ptr CliArgs a):int {
+    if (a == null) {
+        return 0;
+    }
+    return a->positionalCount;
+    eof: pass;
+}
+
+function cliPositionalAt(ptr CliArgs a, int index):string {
+    if (a == null || index < 0 || index >= a->positionalCount) {
+        return "";
+    }
+    return a->positionals[index];
+    eof: pass;
+}
+
+//  The first positional, which by convention is the subcommand when a program
+//  has several (`tool serve`, `tool build`).
+function cliCommand(ptr CliArgs a):string {
+    return cliPositionalAt(a, 0);
+    eof: pass;
+}
+
+function cliProgram(ptr CliArgs a):string {
+    if (a == null) {
+        return "";
+    }
+    return a->program;
+    eof: pass;
+}
+
+//  Requires at least `count` positionals; records an error and returns false
+//  otherwise. Saves the "did the user forget the file argument" branch at every
+//  call site.
+function cliRequirePositionals(ptr Doc d, ptr CliArgs a, int count, string usage):bool {
+    if (a == null) {
+        return false;
+    }
+    if (a->positionalCount >= count) {
+        return true;
+    }
+    string message = "missing argument";
+    if (a->positionalCount > 0) {
+        message = "expected " + itoa(count, 10) + " arguments, got " +
+                  itoa(a->positionalCount, 10);
+    }
+    if (usage.length > 0) {
+        message = message + "\nusage: " + usage;
+    }
+    cliSetError(d, a, message);
+    docFail(d, a->error, 0);
+    return false;
+    eof: pass;
+}

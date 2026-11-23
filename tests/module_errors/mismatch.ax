@@ -1,0 +1,7 @@
+// The declared name must be the file's own stem. A declaration the file itself
+// contradicts is worse than none: package tooling would trust the string.
+module "other" version "1.0.0";
+
+function main():void {
+    eof: pass;
+}

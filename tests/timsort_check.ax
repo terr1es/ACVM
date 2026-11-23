@@ -1,0 +1,200 @@
+//  Stress test for algorithm's sort / sortInt64: sortedness, permutation, and
+//  agreement between sizes that straddle the minrun and stack boundaries.
+//
+//  Sizes 0..5000 in steps that cross every interesting boundary: below minrun,
+//  around it (127/128/129), and large enough to force several merge levels.
+//  The harness fails on a "FAIL" line, so a mismatch needs no exit code.
+//
+//  Run twice -- once with algorithm.dll present (native) and once with it
+//  removed (Axiom fallback). Both must print `failures=0`.
+
+function import (return:(algorithm, random));
+
+comptime int MAXN = 5000;
+comptime int NSEED = 12345;
+
+global int gFail = 0;
+
+function checkOne(int n, int shape, string label):void {
+    int a[MAXN] = {0};
+    unsigned int st[1] = {NSEED as unsigned int};
+
+    int i = 0;
+    while (i < n) {
+        int v = 0;
+        if (shape == 0) {
+            v = randBelow(#st[0], 1, 1000000) - 500000;
+        } else if (shape == 1) {
+            v = i;
+        } else if (shape == 2) {
+            v = n - i;
+        } else if (shape == 3) {
+            v = 7;
+        } else if (shape == 4) {
+            v = i % 8;
+        } else if (shape == 5) {
+            v = randBelow(#st[0], 1, 4);
+        } else if (shape == 6) {
+            v = i ^ (i >> 1);
+        } else if (shape == 7) {
+            // nearly sorted: a sorted array with a handful of swaps, which is the
+            // case the engine probe has to recognise as "keep TimSort"
+            v = i;
+        } else if (shape == 8) {
+            // sorted prefix, random tail: the case the probe must send to radix
+            if (i < n / 8) { v = i; } else { v = randBelow(#st[0], 1, 1000000) + n; }
+        } else if (shape == 9) {
+            // organ pipe: ascending then descending. Two long runs.
+            if (i < n / 2) { v = i; } else { v = n - i; }
+        } else if (shape == 10) {
+            // many short ascending blocks: long-range order, no long run
+            v = (i / 4) * 1000 + (i % 4);
+        } else if (shape == 11) {
+            // narrow range with a negative minimum: the counting path computes
+            // `value - lo`, so a negative `lo` is where that arithmetic breaks
+            // if it is done carelessly.
+            v = (i % 8) - 4;
+        } else {
+            // narrow but not tiny: 300 distinct values, which is still under the
+            // n/8 counter budget for the larger sizes and over it for the small
+            // ones -- so both sides of the dispatch threshold get exercised.
+            v = randRange(#st[0], 1, -150, 150);
+        }
+        a[i] = v;
+        i = i + 1;
+    }
+    if (shape == 7) {
+        int k = 0;
+        while (k < n / 64 + 1) {
+            int x = randBelow(#st[0], 1, n);
+            int y = randBelow(#st[0], 1, n);
+            int t = a[x];
+            a[x] = a[y];
+            a[y] = t;
+            k = k + 1;
+        }
+    }
+
+    // sum before, for the permutation check (int64: a large random array overflows
+    // an int sum, so accumulate in int64)
+    int64 sumBefore = 0i64;
+    i = 0;
+    while (i < n) {
+        sumBefore = sumBefore + a[i] as int64;
+        i = i + 1;
+    }
+
+    sort(#a[0], n);
+
+    int64 sumAfter = 0i64;
+    bool ordered = true;
+    i = 0;
+    while (i < n) {
+        sumAfter = sumAfter + a[i] as int64;
+        if (i > 0 && a[i] < a[i - 1]) {
+            ordered = false;
+        }
+        i = i + 1;
+    }
+    if (!ordered) {
+        print("FAIL not ascending: "); print(label); print(" n="); print(itoa(n, 10)); print("\n");
+        gFail = gFail + 1;
+    }
+    if (sumAfter != sumBefore) {
+        print("FAIL not a permutation: "); print(label); print(" n="); print(itoa(n, 10)); print("\n");
+        gFail = gFail + 1;
+    }
+}
+
+function checkOne64(int n, int shape, string label):void {
+    int64 a[MAXN] = {0i64};
+    unsigned int st[1] = {NSEED as unsigned int};
+
+    int i = 0;
+    while (i < n) {
+        int64 v = 0i64;
+        if (shape == 0) {
+            v = (randNext(#st[0], 1) as int64) * 1000i64;
+        } else if (shape == 1) {
+            v = i as int64;
+        } else if (shape == 2) {
+            v = (n - i) as int64;
+        } else if (shape == 3) {
+            v = -42i64;
+        } else if (shape == 4) {
+            v = (i % 8) as int64;
+        } else if (shape == 5) {
+            v = (randBelow(#st[0], 1, 4)) as int64;
+        } else if (shape == 6) {
+            v = ((i ^ (i >> 1)) as int64) * 1099511627776i64;
+        } else if (shape == 7) {
+            v = i as int64;
+        } else if (shape == 8) {
+            if (i < n / 8) { v = i as int64; } else { v = (randNext(#st[0], 1) as int64) * 1000i64; }
+        } else if (shape == 9) {
+            if (i < n / 2) { v = i as int64; } else { v = (n - i) as int64; }
+        } else if (shape == 10) {
+            v = ((i / 4) * 1000 + (i % 4)) as int64;
+        } else if (shape == 11) {
+            v = ((i % 8) - 4) as int64;
+        } else {
+            v = (randRange(#st[0], 1, -150, 150)) as int64;
+        }
+        a[i] = v;
+        i = i + 1;
+    }
+
+    // XOR, not sum: the values are large enough to overflow an int64 accumulator,
+    // and xor is exact and order independent.
+    int64 xorBefore = 0i64;
+    i = 0;
+    while (i < n) {
+        xorBefore = xorBefore ^ a[i];
+        i = i + 1;
+    }
+
+    sortInt64(#a[0], n);
+
+    int64 xorAfter = 0i64;
+    bool ordered = true;
+    i = 0;
+    while (i < n) {
+        xorAfter = xorAfter ^ a[i];
+        if (i > 0 && a[i] < a[i - 1]) {
+            ordered = false;
+        }
+        i = i + 1;
+    }
+    if (!ordered) {
+        print("FAIL64 not ascending: "); print(label); print(" n="); print(itoa(n, 10)); print("\n");
+        gFail = gFail + 1;
+    }
+    if (xorAfter != xorBefore) {
+        print("FAIL64 not a permutation: "); print(label); print(" n="); print(itoa(n, 10)); print("\n");
+        gFail = gFail + 1;
+    }
+}
+
+function main():void {
+    int sizes[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 15, 16, 17, 31, 32,
+                     33, 63, 64, 65, 66, 100, 127, 128, 129, 255, 256, 1000, 4096, 5000};
+    string shapes[13] = {"random", "asc", "desc", "equal", "eight", "four", "zigzag",
+                         "nearly", "prefix", "organ", "blocks", "negative8", "range300"};
+
+    int s = 0;
+    while (s < 13) {
+        int k = 0;
+        while (k < 32) {
+            checkOne(sizes[k], s, shapes[s]);
+            checkOne64(sizes[k], s, shapes[s]);
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+
+    if (gFail != 0) {
+        print("FAILURES="); print(itoa(gFail, 10)); print("\n");
+    }
+    print("done\n");
+    eof: pass;
+}

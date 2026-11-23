@@ -1,0 +1,457 @@
+//  formats_check.ax — regression checks for the seven extralib format modules.
+//
+//      acvm run tests/formats_check.ax
+//
+//  Each section builds its own document and covers parsing, access, modification,
+//  writing back and round trip. The `check` family is used instead of `assert` so
+//  that one run shows every broken place at once (see the rationale in
+//  stdlib/test.ax).
+//
+//  Multi-line content is written as `"""..."""`, avoiding a pile of `\n` escapes
+//  in the source — that keeps the expected values in the assertions identical to
+//  the real file content, so they read like the thing under test.
+
+function import (return:(test));
+function import (return:(value));
+function import (return:(json));
+function import (return:(yaml));
+function import (return:(toml));
+function import (return:(xml));
+function import (return:(ini));
+function import (return:(csv));
+
+//  A double quote as a string. A CSV field that ends with one would otherwise put
+//  three quotes in a row inside a `"""` literal and terminate it early.
+function q1():string {
+    char c = '"';
+    return "" + c;
+    eof: pass;
+}
+
+function q2():string {
+    return q1() + q1();
+    eof: pass;
+}
+
+//  `qt(x)` is x wrapped in double quotes.
+function qt(string inner):string {
+    return q1() + inner + q1();
+    eof: pass;
+}
+
+//  A single line feed (one byte). Building it with a `char` cast rather than a
+//  `"""` literal keeps it independent of the source file's line endings: a file
+//  saved with CRLF would otherwise make this two bytes and every expectation
+//  that mentions a newline would fail.
+function nl():string {
+    char c = 10 as char;
+    return "" + c;
+    eof: pass;
+}
+
+//===--- value: the data model ------------------------------------------===//
+
+function checkValue():void {
+    testGroup("value");
+
+    Doc d = docNew(0);
+    ptr Value root = valObject(#d);
+    valSet(#d, root, "a", valInt(#d, 1));
+    valSet(#d, root, "b", valString(#d, "text"));
+    ptr Value nested = valSetObject(#d, root, "c");
+    valSet(#d, nested, "d", valBool(#d, true));
+
+    checkInt(valCount(root), 3, "three keys");
+    checkInt(valInt(valGet(root, "a"), 0), 1, "get int");
+    checkString(valStrOf(valGet(root, "b"), ""), "text", "get string");
+    check(valBoolOf(valPath(root, "c.d"), false), "dotted path reaches a nested object");
+    check(valGet(root, "missing") == null, "missing key is null");
+
+    // overwriting keeps the position, removing shifts the keys that follow
+    valSet(#d, root, "a", valInt(#d, 9));
+    checkInt(valInt(valGet(root, "a"), 0), 9, "overwrite in place");
+    checkString(valKeyAt(root, 0), "a", "order preserved after overwrite");
+    valRemove(root, "b");
+    checkInt(valCount(root), 2, "remove drops one key");
+    checkString(valKeyAt(root, 1), "c", "tail shifts down after remove");
+
+    // a deep copy into another document is independent of the original
+    Doc d2 = docNew(0);
+    ptr Value copy = valCopy(#d2, root);
+    check(valEquivalent(root, copy), "deep copy is equivalent");
+    valSet(#d2, copy, "a", valInt(#d2, 100));
+    checkInt(valInt(valGet(root, "a"), 0), 9, "copy is independent");
+    check(!valEquivalent(root, copy), "modified copy differs");
+
+    docFree(#d2);
+    docFree(#d);
+}
+
+//===--- JSON -------------------------------------------------------------===//
+
+function checkJson():void {
+    testGroup("json");
+
+    Doc d = docNew(0);
+    string text = """{"port": 8080, "ratio": 1.5, "on": true, "none": null, "name": "axiom"}""";
+    ptr Value root = jsonParse(#d, text);
+    if (root == null) {
+        check(false, "json parses a flat object: " + docErrorWithPosition(#d, text));
+        docFree(#d);
+        return;
+    }
+    checkInt(valInt(valGet(root, "port"), 0), 8080, "int stays an int");
+    check(valFloatOf(valGet(root, "ratio"), 0.0) == 1.5, "float stays a float");
+    check(valBoolOf(valGet(root, "on"), false), "true is a bool");
+    check(valGet(root, "none")->kind == kValNull, "null is its own kind");
+    checkString(valStrOf(valGet(root, "name"), ""), "axiom", "string value");
+
+    checkString(jsonWrite(#d, root),
+                "{\"port\":8080,\"ratio\":1.5,\"on\":true,\"none\":null,\"name\":\"axiom\"}",
+                "compact write");
+
+    // big integers must keep every digit: going through a double loses bits
+    string bigText = """{"id": 9007199254740993}""";
+    ptr Value big = jsonParse(#d, bigText);
+    checkString(itoa(valIntOf(valGet(big, "id"), 0i64), 10), "9007199254740993",
+                "integers above 2^53 keep every digit");
+
+    // non-ASCII passes through: JSON allows raw UTF-8, and writing it back must
+    // not encode it a second time
+    string escapes = """{"s": "café 😀"}""";
+    ptr Value esc = jsonParse(#d, escapes);
+    check(esc != null, "a document with multi-byte UTF-8 parses");
+    checkString(valStrOf(valGet(esc, "s"), ""), "café 😀", "multi-byte UTF-8 passes through");
+    checkString(jsonWrite(#d, esc), """{"s":"café 😀"}""",
+                "and is written back byte for byte (compact form)");
+
+    // error paths
+    Doc bad = docNew(0);
+    check(jsonParse(#bad, "[1,2,]") == null, "trailing comma is rejected");
+    check(jsonParse(#bad, "01") == null, "leading zero is rejected");
+    check(jsonParse(#bad, "{} {}") == null, "two values on one line are rejected");
+    check(docError(#bad).length > 0, "an error message is recorded");
+    docFree(#bad);
+
+    // JSON Lines
+    Doc lines = docNew(0);
+    string text2 = """{"id": 1}
+{"id": 2}
+
+{"id": 3}
+""";
+    ptr Value array = jsonlParse(#lines, text2);
+    checkInt(valCount(array), 3, "three JSONL records, blank line skipped");
+    checkInt(valInt(valGet(valAt(array, 2), "id"), 0), 3, "third record read");
+    checkString(jsonlWrite(#lines, array),
+                "{\"id\":1}" + nl() + "{\"id\":2}" + nl() + "{\"id\":3}" + nl(),
+                "JSONL round trip (compact, one value per line)");
+    docFree(#lines);
+
+    docFree(#d);
+}
+
+//===--- INI --------------------------------------------------------------===//
+
+function checkIni():void {
+    testGroup("ini");
+
+    Doc d = docNew(0);
+    string text = """; leading comment
+version=2
+
+[server]
+host = localhost
+port = 8080
+title = "  padded  "
+""";
+    ptr Value root = iniParse(#d, text);
+    if (root == null) {
+        check(false, "ini parses: " + docError(#d));
+        docFree(#d);
+        return;
+    }
+    checkString(iniGetString(root, "", "version", "?"), "2", "key outside any section");
+    checkString(iniGetString(root, "server", "host", "?"), "localhost", "section key");
+    checkInt(iniGetInt(root, "server", "port", 0), 8080, "int convenience reader");
+    checkString(iniGetString(root, "server", "title", "?"), "  padded  ", "quotes are stripped");
+    checkInt(iniSectionCount(root), 1, "one section besides the bare keys");
+
+    iniSetInt(#d, root, "server", "port", 9090);
+    checkInt(iniGetInt(root, "server", "port", 0), 9090, "set int");
+    iniSetString(#d, root, "log", "level", "a;b");
+    check(iniHas(root, "log", "level"), "new section created by set");
+    checkString(iniWrite(#d, root),
+                "version=2" + nl() + nl() + "[server]" + nl() + "host=localhost" + nl() +
+                    "port=9090" + nl() + "title=\"  padded  \"" + nl() + nl() + "[log]" + nl() +
+                    "level=\"a;b\"" + nl(),
+                "write adds quotes only where needed");
+    iniRemoveSection(root, "log");
+    check(!iniHas(root, "log", "level"), "section removed");
+    docFree(#d);
+
+    // bad input
+    Doc bad = docNew(0);
+    check(iniParse(#bad, "no equals sign\n") == null, "a line without '=' is an error");
+    docFree(#bad);
+}
+
+//===--- CSV --------------------------------------------------------------===//
+
+function checkCsv():void {
+    testGroup("csv");
+
+    Doc d = docNew(0);
+    string text = "name,port,note" + nl() + "web,80," + qt("a,b") + nl() + "db,5432," +
+                  qt("say " + q2() + "hi" + q2()) + nl() + "quoted," + qt("12") + "," + nl();
+    ptr CsvTable t = csvParse(#d, text, 44);
+    if (t == null) {
+        check(false, "csv parses: " + docError(#d));
+        docFree(#d);
+        return;
+    }
+    checkInt(csvRows(t), 3, "three data rows");
+    checkInt(csvCols(t), 3, "three columns");
+    checkString(csvCellName(t, 0, "name"), "web", "cell by column name");
+    checkString(csvCellName(t, 0, "note"), "a,b", "quoted comma stays inside the cell");
+    checkString(csvCellName(t, 1, "note"), "say \"hi\"", "doubled quotes decode");
+    checkString(csvCellName(t, 2, "note"), "", "short row padded with an empty cell");
+    checkInt(csvColumn(t, "port"), 1, "column lookup");
+    checkInt(csvColumn(t, "nope"), -1, "unknown column is -1");
+
+    checkString(csvWriteUnix(#d, t, 44),
+                "name,port,note" + nl() + "web,80," + qt("a,b") + nl() + "db,5432," +
+                    qt("say " + q2() + "hi" + q2()) + nl() + "quoted,12," + nl(),
+                "write quotes exactly the fields that need it");
+
+    csvSetCellName(#d, t, 0, "port", "8080");
+    checkString(csvCellName(t, 0, "port"), "8080", "set cell");
+    csvRemoveRow(t, 2);
+    checkInt(csvRows(t), 2, "remove row");
+
+    docFree(#d);
+
+    Doc bad = docNew(0);
+    check(csvParse(#bad, "a,b\n1,2,3\n", 44) == null, "a wider row is an error");
+    docFree(#bad);
+}
+
+//===--- XML --------------------------------------------------------------===//
+
+function checkXml():void {
+    testGroup("xml");
+
+    Doc d = docNew(0);
+    string text = """<?xml version="1.0"?>
+<cfg>
+  <db host="localhost" port="5432"/>
+  <paths>
+    <path>/a</path>
+    <path>/b</path>
+  </paths>
+  <note>a &amp; b &lt;x&gt; &#233;</note>
+  <p>hi <b>bold</b> tail</p>
+</cfg>""";
+    ptr XmlNode root = xmlParse(#d, text);
+    if (root == null) {
+        check(false, "xml parses: " + docErrorWithPosition(#d, text));
+        docFree(#d);
+        return;
+    }
+    checkString(root->name, "cfg", "root element");
+    ptr XmlNode db = xmlChild(root, "db");
+    checkString(xmlAttrOf(db, "host"), "localhost", "attribute");
+    checkString(xmlAttrOf(db, "port"), "5432", "second attribute");
+    checkString(xmlAttrOf(db, "nope"), "", "missing attribute is empty");
+    checkInt(xmlCount(root, "path"), 2, "two path elements");
+    checkString(xmlChildText(root, "note"), "a & b <x> \u00e9", "entities decoded");
+    checkString(xmlText(xmlChild(root, "p")), "hi bold tail", "mixed content text order");
+    check(xmlFind(root, "path") != null, "descendant search");
+
+    // modification
+    ptr XmlNode port = xmlChild(root, "db");
+    xmlSetAttr(#d, port, "port", "6543");
+    checkString(xmlAttrOf(port, "port"), "6543", "attribute updated in place");
+    xmlSetAttr(#d, port, "user", "app");
+    checkString(xmlAttrOf(port, "user"), "app", "attribute added");
+
+    string written = xmlWrite(#d, root, 2);
+    checkContains(written, "<db host=\"localhost\" port=\"6543\" user=\"app\"/>",
+                  "self-closing tag written with attributes");
+    checkContains(written, "<p>hi <b>bold</b> tail</p>", "mixed content stays on one line");
+    checkContains(written, "a &amp; b &lt;x&gt; \u00e9", "escaping restored");
+
+    ptr XmlNode again = xmlParse(#d, written);
+    check(again != null, "written XML parses again");
+    checkString(xmlAttrOf(xmlChild(again, "db"), "port"), "6543", "attribute survives a round trip");
+
+    docFree(#d);
+
+    Doc bad = docNew(0);
+    check(xmlParse(#bad, "<a><b></a>") == null, "mismatched tags are an error");
+    check(xmlParse(#bad, "<a/><b/>") == null, "two roots are an error");
+    docFree(#bad);
+}
+
+//===--- TOML -------------------------------------------------------------===//
+
+function checkToml():void {
+    testGroup("toml");
+
+    Doc d = docNew(0);
+    string text = """# top
+title = "Axiom"
+num = 1_000
+pi = 3.14
+hex = 0xff
+b = true
+date = 1979-05-27
+inline = { x = 1, y = "z" }
+arr = [1, 2, 3]
+
+[db]
+host = "h"
+port = 5432
+
+[db.pool]
+max = 10
+
+[[cluster]]
+name = "a"
+
+[[cluster]]
+name = "b"
+""";
+    ptr Value root = tomlParse(#d, text);
+    if (root == null) {
+        check(false, "toml parses: " + docErrorWithPosition(#d, text));
+        docFree(#d);
+        return;
+    }
+    checkString(valStrOf(valGet(root, "title"), ""), "Axiom", "string");
+    checkInt(valInt(valGet(root, "num"), 0), 1000, "underscores in numbers");
+    check(valFloatOf(valGet(root, "pi"), 0.0) == 3.14, "float");
+    checkInt(valInt(valGet(root, "hex"), 0), 255, "hex integer");
+    check(valBoolOf(valGet(root, "b"), false), "bool");
+    checkString(valStrOf(valGet(root, "date"), ""), "1979-05-27", "date kept as text");
+    checkInt(valInt(valPath(root, "inline.x"), 0), 1, "inline table");
+    checkInt(valCount(valGet(root, "arr")), 3, "array");
+    checkInt(valInt(valPath(root, "db.port"), 0), 5432, "table");
+    checkInt(valInt(valPath(root, "db.pool.max"), 0), 10, "dotted table header");
+    checkInt(valCount(valGet(root, "cluster")), 2, "array of tables");
+    checkString(valStrOf(valGet(valAt(valGet(root, "cluster"), 1), "name"), ""), "b",
+                "second array-of-tables element");
+
+    string written = tomlWrite(#d, root);
+    checkContains(written, "num = 1000", "integer written back");
+    checkContains(written, "[db.pool]", "nested table header");
+    checkContains(written, "[[cluster]]", "array of tables header");
+    Doc d2 = docNew(0);
+    ptr Value again = tomlParse(#d2, written);
+    check(again != null, "written TOML parses again");
+    check(valEquivalent(root, again), "TOML round trip is equivalent");
+    docFree(#d2);
+
+    docFree(#d);
+
+    Doc bad = docNew(0);
+    check(tomlParse(#bad, "a = 1\na = 2\n") == null, "duplicate key is an error");
+    check(tomlParse(#bad, "a = bare\n") == null, "a bare string is an error");
+    docFree(#bad);
+}
+
+//===--- YAML -------------------------------------------------------------===//
+
+function checkYaml():void {
+    testGroup("yaml");
+
+    Doc d = docNew(0);
+    string text = """# sample
+name: Axiom
+version: 1
+stable: true
+nested:
+  host: h
+  port: 5432
+list:
+  - a
+  - b
+objs:
+  - id: 1
+    tag: x
+  - id: 2
+    tag: y
+flow: [1, 2, 3]
+flowmap: {a: 1, b: two}
+block: |
+  line1
+  line2
+""";
+    ptr Value root = yamlParse(#d, text);
+    if (root == null) {
+        check(false, "yaml parses: " + docErrorWithPosition(#d, text));
+        docFree(#d);
+        return;
+    }
+    checkString(valStrOf(valGet(root, "name"), ""), "Axiom", "plain string");
+    checkInt(valInt(valGet(root, "version"), 0), 1, "int");
+    check(valBoolOf(valGet(root, "stable"), false), "bool");
+    checkInt(valInt(valPath(root, "nested.port"), 0), 5432, "nested mapping");
+    checkInt(valCount(valGet(root, "list")), 2, "block sequence");
+    checkString(valStrOf(valGet(valAt(valGet(root, "objs"), 0), "tag"), ""), "x",
+                "mapping inside a sequence");
+    checkInt(valCount(valGet(root, "flow")), 3, "flow sequence");
+    checkString(valStrOf(valGet(valGet(root, "flowmap"), "b"), ""), "two", "flow mapping");
+    checkString(valStrOf(valGet(root, "block"), ""), "line1" + nl() + "line2" + nl(),
+                "literal block keeps its newlines");
+
+    string written = yamlWrite(#d, root);
+    checkContains(written, "nested:" + nl() + "  host: h", "nested mapping re-indented");
+    checkContains(written, "  - id: 1" + nl() + "    tag: x",
+                  "sequence entry keeps its keys aligned under the dash");
+    Doc d2 = docNew(0);
+    ptr Value again = yamlParse(#d2, written);
+    check(again != null, "written YAML parses again");
+    check(valEquivalent(root, again), "YAML round trip is equivalent");
+    docFree(#d2);
+    docFree(#d);
+
+    // anchors and aliases
+    Doc anchors = docNew(0);
+    string text2 = """base: &b
+  x: 1
+copy: *b
+""";
+    ptr Value second = yamlParse(#anchors, text2);
+    check(second != null, "anchors parse");
+    checkInt(valInt(valPath(second, "copy.x"), 0), 1, "alias expands to a copy");
+    check(valGet(second, "base") != valGet(second, "copy"), "alias is a copy, not a shared node");
+    docFree(#anchors);
+
+    // multiple documents
+    Doc docs = docNew(0);
+    string stream = """
+---
+a: 1
+---
+a: 2
+""";
+    ptr Value all = yamlParseAll(#docs, stream);
+    checkInt(valCount(all), 2, "two documents in one stream");
+    checkInt(valInt(valGet(valAt(all, 1), "a"), 0), 2, "second document");
+    docFree(#docs);
+}
+
+//===--- entry point ----------------------------------------------------===//
+
+function main():void {
+    checkValue();
+    checkJson();
+    checkIni();
+    checkCsv();
+    checkXml();
+    checkToml();
+    checkYaml();
+    testFinish();
+    eof: pass;
+}

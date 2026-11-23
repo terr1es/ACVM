@@ -1,0 +1,156 @@
+//  stdlib.ax — portable Axiom fallback for the shared standard library.
+//
+//  stdlib/stddec.axd declares `library "stdlib"`, whose functions live in
+//  stdlib.dll / libstdlib.so. This file implements the same functions in Axiom,
+//  and the compiler ships both inside the .acvm:
+//
+//      .dll present  →  the native version runs (fast)
+//      .dll missing  →  this one runs instead, same result (slower)
+//
+//  That is why a program importing `stddec` still works on a machine without the
+//  library. The pairing is by name: `library "stdlib"` looks for stdlib.ax next
+//  to the declaration file, so the module name and the file name must agree.
+//
+//  Signatures must match stddec.axd exactly. Where they disagree, the compiler
+//  reports a redefinition or a type error at the declaration site.
+//
+//  Only the functions with a portable equivalent belong here. Anything that
+//  genuinely needs C (calling out to a system API, say) is simply left out, and
+//  then the library really is required.
+
+// ─── arrays of int ─────────────────────────────────────────────────────────
+
+//  Sorts `count` integers ascending, in place. Delegates to the `sortInts`
+//  compiler primitive, which is linked into acvm.exe and needs no library at
+//  all -- so the fallback is not slower than the native path here, just less
+//  dramatic. A pure Axiom sort would work too; it would also be two orders of
+//  magnitude slower for no benefit.
+module "stdlib" version "0.1.0";
+
+function nativeSort(ptr int data, int count):int64 {
+    sortInts(data, count);
+    return 0;
+}
+
+//  Sorts `count` integers descending, in place.
+//
+//  Ascending sort followed by an in-place reversal. Not stable: the reversal
+//  also reverses the relative order of equal elements.
+//  `count` is an element count; `count <= 1` is a no-op.
+//  Always returns 0 (there is no failure path).
+function nativeSortDesc(ptr int data, int count):int64 {
+    sortInts(data, count);
+    // Reverse in place, which turns the ascending sort into a descending one.
+    ptr int left = data;
+    ptr int right = data + count - 1;
+    while (left < right) {
+        int tmp = @left;
+        @left = @right;
+        @right = tmp;
+        left = left + 1;
+        right = right - 1;
+    }
+    return 0;
+}
+
+//  Reverses `count` integers in place. `count` is an element count.
+//  Always returns 0.
+function nativeReverse(ptr int data, int count):int64 {
+    reverseInts(data, count);
+    return 0;
+}
+
+//  Sums `count` integers. `count` is an element count.
+//
+//  Accumulates in `int64`, so a 32 bit overflow cannot happen before the sum
+//  itself exceeds 2^63. `count <= 0` returns 0.
+function nativeSum(ptr int data, int count):int64 {
+    int64 total = 0;
+    for (int i = 0; i < count; i++) {
+        total = total + (@(data + i) as int64);
+    }
+    return total;
+}
+
+//  Largest element of `data[0..count)`. `count` is an element count.
+//  Returns 0 when `count <= 0` -- the same value a single-element array
+//  holding 0 would return, so check `count` first if that distinction matters.
+function nativeMax(ptr int data, int count):int64 {
+    if (count <= 0) {
+        return 0;
+    }
+    int best = @data;
+    for (int i = 1; i < count; i++) {
+        int value = @(data + i);
+        if (value > best) {
+            best = value;
+        }
+    }
+    return best as int64;
+}
+
+//  Smallest element of `data[0..count)`. Same "0 for an empty array" caveat as
+//  `nativeMax`.
+function nativeMin(ptr int data, int count):int64 {
+    if (count <= 0) {
+        return 0;
+    }
+    int best = @data;
+    for (int i = 1; i < count; i++) {
+        int value = @(data + i);
+        if (value < best) {
+            best = value;
+        }
+    }
+    return best as int64;
+}
+
+//  Number of elements equal to `value` in `data[0..count)`. Linear, O(count).
+function nativeCount(ptr int data, int count, int value):int64 {
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (@(data + i) == value) {
+            found++;
+        }
+    }
+    return found as int64;
+}
+
+// ─── scalars ───────────────────────────────────────────────────────────────
+
+//  Clamps `value` into [`low`, `high`].
+//
+//  Returns 0 when `low > high`: there is no valid range to clamp into, and 0 is
+//  the value the native side returns for the same input, so both paths agree.
+function nativeClamp(int value, int low, int high):int64 {
+    if (low > high) {
+        return 0;
+    }
+    if (value < low) {
+        return low as int64;
+    }
+    if (value > high) {
+        return high as int64;
+    }
+    return value as int64;
+}
+
+//  Greatest common divisor of |a| and |b|. Both operands are made positive
+//  first, so the result is never negative.
+//
+//  `nativeGcd(0, 0)` is 0 -- the loop does not run, so `a` is returned as-is.
+//  `nativeGcd(0, n)` is |n|, which is what makes it usable as an identity.
+function nativeGcd(int a, int b):int64 {
+    if (a < 0) {
+        a = -a;
+    }
+    if (b < 0) {
+        b = -b;
+    }
+    while (b != 0) {
+        int remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return a as int64;
+}

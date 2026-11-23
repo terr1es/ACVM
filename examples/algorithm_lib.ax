@@ -1,0 +1,192 @@
+//  algorithm_lib.ax — the algorithm library, one function per family.
+//
+//  `sort` / `reverse` come from the compiler primitives and work everywhere.
+//  `sortStrings` is pure Axiom as well, for a reason worth knowing: a native sort
+//  cannot read string contents, because an array of `string` marshals to 16-byte
+//  descriptors pointing at paged VM memory rather than host memory.
+//  Everything else is native: declared in stdlib/algorithm.axd, implemented in
+//  algorithm.dll (built from stdlib/algorithm.c), with an Axiom fallback in
+//  stdlib/algorithm.ax for machines without the library.
+//
+//  Run:  acvm run examples/algorithm_lib.ax
+//
+//  To watch it take the fallback path:
+//      (move algorithm.dll out of the build directory)
+//      ACVM_DEBUG_EXTERNAL=1 acvm run examples/algorithm_lib.ax
+//
+//  The point of each call below is the *shape* it replaces. A binary search is
+//  twenty steps in Axiom too, so O(log n) is not what makes it native. A scan
+//  over 200 000 elements is, and so is a selection that avoids a full sort.
+
+function import (return:(algorithm));
+
+comptime int N = 200000;
+
+//  Same LCG as the benchmarks, so runs are reproducible.
+function private fillRandom(ptr int data, int count, unsigned int seed):void {
+    unsigned int state = seed;
+    for (int i = 0; i < count; i++) {
+        state = state * 1664525u32 + 1013904223u32;
+        @(data + i) = ((state >> 16) as int) % 10000;
+    }
+    eof: pass;
+}
+
+function main():void {
+    int data[N] = {0};
+    fillRandom(#data[0], N, 12345u32);
+
+    // ─── queries: one native pass instead of 200 000 interpreted ones ──────
+    print("min index:        "); print(minIndex(#data[0], N)); print("\n");
+    print("max index:        "); print(maxIndex(#data[0], N)); print("\n");
+    print("count of 0:       "); print(countInt(#data[0], N, 0)); print("\n");
+    print("first 4242 at:    "); print(findInt(#data[0], N, 4242)); print("\n");
+
+    // ─── selection: the median without sorting ────────────────────────────
+    //
+    //  A full sort is O(n log n); quickselect is O(n) on average. For one order
+    //  statistic on a large array that is the whole difference. Note that it
+    //  rearranges the array it is given -- the median is guaranteed to be at the
+    //  middle, nothing else is.
+    int sample[1001] = {0};
+    for (int i = 0; i < 1001; i++) {
+        @(#sample[0] + i) = @(#data[0] + i);
+    }
+    print("median:           "); print(medianValue(#sample[0], 1001)); print("\n");
+
+    //  The 90th percentile: one selection, not a sort.
+    int copy[1001] = {0};
+    for (int i = 0; i < 1001; i++) {
+        @(#copy[0] + i) = @(#data[0] + i);
+    }
+    nthElement(#copy[0], 1001, 900);
+    print("p90:              "); print(@(#copy[0] + 900)); print("\n");
+
+    // ─── sort, then search the sorted result ──────────────────────────────
+    sort(#data[0], N);
+    print("sorted:           "); print(isSortedAsc(#data[0], N)); print("\n");
+
+    print("lowerBound(5000): "); print(lowerBound(#data[0], N, 5000)); print("\n");
+    print("upperBound(5000): "); print(upperBound(#data[0], N, 5000)); print("\n");
+    print("binarySearch(5000): ");
+    print(binarySearch(#data[0], N, 5000));
+    print("\n");
+    print("binarySearch(9999): ");
+    print(binarySearch(#data[0], N, 9999));   // absent: -1
+    print("\n");
+
+    // ─── unique: compact the sorted array in place ─────────────────────────
+    //
+    //  `uniqueSorted` returns the new length; the tail is left as it was, so
+    //  only the first `distinct` elements are meaningful.
+    int distinct = uniqueSorted(#data[0], N);
+    print("distinct values:  "); print(distinct); print("\n");
+    print("smallest / largest: ");
+    print(@#data[0]);
+    print(" / ");
+    print(@(#data[0] + distinct - 1));
+    print("\n");
+
+    // ─── merge: two sorted runs into one ──────────────────────────────────
+    int left[5] = {1, 4, 7, 10, 13};
+    int right[4] = {2, 3, 11, 12};
+    int merged[10] = {0};
+    int count = mergeInts(#merged[0], 10, #left[0], 5, #right[0], 4);
+    print("merged:           ");
+    for (int i = 0; i < count; i++) {
+        print(@(#merged[0] + i));
+        print(" ");
+    }
+    print("\n");
+
+    //  Not enough room is an error code, not a crash or a silent truncation.
+    int tight[4] = {0};
+    print("merge into 4:     ");
+    print(mergeInts(#tight[0], 4, #left[0], 5, #right[0], 4));
+    print(" (needs 9)\n");
+
+    // ─── heap: a priority queue with no allocation ────────────────────────
+    //
+    //  The array is the queue. `pushHeap` assumes the caller already appended the
+    //  new element; `popHeap` moves the maximum to the end and restores the rest.
+    int queue[8] = {0};
+    int size = 0;
+    int incoming[8] = {42, 7, 99, 13, 88, 1, 64, 30};
+    for (int i = 0; i < 8; i++) {
+        @(#queue[0] + size) = @(#incoming[0] + i);
+        size++;
+        pushHeap(#queue[0], size);
+    }
+    print("heap valid:       "); print(isHeap(#queue[0], size)); print("\n");
+    print("drained in order: ");
+    while (size > 0) {
+        popHeap(#queue[0], size);
+        print(@(#queue[0] + size - 1));
+        print(" ");
+        size--;
+    }
+    print("\n");
+
+    // ─── rotate and partition ─────────────────────────────────────────────
+    int ring[7] = {1, 2, 3, 4, 5, 6, 7};
+    rotateInts(#ring[0], 7, 3);
+    print("rotate left 3:    ");
+    for (int i = 0; i < 7; i++) {
+        print(@(#ring[0] + i));
+        print(" ");
+    }
+    print("\n");
+
+    int splitData[8] = {5, 1, 9, 3, 7, 2, 8, 4};
+    int split = partitionInts(#splitData[0], 8, 5);
+    print("partition at 5:   split=");
+    print(split);
+    print(" left<5=");
+    print(lowerBound(#splitData[0], split, 5) == split);
+    print(" right>=5=");
+    print(lowerBound(#splitData[0] + split, 8 - split, 5) == 0);
+    print("\n");
+
+    // ─── fill and compare ─────────────────────────────────────────────────
+    int block[6] = {0};
+    fillInts(#block[0], 6, -1);
+    int zeros[6] = {0};
+    print("filled with -1:   ");
+    for (int i = 0; i < 6; i++) {
+        print(@(#block[0] + i));
+        print(" ");
+    }
+    print("\n");
+    print("equals zeros:     "); print(equalInts(#block[0], 6, #zeros[0], 6)); print("\n");
+
+    // ─── strings ──────────────────────────────────────────────────────────
+    //
+    //  String ordering is by content (`<` emits a native three-way compare), and
+    //  unsigned byte order, so UTF-8 sorts correctly. Numbers stored as text sort
+    //  lexicographically -- "10" before "2" -- which is a property of the data, not
+    //  a bug in the sort.
+    string words[6] = {"delta", "alpha", "charlie", "bravo", "echo", "aardvark"};
+    print("\nstrings before: sorted=");
+    print(isSortedStrings(#words[0], 6));
+    print("\n");
+    sortStrings(#words[0], 6);
+    print("strings after:  [");
+    for (int i = 0; i < 6; i++) {
+        print(@(#words[0] + i));
+        print(" ");
+    }
+    print("] sorted=");
+    print(isSortedStrings(#words[0], 6));
+    print("\n");
+
+    string numeric[4] = {"10", "2", "1", "20"};
+    sortStrings(#numeric[0], 4);
+    print("numeric as text: [");
+    for (int i = 0; i < 4; i++) {
+        print(@(#numeric[0] + i));
+        print(" ");
+    }
+    print("]   <- lexicographic, not numeric\n");
+
+    eof: pass;
+}

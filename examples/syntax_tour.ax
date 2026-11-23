@@ -1,0 +1,82 @@
+//  syntax_tour.ax — Axiom-specific syntax, all in one place.
+//
+//  Run:  acvm run examples/syntax_tour.ax
+//
+//  Task: build data -> write file -> read back -> sort and search -> stats -> cleanup.
+//  Every syntax point lands on a real use, not a checklist padded to look full.
+
+function import (return:(io));           // files + paths
+function import (return:(algorithm));    // sort + search + min-max
+
+comptime int N = 6;                       // compile-time constant, usable as an array length
+
+enum Status { OK = 0, MISSING = 1, TOO_BIG = 2 };    // an enum is an integer underneath
+struct Range { int lo; int hi; };                     // struct is a value type
+
+// eof: all three returns share one ending, so cleanup does not grow with the return count.
+// Note that eof is not finally — it does not run when a trap ends the function.
+function load(string path, ptr char buf, int cap):Status {
+    if (!fileExists(path)) { return MISSING; }
+    if (fileSize(path) > cap) { return TOO_BIG; }
+    if (readTextFile(path, buf, cap) < 0) { return TOO_BIG; }
+    return OK;
+    eof: print("[eof] ");
+}
+
+// virtual: an escape hatch. It runs where defined; the outer function ends and it takes over.
+// With an eof -> the outer eof is skipped; without one -> the outer eof still runs.
+function fill(ptr int a, int cap):int8 {
+    if (cap < N) {
+        virtual { return -1; eof: print("[virtual-eof] "); }
+    }
+    return 0;
+    eof: print("[outer-eof] ");
+}
+
+function main():void {
+    string path = "tour.tmp";
+    int values[N] = {42, 7, 91, 13, 68, 3};
+
+    print("1 write: "); print(writeTextFile(path, "42,7,91,13,68,3\n")); print(" bytes\n");
+
+    char buf[256];
+    Status st = load(path, #buf[0], 256);
+    // Use the byte count actually read, never a hard-coded length: the rest is old zeros.
+    print("2 load: status="); print(st);
+    print(" text=["); print(makeString(#buf[0], fileSize(path) - 1)); print("]\n");
+
+    // arena_scope: temporaries die at block exit, so string building in a loop must wrap
+    string csv = "";
+    for (int i = 0; i < N; i++) {
+        arena_scope { csv = csv + itoa(@(#values[0] + i), 10) + ","; }
+    }
+    print("3 csv: "); print(csv); print("\n");
+
+    sort(#values[0], N);                                    // C implementation, no deps
+    print("4 sorted+find: "); print(binarySearch(#values[0], N, 42));
+    print(" absent->"); print(lowerBound(#values[0], N, 50)); print("\n");
+
+    int mm[4];
+    minMax(#mm[0], 4, #values[0], N);                        // extremes and positions, one pass
+    print("5 min="); print(@#mm[0]); print("@"); print(@(#mm[0] + 2));
+    print(" max="); print(@(#mm[0] + 1)); print("\n");
+
+    int4 bucket = 7;                 // 4-bit signed, -8..7, overflow traps
+    int8 count = 12;                 // 8-bit, -128..127
+    print("6 int4="); print(bucket); print(" int8="); print(count); print("\n");
+
+    unsigned int wrap = 4294967295u32 + 1u32;   // unsigned wraps to 0, no error
+    print("7 wrap="); print(wrap); print("\n");
+
+    Range r = {1, 9};                // struct copies by value
+    print("8 range="); print(r.lo); print(".."); print(r.hi); print("\n");
+
+    print("9 virtual: "); print(fill(#values[0], 2) as int);
+    print(" | "); print(fill(#values[0], N) as int); print("\n");
+
+    print("10 path: stem="); print(pathStem("a/b.csv"));
+    print(" ext="); print(pathExtension("a/b.csv")); print("\n");
+    removeFile(path);
+    print("done\n");
+    eof: pass;
+}

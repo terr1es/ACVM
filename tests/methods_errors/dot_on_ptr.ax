@@ -1,0 +1,13 @@
+//  A dot on a pointer: steer the user to '->' instead of claiming there is no
+//  such method.
+struct S {
+    int n;
+    function get(self):int { return self.n; }
+};
+
+function main():void {
+    S s = {7};
+    ptr S p = #s;
+    print(p.get());
+    eof: pass;
+}

@@ -1,0 +1,602 @@
+//  time.ax — calendar arithmetic, formatting and parsing.
+//
+//  `time.axd` declares the four clock reads that need the operating system. This
+//  file is everything else, and it is all plain Axiom: no DLL, no marshalling, and
+//  it works on any `int64` timestamp whether or not a clock produced it.
+//
+//      function import (return:(time));
+//
+//      DateTime when = timeToCivil(1700000000000i64);
+//      print(timeFormat(when));        // 2023-11-14 22:13:20
+//      print(timeDayOfWeek(when));     // 2  (Tuesday, ISO numbering)
+//
+//  ── the model ─────────────────────────────────────────────────────────────
+//
+//  A timestamp is `int64` milliseconds since the Unix epoch, UTC. A `DateTime` is
+//  the broken-down form. Both are ordinary values: nothing here allocates, nothing
+//  holds state, and every function is pure. That makes this module trivially
+//  testable — you can pass in any timestamp and get a fixed answer, with no clock
+//  involved.
+//
+//  ── what is deliberately simplified ───────────────────────────────────────
+//
+//  **Leap seconds are ignored.** Every day is assumed to be exactly 86400 seconds,
+//  so `second` never reads 60. Leap seconds have been inserted 27 times since 1972
+//  and are scheduled to be phased out by 2035; pretending they do not exist is
+//  what every mainstream timestamp library does, and it keeps `timeFromCivil`
+//  exactly invertible.
+//
+//  **The proleptic Gregorian calendar is used for all dates**, including before
+//  1582 when it did not exist. This matches ISO 8601 and means date arithmetic
+//  never has a discontinuity.
+//
+//  ── the calendar maths ────────────────────────────────────────────────────
+//
+//  Days-to-civil and civil-to-days use Howard Hinnant's algorithms (`chrono`
+//  proposal, public domain). They are branch-light integer arithmetic with no
+//  lookup tables, correct for any year in range, and — the reason for choosing
+//  them — they are exactly invertible including for dates before 1970, which is
+//  where naive implementations break on integer division rounding.
+
+module "time" version "0.1.0";
+
+function import (return:(time));
+
+comptime int64 MS_PER_SECOND = 1000i64;
+comptime int64 MS_PER_MINUTE = 60000i64;
+comptime int64 MS_PER_HOUR = 3600000i64;
+comptime int64 MS_PER_DAY = 86400000i64;
+comptime int64 SECONDS_PER_DAY = 86400i64;
+
+//  Broken-down UTC time.
+//
+//  Invariants: `month` 1–12, `day` 1–31 (valid for the month), `hour` 0–23,
+//  `minute` 0–59, `second` 0–59, `millis` 0–999. `timeToCivil` always produces a
+//  valid value; if you build one by hand, run it through `timeValid` first.
+struct DateTime {
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+    int millis;
+};
+
+// ─── internals: integer arithmetic helpers ─────────────────────────────────
+
+//  Floor division: rounds toward negative infinity instead of toward zero.
+//
+//  Needed because Axiom's `/` truncates, so `-1 / 86400000` is 0 while the correct
+//  day number for one millisecond before the epoch is -1. Getting this wrong makes
+//  every date before 1970 off by one day.
+function private floorDiv(int64 a, int64 b):int64 {
+    int64 quotient = a / b;
+    if ((a % b) != 0i64 && ((a < 0i64) != (b < 0i64))) {
+        quotient = quotient - 1i64;
+    }
+    return quotient;
+    eof: pass;
+}
+
+//  Non-negative remainder matching `floorDiv`, so that
+//  `floorDiv(a, b) * b + floorMod(a, b) == a` for every sign combination.
+function private floorMod(int64 a, int64 b):int64 {
+    int64 remainder = a % b;
+    if (remainder != 0i64 && ((remainder < 0i64) != (b < 0i64))) {
+        remainder = remainder + b;
+    }
+    return remainder;
+    eof: pass;
+}
+
+//  Left-pads an integer to `width` digits with '0'. Private: this exists so `time`
+//  does not have to depend on the `io` library for three lines of formatting.
+function private padNumber(int value, int width):string {
+    string digits = itoa(value, 10);
+    string result = digits;
+    while (result.length < width) {
+        result = "0" + result;
+    }
+    return result;
+    eof: pass;
+}
+
+// ─── calendar core ─────────────────────────────────────────────────────────
+
+//  Days since 1970-01-01 for a civil date. Correct for any year, including
+//  negative ones, and it is the exact inverse of `civilFromDays`.
+function private daysFromCivil(int year, int month, int day):int64 {
+    int adjustedYear = year;
+    if (month <= 2) {
+        // January and February are treated as months 13 and 14 of the previous
+        // year, which puts the leap day at the end and removes a special case.
+        adjustedYear = adjustedYear - 1;
+    }
+    const int64 era = floorDiv(adjustedYear as int64, 400i64);
+    const int64 yearOfEra = adjustedYear as int64 - era * 400i64;          // 0..399
+    const int shiftedMonth = month + (month > 2 ? -3 : 9);                 // 0..11
+    const int64 dayOfYear = (153i64 * shiftedMonth as int64 + 2i64) / 5i64 +
+        day as int64 - 1i64;                                               // 0..365
+    const int64 dayOfEra = yearOfEra * 365i64 + yearOfEra / 4i64 -
+        yearOfEra / 100i64 + dayOfYear;                                    // 0..146096
+    return era * 146097i64 + dayOfEra - 719468i64;
+    eof: pass;
+}
+
+//  Civil date for a day number. Writes year/month/day into `out[0..2]`; the caller
+//  supplies the three-element array because Axiom cannot return a tuple cheaply
+//  through this path.
+function private civilFromDays(int64 days, ptr int out):void {
+    const int64 shifted = days + 719468i64;
+    const int64 era = floorDiv(shifted, 146097i64);
+    const int64 dayOfEra = shifted - era * 146097i64;                      // 0..146096
+    const int64 yearOfEra = (dayOfEra - dayOfEra / 1460i64 + dayOfEra / 36524i64 -
+        dayOfEra / 146096i64) / 365i64;                                    // 0..399
+    int64 year = yearOfEra + era * 400i64;
+    const int64 dayOfYear = dayOfEra - (365i64 * yearOfEra + yearOfEra / 4i64 -
+        yearOfEra / 100i64);                                               // 0..365
+    const int64 shiftedMonth = (5i64 * dayOfYear + 2i64) / 153i64;         // 0..11
+    const int64 day = dayOfYear - (153i64 * shiftedMonth + 2i64) / 5i64 + 1i64;
+    int64 month = shiftedMonth < 10i64 ? shiftedMonth + 3i64 : shiftedMonth - 9i64;
+    if (month <= 2i64) {
+        year = year + 1i64;
+    }
+    @(out + 0) = year as int;
+    @(out + 1) = month as int;
+    @(out + 2) = day as int;
+    eof: pass;
+}
+
+// ─── conversion ────────────────────────────────────────────────────────────
+
+//  Breaks a UTC timestamp into a `DateTime`.
+//
+//  Truncates rather than rounds: 999.9 ms is `millis == 999`, not a rollover to the
+//  next second, because a timestamp is a point and reporting the containing second
+//  is the least surprising choice.
+function timeToCivil(int64 epochMs):DateTime {
+    const int64 days = floorDiv(epochMs, MS_PER_DAY);
+    const int64 withinDay = floorMod(epochMs, MS_PER_DAY);
+
+    int parts[3] = {0, 0, 0};
+    civilFromDays(days, #parts[0]);
+
+    DateTime result = {0, 0, 0, 0, 0, 0, 0};
+    result.year = @(#parts[0] + 0);
+    result.month = @(#parts[0] + 1);
+    result.day = @(#parts[0] + 2);
+    result.hour = (withinDay / MS_PER_HOUR) as int;
+    result.minute = ((withinDay % MS_PER_HOUR) / MS_PER_MINUTE) as int;
+    result.second = ((withinDay % MS_PER_MINUTE) / MS_PER_SECOND) as int;
+    result.millis = (withinDay % MS_PER_SECOND) as int;
+    return result;
+    eof: pass;
+}
+
+//  Turns a `DateTime` (interpreted as UTC) back into a timestamp.
+//
+//  Out-of-range fields are **carried**, not rejected: month 13 becomes January of
+//  the next year, day 32 becomes the 1st of the next month, hour 25 rolls over. That
+//  makes `timeAddDays(t, 1)` expressible as "add 1 to the day" without pre-checking
+//  month lengths, and it is what makes this the exact inverse of `timeToCivil`.
+function timeFromCivil(DateTime t):int64 {
+    const int64 days = daysFromCivil(t.year, t.month, t.day);
+    int64 withinDay = t.hour as int64 * MS_PER_HOUR;
+    withinDay = withinDay + t.minute as int64 * MS_PER_MINUTE;
+    withinDay = withinDay + t.second as int64 * MS_PER_SECOND;
+    withinDay = withinDay + t.millis as int64;
+    return days * MS_PER_DAY + withinDay;
+    eof: pass;
+}
+
+//  Breaks a timestamp into local time using the machine's timezone at that instant.
+//  Requires time.dll; the UTC version does not.
+function timeToCivilLocal(int64 epochMs):DateTime {
+    const int64 offsetMin = timeLocalOffsetMin(epochMs);
+    return timeToCivil(epochMs + offsetMin * MS_PER_MINUTE);
+    eof: pass;
+}
+
+//  The offset that `timeToCivilLocal` applied, in minutes east of UTC, for display
+//  as "+08:00".
+function timeLocalOffsetString(int64 epochMs):string {
+    const int64 offsetMin = timeLocalOffsetMin(epochMs);
+    const int64 magnitude = offsetMin < 0i64 ? -offsetMin : offsetMin;
+    string sign = offsetMin < 0i64 ? "-" : "+";
+    return sign + padNumber((magnitude / 60i64) as int, 2) + ":" +
+        padNumber((magnitude % 60i64) as int, 2);
+    eof: pass;
+}
+
+// ─── fields ────────────────────────────────────────────────────────────────
+
+function timeIsLeapYear(int year):bool {
+    if (year % 4 != 0) {
+        return false;
+    }
+    if (year % 100 != 0) {
+        return true;
+    }
+    return year % 400 == 0;
+    eof: pass;
+}
+
+//  Days in `month` (1–12). Returns 0 for an out-of-range month rather than guessing.
+function timeDaysInMonth(int year, int month):int {
+    if (month < 1 || month > 12) {
+        return 0;
+    }
+    if (month == 2) {
+        return timeIsLeapYear(year) ? 29 : 28;
+    }
+    if (month == 4 || month == 6 || month == 9 || month == 11) {
+        return 30;
+    }
+    return 31;
+    eof: pass;
+}
+
+//  ISO 8601 weekday: **1 = Monday … 7 = Sunday**.
+//
+//  Not C's `tm_wday` (0 = Sunday), because the ISO numbering is what matches the
+//  ISO formatting elsewhere in this module. 1970-01-01 was a Thursday, which is
+//  where the constant 3 comes from.
+function timeDayOfWeek(DateTime t):int {
+    const int64 days = daysFromCivil(t.year, t.month, t.day);
+    const int64 weekday = floorMod(days + 3i64, 7i64);      // 0 = Monday
+    return weekday as int + 1;
+    eof: pass;
+}
+
+//  Day of the year, 1-based: 1 January is 1, 31 December is 365 or 366.
+function timeDayOfYear(DateTime t):int {
+    const int64 here = daysFromCivil(t.year, t.month, t.day);
+    const int64 start = daysFromCivil(t.year, 1, 1);
+    return (here - start) as int + 1;
+    eof: pass;
+}
+
+//  "Jan" … "Dec", or "" for an out-of-range month.
+function timeMonthAbbr(int month):string {
+    string names[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    if (month < 1 || month > 12) {
+        return "";
+    }
+    return @(#names[0] + (month - 1));
+    eof: pass;
+}
+
+//  "January" … "December", or "" for an out-of-range month.
+function timeMonthName(int month):string {
+    string names[12] = {"January", "February", "March", "April", "May", "June",
+                        "July", "August", "September", "October", "November",
+                        "December"};
+    if (month < 1 || month > 12) {
+        return "";
+    }
+    return @(#names[0] + (month - 1));
+    eof: pass;
+}
+
+//  "Mon" … "Sun", matching `timeDayOfWeek`'s ISO numbering.
+function timeWeekdayAbbr(int isoWeekday):string {
+    string names[7] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    if (isoWeekday < 1 || isoWeekday > 7) {
+        return "";
+    }
+    return @(#names[0] + (isoWeekday - 1));
+    eof: pass;
+}
+
+// ─── formatting ────────────────────────────────────────────────────────────
+
+//  "2026-11-22"
+function timeFormatDate(DateTime t):string {
+    return padNumber(t.year, 4) + "-" + padNumber(t.month, 2) + "-" +
+        padNumber(t.day, 2);
+    eof: pass;
+}
+
+//  "00:07:18"
+function timeFormatTime(DateTime t):string {
+    return padNumber(t.hour, 2) + ":" + padNumber(t.minute, 2) + ":" +
+        padNumber(t.second, 2);
+    eof: pass;
+}
+
+//  "2026-11-22 00:07:18" — the form to put in a log or a report.
+function timeFormat(DateTime t):string {
+    return timeFormatDate(t) + " " + timeFormatTime(t);
+    eof: pass;
+}
+
+//  "2026-11-22 00:07:18.045" — with milliseconds, for correlating events.
+function timeFormatMs(DateTime t):string {
+    return timeFormat(t) + "." + padNumber(t.millis, 3);
+    eof: pass;
+}
+
+//  "2026-11-22T00:07:18Z" — ISO 8601 / RFC 3339, the form to store or transmit.
+//  The trailing Z states explicitly that this is UTC; appending an offset instead
+//  would require a timezone, which this value does not carry.
+function timeFormatIso(DateTime t):string {
+    return timeFormatDate(t) + "T" + timeFormatTime(t) + "Z";
+    eof: pass;
+}
+
+//  "2026-11-22T00:07:18.045Z"
+function timeFormatIsoMs(DateTime t):string {
+    return timeFormatDate(t) + "T" + timeFormatTime(t) + "." +
+        padNumber(t.millis, 3) + "Z";
+    eof: pass;
+}
+
+// ─── parsing ───────────────────────────────────────────────────────────────
+//
+//  Strict ISO 8601: exactly "YYYY-MM-DD", or "YYYY-MM-DDTHH:MM:SS" optionally
+//  followed by "." and any number of fractional digits, optionally followed by "Z"
+//  or "+HH:MM" / "-HH:MM".
+//
+//  Strict on purpose. A lenient parser invents interpretations for ambiguous input
+//  ("01/02/2026" is January 2nd or February 1st depending on the country), and the
+//  ambiguity only surfaces when someone's data means something else than they
+//  thought. A rejected parse is a bug report; a silently wrong date is a corrupt
+//  record.
+
+//  True when `piece` is exactly one ASCII digit.
+//
+//  Written as an equality check against a literal table rather than a range test
+//  (`piece >= "0" && piece <= "9"`) because **Axiom's `<` `>` `<=` `>=` on strings
+//  are not content comparisons** -- `"b" < "a"` and `"a" < "b"` are both true, so a
+//  range test accepts or rejects at random. `==` and `!=` do compare contents, so
+//  this form is reliable. See docs/AX01.md AX01-X04.
+function private isDigit(string piece):bool {
+    string digits = "0123456789";
+    for (int i = 0; i < 10; i++) {
+        if (piece == digits[i .. i + 1]) {
+            return true;
+        }
+    }
+    return false;
+    eof: pass;
+}
+
+//  Reads exactly `count` digits starting at `index`, or returns -1 when there are
+//  not enough digits or a non-digit appears.
+function private readDigits(string text, int index, int count):int {
+    if (index < 0 || index + count > text.length) {
+        return -1;
+    }
+    int value = 0;
+    for (int i = 0; i < count; i++) {
+        string piece = text[index + i .. index + i + 1];
+        if (!isDigit(piece)) {
+            return -1;
+        }
+        value = value * 10 + atoi(piece);
+    }
+    return value;
+    eof: pass;
+}
+
+//  Parses "YYYY-MM-DD". Returns false on any malformed or out-of-range input,
+//  leaving `out` untouched.
+function timeParseDate(string text, ptr DateTime out):bool {
+    if (text.length != 10) {
+        return false;
+    }
+    if (text[4 .. 5] != "-" || text[7 .. 8] != "-") {
+        return false;
+    }
+    const int year = readDigits(text, 0, 4);
+    const int month = readDigits(text, 5, 2);
+    const int day = readDigits(text, 8, 2);
+    if (year < 0 || month < 0 || day < 0) {
+        return false;
+    }
+    if (month < 1 || month > 12) {
+        return false;
+    }
+    if (day < 1 || day > timeDaysInMonth(year, month)) {
+        return false;
+    }
+    DateTime value = {0, 0, 0, 0, 0, 0, 0};
+    value.year = year;
+    value.month = month;
+    value.day = day;
+    @out = value;
+    return true;
+    eof: pass;
+}
+
+//  Parses a full ISO 8601 timestamp and returns a UTC timestamp in milliseconds.
+//
+//  On failure returns `fallback` and leaves `ok` false, so a caller that cannot
+//  abort still gets a usable value while knowing the parse did not succeed.
+//
+//  An explicit numeric offset ("+08:00") is honoured: the result is the equivalent
+//  UTC instant. "Z" and no-suffix both mean UTC.
+function timeParseIso(string text, ptr bool ok, int64 fallback):int64 {
+    @ok = false;
+    if (text.length < 10) {
+        return fallback;
+    }
+
+    DateTime value = {0, 0, 0, 0, 0, 0, 0};
+    if (!timeParseDate(text[0 .. 10], #value)) {
+        return fallback;
+    }
+    if (text.length == 10) {
+        @ok = true;
+        return timeFromCivil(value);
+    }
+    if (text[10 .. 11] != "T") {
+        return fallback;
+    }
+
+    //  Time part: HH:MM:SS, then optional fraction, then optional offset.
+    if (text.length < 19) {
+        return fallback;
+    }
+    if (text[13 .. 14] != ":" || text[16 .. 17] != ":") {
+        return fallback;
+    }
+    const int hour = readDigits(text, 11, 2);
+    const int minute = readDigits(text, 14, 2);
+    const int second = readDigits(text, 17, 2);
+    if (hour < 0 || minute < 0 || second < 0) {
+        return fallback;
+    }
+    if (hour > 23 || minute > 59 || second > 59) {
+        return fallback;
+    }
+    value.hour = hour;
+    value.minute = minute;
+    value.second = second;
+
+    int cursor = 19;
+    //  Fractional seconds: accept any number of digits, keep milliseconds.
+    if (cursor < text.length && text[cursor .. cursor + 1] == ".") {
+        cursor = cursor + 1;
+        int digits = 0;
+        int millis = 0;
+        while (cursor < text.length) {
+            string piece = text[cursor .. cursor + 1];
+            if (!isDigit(piece)) {
+                break;
+            }
+            if (digits < 3) {
+                millis = millis * 10 + atoi(piece);
+            }
+            digits = digits + 1;
+            cursor = cursor + 1;
+        }
+        if (digits == 0) {
+            return fallback;
+        }
+        //  ".5" is 500 ms, not 5 ms.
+        while (digits < 3) {
+            millis = millis * 10;
+            digits = digits + 1;
+        }
+        value.millis = millis;
+    }
+
+    //  Offset: "Z", or ±HH:MM. Absent means UTC.
+    int64 offsetMinutes = 0i64;
+    if (cursor < text.length) {
+        string marker = text[cursor .. cursor + 1];
+        if (marker == "Z") {
+            cursor = cursor + 1;
+        } else if (marker == "+" || marker == "-") {
+            if (cursor + 6 > text.length) {
+                return fallback;
+            }
+            if (text[cursor + 3 .. cursor + 4] != ":") {
+                return fallback;
+            }
+            const int offsetHour = readDigits(text, cursor + 1, 2);
+            const int offsetMin = readDigits(text, cursor + 4, 2);
+            if (offsetHour < 0 || offsetMin < 0) {
+                return fallback;
+            }
+            if (offsetHour > 23 || offsetMin > 59) {
+                return fallback;
+            }
+            offsetMinutes = offsetHour as int64 * 60i64 + offsetMin as int64;
+            if (marker == "-") {
+                offsetMinutes = -offsetMinutes;
+            }
+            cursor = cursor + 6;
+        } else {
+            return fallback;
+        }
+    }
+    if (cursor != text.length) {
+        return fallback;
+    }
+
+    @ok = true;
+    return timeFromCivil(value) - offsetMinutes * MS_PER_MINUTE;
+    eof: pass;
+}
+
+// ─── arithmetic ────────────────────────────────────────────────────────────
+
+//  Adds milliseconds to a timestamp. Negative values subtract.
+function timeAddMs(int64 epochMs, int64 deltaMs):int64 {
+    return epochMs + deltaMs;
+    eof: pass;
+}
+
+//  Adds whole days. Uses exact 86400000 ms steps, which is correct in UTC and
+//  deliberately not "same clock time tomorrow" across a DST change — that would
+//  need the timezone, and this function does not have it.
+function timeAddDays(int64 epochMs, int64 days):int64 {
+    return epochMs + days * MS_PER_DAY;
+    eof: pass;
+}
+
+//  Adds `hours` to a timestamp. Pure arithmetic on the epoch value: 1 hour is
+//  exactly 3 600 000 ms, with no calendar or timezone involved, so this is safe
+//  across a DST boundary as "3600 seconds later" (not "the same clock face an
+//  hour later").
+function timeAddHours(int64 epochMs, int64 hours):int64 {
+    return epochMs + hours * MS_PER_HOUR;
+    eof: pass;
+}
+
+//  Adds `minutes` to a timestamp. Same "exact duration, not calendar" rule as
+//  `timeAddHours`.
+function timeAddMinutes(int64 epochMs, int64 minutes):int64 {
+    return epochMs + minutes * MS_PER_MINUTE;
+    eof: pass;
+}
+
+//  Adds `seconds` to a timestamp. Same "exact duration, not calendar" rule as
+//  `timeAddHours`.
+function timeAddSeconds(int64 epochMs, int64 seconds):int64 {
+    return epochMs + seconds * MS_PER_SECOND;
+    eof: pass;
+}
+
+//  Elapsed milliseconds between two monotonic readings, clamped at zero.
+//
+//  Clamping is not paranoia: `timeMonotonicNs` is documented monotonic, but a
+//  platform bug or a reading taken across a suspend/resume can still produce a
+//  non-positive delta, and a negative duration in a log is worse than a zero one.
+function timeElapsedMs(int64 startNs, int64 endNs):int64 {
+    const int64 delta = endNs - startNs;
+    if (delta <= 0i64) {
+        return 0i64;
+    }
+    return delta / 1000000i64;
+    eof: pass;
+}
+
+//  True when `t` is a calendar date that actually exists. Useful after building a
+//  `DateTime` by hand, since `timeToCivil` never produces an invalid one.
+function timeValid(DateTime t):bool {
+    if (t.month < 1 || t.month > 12) {
+        return false;
+    }
+    if (t.day < 1 || t.day > timeDaysInMonth(t.year, t.month)) {
+        return false;
+    }
+    if (t.hour < 0 || t.hour > 23) {
+        return false;
+    }
+    if (t.minute < 0 || t.minute > 59) {
+        return false;
+    }
+    if (t.second < 0 || t.second > 59) {
+        return false;
+    }
+    if (t.millis < 0 || t.millis > 999) {
+        return false;
+    }
+    return true;
+    eof: pass;
+}

@@ -1,0 +1,125 @@
+//  strbyte.ax — byte views of strings, and the compare/hash built on them.
+//
+//      function import (return:(strbyte));
+//
+//      print(strByteAt("ABC", 0));         // 65
+//      print(strCompare("apple", "banana") < 0);   // true
+//      print(strHashOf("abc") == strHashOf("abc")); // true
+//
+//  ── why this module exists ────────────────────────────────────────────────
+//
+//  Axiom has two sharp facts about strings:
+//
+//  1. **`s[i]` does not work**. It indexes UTF-16 code units, but a string is
+//     UTF-8, so `"hello"[0]` gives mojibake (U+6568), not `'h'`.
+//  2. **`<` used to be unreliable** (fixed in compiler, see below). `==` compared
+//     by content, but `<` `<=` `>` `>=` took the numeric path and compared string
+//     descriptors as integers: measured, `"zzz" < "aaa"` and `"aaa" < "zzz"` were
+//     **both true**. IRGen emits `STR_CMP` for relational compares, so `<` works.
+//
+//  Together those two meant ordered string sets and string hashing were both out of
+//  reach -- unless the bytes were reachable, which is what this module provides.
+//
+//  ── how to get at the bytes ───────────────────────────────────────────────
+//
+//  `string` is a 16-byte value type: the first 8 bytes hold the data pointer, the
+//  last 8 the byte length. So take the address of a string variable, read the
+//  pointer as `int64`, cast to `ptr int8`, and you have a byte-addressable view:
+//
+//      string s = "ABC";
+//      ptr int64 words = #s as ptr int64;
+//      ptr int8 bytes = @words as ptr int8;     // 65, 66, 67
+//
+//  **The pointer must be read as `int64`**. Read as `int32`, it sign-extends once
+//  the address is >= 0x80000000 (arena-concatenated strings sit in that range,
+//  measured): `0x80000010` becomes `-2147483632`, and the pointer then aims
+//  somewhere wrong without crashing -- it just reads garbage. I hit this once.
+//
+//  ── safety boundary ───────────────────────────────────────────────────────
+//
+//  These functions only read, never modify (strings are immutable anyway). But the
+//  pointer comes out of the descriptor, so the string must stay alive: if it came
+//  from an `arena_scope` that exited, the bytes belong to freed memory (AX01-M02).
+
+//  Raw byte view of a string's contents.
+//
+//  Returns a null pointer for an empty string, so callers must check `length`
+//  first rather than relying on the pointer being non-null.
+module "strbyte" version "0.1.0";
+
+function strBytesOf(string s):ptr int8 {
+    ptr int64 words = #s as ptr int64;
+    return @words as ptr int8;
+    eof: pass;
+}
+
+//  Byte at `index`, **unsigned** 0..255, or 0 when out of range.
+//
+//  `ptr int8` is signed, so a UTF-8 continuation byte like 0xE4 reads as -28
+//  without the mask; returning it raw would make comparisons and hashes asymmetric.
+function strByteAt(string s, int index):int {
+    if (index < 0 || index >= s.length) {
+        return 0;
+    }
+    ptr int8 bytes = strBytesOf(s);
+    if (bytes == 0 as ptr int8) {
+        return 0;
+    }
+    return (@(bytes + index) as int) & 255;
+    eof: pass;
+}
+
+//  Lexicographic comparison by byte value, the ordering C's `strcmp` gives.
+//
+//  Returns a negative number when `a < b`, zero when equal, positive when
+//  `a > b`. When one is a prefix of the other, the shorter one sorts first.
+//
+//  This is the form `set.ax` / `map.ax` / `hash.ax` use. `<` also works now, but a
+//  three-way result is what a binary search or a sort comparator actually needs:
+//  with `<` alone every comparison has to be written twice.
+//
+//  Delegates to the compiler's `STR_CMP` / `STR_EQ` instructions rather than
+//  walking bytes here: one VM instruction against an interpreted per-byte loop is
+//  most of the cost of every string lookup. Measured with the same 200 000 pairs
+//  of 6 byte keys (`bench/str_hotpaths.ax`): 1140 ms as a byte loop, 232 ms
+//  through the instructions -- 4.9x, and the sign agreed on all 1000 pairs the
+//  equivalence check compared. Equality is tested first because that is the case
+//  that matters for lookups: a hit costs one comparison instead of two. Only the
+//  sign of the result is part of the contract, so returning -1 / 0 / +1 instead
+//  of a byte difference changes nothing for any caller.
+function strCompare(string a, string b):int {
+    if (a == b) {
+        return 0;
+    }
+    if (a < b) {
+        return -1;
+    }
+    return 1;
+    eof: pass;
+}
+
+//  FNV-1a over the bytes, returned as `unsigned int`.
+//
+//  `unsigned` on purpose: a hash is above 2^31 about half the time, and Axiom's
+//  `as int` is a checked conversion that traps instead of truncating. Callers that
+//  need an `int` for indexing should mask with `& 0x7FFFFFFF` rather than convert.
+function strHashOf(string s):unsigned int {
+    unsigned int hash = 2166136261u32;      // FNV offset basis
+    ptr int8 bytes = strBytesOf(s);
+    if (bytes != 0 as ptr int8) {
+        for (int i = 0; i < s.length; i++) {
+            unsigned int byte = ((@(bytes + i) as int) & 255) as unsigned int;
+            hash = (hash ^ byte) * 16777619u32;     // FNV prime
+        }
+    }
+    return hash;
+    eof: pass;
+}
+
+//  Non-negative hash, ready to be used as a bucket index modulo a capacity.
+//  Same FNV-1a mixing, high bit cleared.
+function strHashIndex(string s):int {
+    unsigned int hash = strHashOf(s);
+    return (hash & 2147483647u32) as int;
+    eof: pass;
+}

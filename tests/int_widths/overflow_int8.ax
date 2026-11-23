@@ -1,0 +1,12 @@
+// A narrow width must still trap. The 128-bit work changed the signed Add and Sub
+// paths to overflow-checked builtins for *every* width; this guards the widths that
+// were already correct against a regression in that rewrite.
+
+function main():void {
+    int8 maxv = 127;
+    int8 one = 1;
+    print("before\n");
+    int8 boom = maxv + one;
+    print(boom);
+    eof: pass;
+}

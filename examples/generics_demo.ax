@@ -1,0 +1,109 @@
+//  generics_demo.ax — writing one function instead of five.
+//
+//  Before generics, a library author had exactly one option per element type: copy
+//  the function and change the type. `stdlib/algorithm.ax` shows where that ends
+//  up -- 953 of its 2207 lines (43%) are thirteen pairs of functions that differ
+//  only in `int` vs `int64`.
+//
+//  A generic function is compiled once per type it is *called* with
+//  (monomorphisation), so the loop below costs the same as a hand-written
+//  `minInt` / `minDouble` would. Nothing is dispatched, boxed or erased at run
+//  time. The instance names are visible when something goes wrong: a trap inside
+//  `totalOf<int64>` names that instance, not the template.
+//
+//  Run:  acvm run examples/generics_demo.ax
+
+function import (return:(io));
+
+//===--- The kind of thing a third-party library would ship -----------------===//
+
+//  One type parameter: the two arguments must agree on it.
+function clampTo<T>(T value, T low, T high):T {
+    if (value < low) {
+        return low;
+    }
+    if (value > high) {
+        return high;
+    }
+    return value;
+}
+
+//  `T` is inferred from the element type of the pointer, so the same body walks
+//  an `int` array and an `int64` array with the right stride for each.
+function totalOf<T>(ptr T data, int count):T {
+    T total = 0 as T;
+    for (int i = 0; i < count; i++) {
+        total = total + @(data + i);
+    }
+    return total;
+}
+
+//  Two type parameters, used in different positions.
+function pickFirst<A, B>(A first, B second):A {
+    return first;
+}
+
+//  A generic may call another generic; each expands against its own `T`.
+function clampTotal<T>(ptr T data, int count, T low, T high):T {
+    return clampTo(totalOf(data, count), low, high);
+}
+
+//  Recursion is fine as long as the type stops changing: `powOf` calls itself
+//  with the same `T`, so it is one instance recursing at run time.
+function powOf<T>(T base, int exponent):T {
+    if (exponent <= 0) {
+        return 1 as T;
+    }
+    return base * powOf(base, exponent - 1);
+}
+
+//===--- Demonstrating that the types really are separate -------------------===//
+
+function showInt(string label, int value):void {
+    print(label);
+    print(value);
+    print("\n");
+    eof: pass;
+}
+
+function showDouble(string label, double value):void {
+    print(label);
+    print(value);
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    //  Same template, three element types. The literals decide which.
+    showInt("clampTo(15, 0, 10)      = ", clampTo(15, 0, 10));
+    showDouble("clampTo(2.5, 0.0, 2.0)  = ", clampTo(2.5, 0.0, 2.0));
+    print("clampTo('z', 'a', 'm')   = ");
+    print(clampTo('z', 'a', 'm'));
+    print("\n");
+
+    //  Sum: `int` and `int64` take separate instances. If the compiler had
+    //  reused one, the second call would either print 60 or overflow.
+    int xs[4] = {1, 2, 3, 4};
+    showInt("totalOf(int[4])          = ", totalOf(#xs[0], 4));
+
+    int64 big[3] = {10000000000i64, 20000000000i64, 30000000000i64};
+    print("totalOf(int64[3])        = ");
+    print(totalOf(#big[0], 3));
+    print("\n");
+
+    //  Two type parameters: `A` from the first argument, `B` from the second.
+    showInt("pickFirst(9, 1.5)        = ", pickFirst(9, 1.5));
+    print("pickFirst(\"kept\", 7)      = ");
+    print(pickFirst("kept", 7));
+    print("\n");
+
+    //  Nested: a generic calling a generic.
+    showInt("clampTotal(xs, 4, 0, 6)  = ", clampTotal(#xs[0], 4, 0, 6));
+
+    //  Recursive generic.
+    showInt("powOf(2, 10)             = ", powOf(2, 10));
+    print("powOf(2.0, 3)            = ");
+    print(powOf(2.0, 3));
+    print("\n");
+    eof: pass;
+}

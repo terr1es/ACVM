@@ -1,0 +1,157 @@
+// Axiom syntax-highlighting self-test
+// Each section covers one token class; open this file to check a colour scheme by eye.
+
+function import (return:(Std));
+
+// ---- comments ----
+/* block comment
+   does not nest */
+
+// ---- literals ----
+int     dec   = 123;
+int     sep   = 1_000_000;
+int     hex   = 0xFF_FF;
+int     bin   = 0b1010_1010;
+int8    small = 100i8;
+unsigned int8 u8 = 200u8;
+float   f     = 1.5;
+double  d     = 1.5e-3;
+double  t     = 1.;
+float   g     = .5;
+float32 f32   = 1.5f32;
+double  dd    = 1.5d;
+double16.4 q  = 3.14;
+int127  big   = 1;
+char    c     = '\n';
+char    uni   = '\u4e2d';
+string  s     = "hello\tworld\n";
+string  raw   = r"a\nb";
+bool    flag  = true;
+bool    no    = false;
+
+// ---- types ----
+ptr int          p1;
+ptr ptr int      p2;
+ptr (int[10])    parr;
+int              arr[10];
+unsigned char    uc;
+vector int       vi;
+vector string    vs;
+
+// ---- structs and enums ----
+struct Point {
+    int x;
+    int y;
+};
+
+struct Node {
+    int      value;
+    ptr Node next;
+};
+
+enum Color {
+    RED,
+    GREEN,
+    BLUE,
+};
+
+enum Http {
+    OK = 200,
+    NOT_FOUND = 404,
+};
+
+// ---- functions ----
+// Five function-kind keywords plus the plain form; the name must match `function`
+// in colour (entity.name.function) in every case.
+function private helper(const int x):int {
+    return x * 2;
+    eof: pass;
+}
+
+function global exported(int x):int {
+    return x + 1;
+    eof: pass;
+}
+
+function event onOverflow()(counter > 100):void {
+    log("overflow");
+    eof: pass;
+}
+
+function process worker():void {
+    while (true) {
+        if (nothingToDo()) { next; }
+        eof: pass;
+    }
+    eof: pass;
+}
+
+function main():void {
+    // ---- control flow ----
+    if (a > 0) {
+        print("pos\n");
+    } else if (a < 0) {
+        print("neg\n");
+    } else {
+        print("zero\n");
+    }
+
+    while (condition) { break; }
+    for (int i = 0; i < 10; i++) { continue; }
+    for i in 0..10 { pass; }
+    loop (5) { pass; }
+
+    outer: for (int i = 0; i < 3; i++) {
+        break outer;
+    }
+
+    switch (code) {
+        case 1:
+            handleOne();
+        case 2:
+            handleTwo();
+            fallthrough;
+        default:
+            handleUnknown();
+    }
+
+    // ---- expressions ----
+    int  a  = 1;
+    int8 b  = 2;
+    ptr int q = #a;
+    int  v  = @q;
+    int  w  = q->field;
+    bool ok = (a == 1) && (b != 2) || !flag;
+    int  r  = a << 2 | b & 0xF ^ ~a;
+    int  t2 = ok ? 1 : 0;
+    int  u  = a as int8;
+    int  z  = a++ + --b;
+    int8 mx = a > b ? a : b;
+    ptr void raw2 = p1 as ptr void;
+    int  nn = null == q ? 0 : 1;
+
+    // ---- strings and ranges ----
+    string t3 = s[0..3];
+    char   ch = s[0];
+    string cat = "n = " + a + "\n";
+
+    // ---- blocks ----
+    {
+        int inner = 1;      // a bare block does not open a scope
+    }
+
+    arena_scope {
+        string tmp = "a" + "b";
+    }
+
+    if (rare) {
+        virtual {
+            log("taken over");
+            return;
+            eof: pass;
+        }
+    }
+
+    eof:
+        print("bye\n");
+}

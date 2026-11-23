@@ -1,0 +1,26 @@
+// hello_sort.ax -- fill ten numbers and sort them with the standard library.
+//
+// Run:  acvm run examples/hello_sort.ax
+//
+// `import` merges another file's declarations into this file's scope. Members
+// are reached by their bare names: there is no namespace, so `quicksort.main()`
+// is not a thing (spec §2.2.1.1, I6/Q43). This file's own `main` overrides the
+// one in quicksort.ax, which is what makes the import usable at all.
+
+function import (return:(algorithm));
+
+function main():void {
+    int a[10] = {2, 5, 123, 54, 8, 3, 21, 98, 356, 1};
+
+    // From stdlib/algorithm.ax: sort(ptr T, count).
+    sort(#a[0],10);
+
+    // `print(x)` writes one value and no newline, so the newline needs its own
+    // call: 'char' is not a numeric type, so a bare '\n' is not an operand.
+    for i in 0..10 {
+        print(" " + @(#a[0] + i) + " ");
+    }
+
+    eof: pass;
+
+}

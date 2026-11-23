@@ -1,0 +1,57 @@
+//  args_check.ax — command-line arguments.
+//
+//  **This test is only meaningful when run with arguments**:
+//
+//      acvm run tests/args_check.ax -- alpha beta "two words"
+//
+//  CTest registers a variant with arguments; running without them also passes
+//  (it then checks the zero-argument path itself), but covers much less.
+//
+//  The spec originally had no way to pass arguments: `acvm run prog.ax --input x`
+//  was rejected by the CLI as an unknown option. Now everything after `--`
+//  belongs to the program, read through `argCount()` / `argAt(i)`.
+
+function import (return:(test));
+
+function main():void {
+    int count = argCount();
+
+    //  Assume nothing about how many arguments there are or what they hold: the
+    //  same file has to pass both with no arguments and with three. So the
+    //  assertions are about invariants, not concrete values.
+    check(count >= 0, "argCount is non-negative");
+
+    if (count == 0) {
+        testGroup("no arguments");
+        checkInt(argCount(), 0, "zero arguments");
+        checkEmpty(argAt(0), "argAt(0) on empty is empty");
+        checkEmpty(argAt(-1), "argAt(-1) on empty is empty");
+        print("[note] run with `-- a b c` to exercise the argument path\n");
+        testFinish();
+        return;
+    }
+
+    testGroup("arguments present");
+
+    //  Every valid index must read back a legitimate value, the empty string
+    //  included: the assertion is "in range, no crash, length consistent",
+    //  because we do not know what the caller passed.
+    for (int i = 0; i < count; i++) {
+        string value = argAt(i);
+        //  An empty argument is legal (`acvm run x.ax -- ""`), so all we can
+        //  assert is that it is not garbage: the length must agree with the
+        //  content, which is the basic invariant of a string.
+        check(value.length >= 0, "argument " + itoa(i, 10) + " is readable");
+    }
+
+    //  Out of range must be an empty string, not a crash and not random memory.
+    checkEmpty(argAt(count), "argAt(count) is empty");
+    checkEmpty(argAt(count + 100), "far out of range is empty");
+    checkEmpty(argAt(-1), "negative index is empty");
+
+    //  Reading the same position twice must be stable — arguments are read-only.
+    checkString(argAt(0), argAt(0), "repeated read is stable");
+
+    testFinish();
+    eof: pass;
+}

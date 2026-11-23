@@ -1,0 +1,21 @@
+// `private` is file scoped: two files may each have a `private helper` and
+// neither may see the other's.
+//
+// This used to fail. The two definitions were merged into one entry that kept
+// the *first* file's identity but the *second* file's body, so a library calling
+// its own helper was told "'helper' is private to <the other library>". Importing
+// one library broke another, with an error naming a file the program never
+// mentioned.
+//
+// Expected output:
+//     lib_a 1
+//     lib_b 2
+
+import "private_a.ax";
+import "private_b.ax";
+
+function main():void {
+    print("lib_a "); print(aOwn()); print("\n");
+    print("lib_b "); print(bOwn()); print("\n");
+    eof: pass;
+}

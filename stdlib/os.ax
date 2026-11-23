@@ -1,0 +1,359 @@
+//  os.ax — the part of the system library that is plain Axiom.
+//
+//  `os.axd` declares the functions that must call the operating system. This file
+//  turns them into something worth calling: the text-producing ones become
+//  functions that return a `string`, the id codes become names, and the environment
+//  block becomes a list you can walk.
+//
+//      function import (return:(os));
+//
+//      print(platformName());          // windows / linux / macos
+//      print(cwd());
+//      print(env("PATH").length);
+//      for (int i = 0; i < envCount(); i++) { print(envEntryAt(i)); }
+//
+//  ── why wrappers instead of returning strings from C ──────────────────────
+//
+//  A library function cannot allocate a `string`: the allocation has to land in the
+//  VM's arena, and the library has no access to it. So the native half writes into
+//  a caller buffer, and a wrapper here does the `makeString` step. The fixed
+//  wrapper buffer is 256 bytes, which covers the current directory, a hostname, a
+//  user name and a home directory with room to spare; `PATH` is a different matter
+//  and has its own function (`env`), which takes a 4 KB buffer.
+//
+//  A caller who needs more than that calls the raw `...Into` form from `os.axd`
+//  with their own buffer. That is why both layers are public.
+//
+//  ── the absence of a nullable string ─────────────────────────────────────
+//
+//  Three functions below return "" where a different language would return null:
+//  `env`, `cwd`, `homeDir`. The convention `io` already uses. Where the difference
+//  between "missing" and "empty" matters, a separate predicate exists: `envHas` for
+//  variables, and `-1` for the numeric ones.
+
+module "os" version "0.1.0";
+
+function import (return:(io));
+function import (return:(str));
+
+//  Buffer sizes. Named because they appear in more than one place and a bare 256
+//  in a call site says nothing about why that number.
+comptime int OS_TEXT_BYTES = 256;
+comptime int OS_ENV_BYTES = 4096;
+comptime int OS_ENV_ENTRY_BYTES = 8192;
+
+// ─── platform and architecture names ──────────────────────────────────────
+//
+//  The ids come from the native half and are stable; the names are decided here, so
+//  adding a friendlier spelling does not require rebuilding the library.
+
+function platformName():string {
+    switch (platformId()) {
+        case 1: return "windows";
+        case 2: return "linux";
+        case 3: return "macos";
+        case 4: return "freebsd";
+        default: return "unknown";
+    }
+    eof: pass;
+}
+
+//  Machine architecture as a short lowercase name: "x86", "x86_64", "arm",
+//  "arm64", or "unknown" for an id this build does not know.
+//
+//  Describes the process, not the hardware: an x86_64 build running under
+//  emulation reports "x86_64".
+function archName():string {
+    switch (archId()) {
+        case 1: return "x86";
+        case 2: return "x86_64";
+        case 3: return "arm";
+        case 4: return "arm64";
+        default: return "unknown";
+    }
+    eof: pass;
+}
+
+//  True on Windows. Cheaper and clearer than comparing `platformName()`, and it
+//  is what the path-separator helpers key off.
+function isWindows():bool {
+    return platformId() == 1;
+    eof: pass;
+}
+
+//  The path separator as a string, for building paths by hand. `pathJoin` in
+//  stdlib/io.ax is usually the better tool; this exists for the cases where a
+//  separator has to be concatenated directly (a trailing one, a list of paths).
+function pathSeparator():string {
+    if (isWindows()) {
+        return "\\";
+    }
+    return "/";
+    eof: pass;
+}
+
+//  The character that separates entries in `PATH` and similar lists: ';' on
+//  Windows, ':' elsewhere. Hard-coding ":" is the classic reason a path list
+//  breaks the first time it meets a Windows drive letter ("C:\...").
+function pathListSeparator():string {
+    if (isWindows()) {
+        return ";";
+    }
+    return ":";
+    eof: pass;
+}
+
+//  Rewrites `/` into the platform's separator. On Unix it returns the input
+//  unchanged; on Windows it turns `a/b/c` into `a\b\c`.
+//
+//  Why this is needed at all: `pathJoin` in stdlib/io.ax always joins with `/`,
+//  which is deliberate -- every Windows API accepts it, so one code path serves
+//  both platforms. The cost is that a joined path *looks* foreign on Windows, and
+//  a few places care: quoting a path for `cmd.exe`, showing it to a user, or
+//  handing it to a program that mis-parses forward slashes. Everything Axiom does
+//  itself (io, os) accepts either, so convert only at the boundary that needs it.
+function toNativePath(string path):string {
+    if (!isWindows()) {
+        return path;
+    }
+    return replaceAll(path, "/", "\\");
+    eof: pass;
+}
+
+// ─── text-producing wrappers ──────────────────────────────────────────────
+
+//  Reads an environment variable. Returns "" when it is unset **or** set to "",
+//  because the language has no nullable string -- use `envHas` to tell them apart.
+//
+//  Unlike the other wrappers this one does not use a fixed buffer: environment
+//  values can be long (`PATH` on a developer machine is easily 8 KB), and silently
+//  failing to read one would be worse than paying for the larger buffer.
+function env(string name):string {
+    char buffer[OS_ENV_BYTES];
+    int length = envGetInto(name, #buffer[0], OS_ENV_BYTES);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+//  The current working directory, or "" when it cannot be read.
+function cwd():string {
+    char buffer[OS_TEXT_BYTES];
+    int length = cwdInto(#buffer[0], OS_TEXT_BYTES);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+//  Full path of the running executable, or "" when unavailable.
+//
+//  `pathDir(exePath())` is the directory the binary lives in, which is where a tool
+//  should look for its own resources -- not the working directory, which is
+//  wherever the user happened to be standing.
+function exePath():string {
+    char buffer[OS_TEXT_BYTES];
+    int length = exePathInto(#buffer[0], OS_TEXT_BYTES);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+//  The network host name, or "" when the platform call fails -- an empty string is
+//  indistinguishable from a genuinely empty name, so treat "" as "unavailable".
+//
+//  Truncated to `OS_TEXT_BYTES` (256) bytes by the fixed buffer inside; a longer
+//  value comes back cut, with no error. Uses the native `hostNameInto` and cannot
+//  exceed that size.
+function hostName():string {
+    char buffer[OS_TEXT_BYTES];
+    int length = hostNameInto(#buffer[0], OS_TEXT_BYTES);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+//  The login name of the current user, or "" when the platform call fails -- an empty string is
+//  indistinguishable from a genuinely empty name, so treat "" as "unavailable".
+//
+//  Truncated to `OS_TEXT_BYTES` (256) bytes by the fixed buffer inside; a longer
+//  value comes back cut, with no error. Uses the native `userNameInto` and cannot
+//  exceed that size.
+function userName():string {
+    char buffer[OS_TEXT_BYTES];
+    int length = userNameInto(#buffer[0], OS_TEXT_BYTES);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+//  The directory for temporary files, or "" when the platform call fails -- an empty string is
+//  indistinguishable from a genuinely empty name, so treat "" as "unavailable".
+//
+//  Truncated to `OS_TEXT_BYTES` (256) bytes by the fixed buffer inside; a longer
+//  value comes back cut, with no error. Uses the native `tempDirInto` and cannot
+//  exceed that size.
+function tempDir():string {
+    char buffer[OS_TEXT_BYTES];
+    int length = tempDirInto(#buffer[0], OS_TEXT_BYTES);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+//  The current user's home directory, or "" when the platform call fails -- an empty string is
+//  indistinguishable from a genuinely empty name, so treat "" as "unavailable".
+//
+//  Truncated to `OS_TEXT_BYTES` (256) bytes by the fixed buffer inside; a longer
+//  value comes back cut, with no error. Uses the native `homeDirInto` and cannot
+//  exceed that size.
+function homeDir():string {
+    char buffer[OS_TEXT_BYTES];
+    int length = homeDirInto(#buffer[0], OS_TEXT_BYTES);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+//  Runs a command and returns its standard output. "" when the command cannot run
+//  or produces nothing -- both are `""`, because the failure signal of
+//  `runCaptureInto` is also "no bytes".
+//
+//  Use `runCaptureResult` when the exit code matters, which for a command like
+//  `git rev-parse` it almost always does.
+function runCapture(string command):string {
+    char buffer[OS_ENV_BYTES];
+    int exitCode[1] = {-1};
+    int length = runCaptureInto(command, #buffer[0], OS_ENV_BYTES, #exitCode[0], 1);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+// ─── environment enumeration ──────────────────────────────────────────────
+//
+//  `envCount` and `envEntryInto` live in the native half because only it can walk
+//  the platform's environment block. Everything below is string work on the result.
+//
+//  A full dump is O(n^2) in block walks: each entry re-walks from the front. That
+//  is deliberate -- the alternative is a caller-supplied buffer whose size has to
+//  be guessed, and guessing too small silently returns zero variables. A hundred
+//  entries is a rounding error either way. Bind the count before looping anyway:
+//
+//      int count = envCount();
+//      for (int i = 0; i < count; i++) { print(envEntryAt(i) + "\n"); }
+
+//  Entry `index` as `NAME=VALUE`, or "" when out of range.
+//
+//  Entries longer than 8 KB (a `PATH` with many toolchains, or a large certificate
+//  blob) come back as "". Raise `OS_ENV_ENTRY_BYTES` if that is a real case; the
+//  buffer is on the stack, so the cost of a bigger number is stack, not heap.
+function envEntryAt(int index):string {
+    char buffer[OS_ENV_ENTRY_BYTES];
+    int length = envEntryInto(index, #buffer[0], OS_ENV_ENTRY_BYTES);
+    if (length < 0) {
+        return "";
+    }
+    return makeString(#buffer[0], length);
+    eof: pass;
+}
+
+//  The `NAME` part of a `NAME=VALUE` entry.
+//
+//  Splits on the **first** '=' only: a value may contain '=' (base64, connection
+//  strings, `--define=VALUE=x`), and splitting on the last one would cut the name
+//  short. An entry with no '=' is its own name.
+function envEntryName(string entry):string {
+    int at = indexOf(entry, "=");
+    if (at < 0) {
+        return entry;
+    }
+    return entry[0..at];
+    eof: pass;
+}
+
+//  The `VALUE` part of a `NAME=VALUE` entry; "" when there is no '='.
+function envEntryValue(string entry):string {
+    int at = indexOf(entry, "=");
+    if (at < 0) {
+        return "";
+    }
+    return entry[at + 1 .. entry.length];
+    eof: pass;
+}
+
+// ─── small conveniences built on the above ────────────────────────────────
+
+//  A directory for this program's own files, under the per-user configuration
+//  location: `%APPDATA%\<name>` on Windows, `~/.config/<name>` elsewhere.
+//
+//  Does **not** create it -- `makeDir` in stdlib/io.ax does, and creating
+//  directories as a side effect of asking where one is would be a surprise. The
+//  two-step form means the caller decides when to write to disk:
+//
+//      string dir = configDir("mytool");
+//      if (dir.length > 0 && !isDirectory(dir)) { makeDir(dir); }
+function configDir(string applicationName):string {
+    if (applicationName.length == 0) {
+        return "";
+    }
+    if (isWindows()) {
+        string appData = env("APPDATA");
+        if (appData.length == 0) {
+            return "";
+        }
+        // Native separators: this value is meant to be shown and used as a path,
+        // not passed straight back into io.
+        return toNativePath(pathJoin(appData, applicationName));
+    }
+    //  XDG_CONFIG_HOME when the user set it, which is the whole point of the
+    //  variable; ~/.config otherwise, per the XDG Base Directory spec.
+    string base = env("XDG_CONFIG_HOME");
+    if (base.length == 0) {
+        string home = homeDir();
+        if (home.length == 0) {
+            return "";
+        }
+        base = pathJoin(home, ".config");
+    }
+    return toNativePath(pathJoin(base, applicationName));
+    eof: pass;
+}
+
+//  True when the environment says this is a terminal-ish interactive session.
+//
+//  **A guess, not a query.** It checks what the environment claims (`TERM` on Unix,
+//  `WT_SESSION` or `SESSIONNAME` on Windows). Windows offers no portable way to ask
+//  "is stdout a console" from here without a handle, and a program that needs to be
+//  sure should not base a destructive decision on this.
+function isInteractive():bool {
+    if (isWindows()) {
+        return env("WT_SESSION").length > 0 || env("SESSIONNAME").length > 0;
+    }
+    return env("TERM").length > 0;
+    eof: pass;
+}
+
+//  Splits `PATH` into its entries. Releases must follow with `splitFree`.
+//
+//  Uses the platform's own separator, so a Windows `PATH` with `C:\...` entries
+//  splits into whole entries instead of being cut at every drive letter.
+function pathEntries():SplitList {
+    return makeSplit(env("PATH"), pathListSeparator());
+    eof: pass;
+}

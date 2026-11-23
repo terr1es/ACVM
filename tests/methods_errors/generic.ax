@@ -1,0 +1,8 @@
+//  Generic methods are not supported yet, and that must be a clear error rather
+//  than a half-done implementation.
+struct S {
+    int n;
+    function map<T>(self, T v):T { return v; }
+};
+
+function main():void { pass; eof: pass; }

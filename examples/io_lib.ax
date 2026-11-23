@@ -1,0 +1,82 @@
+//  io_lib.ax — reading and writing files, and formatting the result.
+//
+//  Two halves, and the split is invisible at the call site:
+//
+//    stdlib/io.ax    path splitting, padding, hex  — plain Axiom, no library
+//    stdlib/io.axd   file access, line input       — needs io.dll
+//
+//  Writing takes a `string`; reading fills a caller buffer because the library
+//  cannot allocate in the VM's arena. `makeString` turns those bytes back into a
+//  string, and the round trip is exact.
+//
+//  Run:  acvm run examples/io_lib.ax
+
+function import (return:(io));
+
+comptime int LINE = 256;
+
+function main():void {
+    // ─── paths: pure Axiom, correct on both separators ────────────────────
+    string path = "reports/2026/november/summary.csv";
+    print("dir:   "); print(pathDir(path)); print("\n");
+    print("base:  "); print(pathBase(path)); print("\n");
+    print("stem:  "); print(pathStem(path)); print("\n");
+    print("ext:   "); print(pathExtension(path)); print("\n");
+
+    //  Rebuilding from the parts must give the original back.
+    string rebuilt = pathJoin(pathDir(path), pathBase(path));
+    print("round trip: "); print(rebuilt == path); print("\n");
+
+    //  A dotfile has no extension; the dot belongs to the name.
+    print("dotfile:     "); print(pathExtension(".gitignore") == ""); print("\n");
+
+    // ─── write a small report, then read it back ──────────────────────────
+    string name = "io_lib_report.txt";
+    string body = "count,value\n" + "3,120\n" + "4,130\n" + "5,150\n";
+
+    print("wrote bytes: "); print(writeTextFile(name, body)); print("\n");
+    print("file size:   "); print(fileSize(name)); print("\n");
+    print("exists:      "); print(fileExists(name)); print("\n");
+
+    char buffer[LINE] = {0 as char};
+    int count = readTextFile(name, #buffer[0], LINE);
+    string text = makeString(#buffer[0], count);
+    print("read back ok: "); print(text == body); print("\n");
+
+    //  Append a total line, then confirm the size grew.
+    print("appended:    "); print(appendTextFile(name, "total,400\n")); print("\n");
+    count = readTextFile(name, #buffer[0], LINE);
+    print("size now:    "); print(count); print("\n");
+
+    // ─── formatting: alignment is the point ───────────────────────────────
+    print("\n");
+    print(padLeft("id", 6, " ")); print(padLeft("value", 8, " ")); print("\n");
+    int sizes[3] = {120, 130, 150};
+    for (int i = 0; i < 3; i++) {
+        print(padLeft(itoa(i + 3, 10), 6, " "));
+        print(padLeft(itoa(@(#sizes[0] + i), 10), 8, " "));
+        print("\n");
+    }
+
+    //  Zero padding makes file names and timestamps sort correctly as text.
+    print("\n");
+    for (int i = 1; i < 4; i++) {
+        print("frame_" + padZero(itoa(i, 10), 4) + ".png");
+        print("\n");
+    }
+
+    //  hexByte is what a hex dump is built from.
+    print("\n");
+    char sample[4] = {0 as char, 1 as char, 15 as char, 255 as char};
+    for (int i = 0; i < 4; i++) {
+        print(hexByte(@(#sample[0] + i) as int));
+        print(" ");
+    }
+    print("\n");
+
+    // ─── clean up, so the example leaves nothing behind ───────────────────
+    print("\nremoved: "); print(removeFile(name)); print("\n");
+    print("gone:    "); print(fileExists(name)); print("\n");
+
+    eof: pass;
+}

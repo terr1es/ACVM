@@ -1,0 +1,7 @@
+//  A method must have a body.
+struct S {
+    int n;
+    function get(self):int;
+};
+
+function main():void { pass; eof: pass; }

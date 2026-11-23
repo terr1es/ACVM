@@ -1,0 +1,147 @@
+//  net_echo.ax — a TCP server and a client in one file, chosen by argument.
+//
+//  This is the honest shape of a network program in Axiom today: **two OS
+//  processes**, not two `process` blocks. A blocking `recv` inside a native call
+//  never returns to the interpreter, so the scheduler has no chance to switch --
+//  a `process` that called `tcpAccept` would freeze everything else in the VM.
+//  Until there is a non-blocking API, concurrency comes from the operating system:
+//
+//      acvm run examples/net_echo.ax -- server 8080
+//      acvm run examples/net_echo.ax -- client 8080 "hello"
+//      acvm run examples/net_echo.ax -- client 8080 "second message"
+//
+//  The `--` is not decoration: everything after it is the program's argv, and
+//  without it `acvm` reads `server` as one of its own options.
+//
+//  The server handles one connection at a time, which is what a serial protocol
+//  needs and what the blocking model gives you. For many clients at once, run
+//  several servers on several ports, or wait for the event-loop API.
+//
+//  ── the discipline this file demonstrates ─────────────────────────────────
+//
+//  Handles are not garbage collected. Every exit path from a function that opened
+//  one closes it, and the server's loop closes the accepted handle before going
+//  back to accept. That is the whole cost of having no `defer`.
+
+function import (return:(net));
+function import (return:(os));
+
+//  Reads the server's line-protocol request: one line, newline stripped.
+//  Returns the line, or "" when the peer closed without sending anything.
+//
+//  A real protocol would carry a length; a line is enough to show the shape and
+//  keeps the example about sockets rather than about framing.
+function readLineFrom(int64 fd, ptr unsigned int8 buffer, int capacity):string {
+    int used = 0;
+    while (used < capacity - 1) {
+        int n = tcpRecv(fd, buffer + used, 1);
+        if (n <= 0) {
+            break;
+        }
+        if (buffer[used] as int == 10) {
+            // Newline: not part of the line.
+            return makeString(buffer as ptr char, used);
+        }
+        if (buffer[used] as int != 13) {
+            used = used + 1;
+        }
+    }
+    if (used == 0) {
+        return "";
+    }
+    return makeString(buffer as ptr char, used);
+}
+
+//===--- server -----------------------------------------------------------===//
+
+function runServer(int port):void {
+    int64 listener = tcpListen(port, 8);
+    if (listener < 0) {
+        print("listen failed: "); print(netFailure("listen")); print("\n");
+        return;
+    }
+    int actual = tcpLocalPort(listener) as int;
+    print("listening on port "); print(actual); print(" (ctrl-c to stop)\n");
+
+    // An unbounded accept is the right shape here: the process is meant to run
+    // until it is killed, and a timeout would only add a wake-up nobody wants.
+    ptr unsigned int8 buffer = alloc(4096) as ptr unsigned int8;
+    if (buffer == 0 as ptr unsigned int8) {
+        print("out of memory\n");
+        tcpClose(listener);
+        return;
+    }
+
+    while (true) {
+        int64 client = tcpAccept(listener, -1);
+        if (client < 0) {
+            print("accept failed: "); print(netFailure("accept")); print("\n");
+            break;
+        }
+        print("client from "); print(peerAddress(client)); print("\n");
+
+        string line = readLineFrom(client, buffer, 4096);
+        if (line != "") {
+            print("  got: "); print(line); print("\n");
+            string reply = "echo: " + line + "\n";
+            if (tcpSend(client, reply) < 0) {
+                print("  send failed: "); print(netFailure("send")); print("\n");
+            }
+        }
+        // Close before the next accept: a serial server holds one connection.
+        tcpClose(client);
+    }
+
+    free(buffer as ptr void);
+    tcpClose(listener);
+    eof: pass;
+}
+
+//===--- client -----------------------------------------------------------===//
+
+function runClient(int port, string message):void {
+    // `fetchAll` opens, sends, half-closes, reads to EOF and closes. There is no
+    // path through it that leaves a handle open, which is why it is the default
+    // for a one-shot exchange.
+    string reply = fetchAll("127.0.0.1", port, message + "\n", 4096, 5000);
+    if (reply == "") {
+        print("no reply: "); print(netFailure("request")); print("\n");
+        return;
+    }
+    print(reply);
+    eof: pass;
+}
+
+//===--- entry ------------------------------------------------------------===//
+
+function main():void {
+    if (argCount() < 2) {
+        print("usage: acvm run examples/net_echo.ax -- server <port>\n");
+        print("       acvm run examples/net_echo.ax -- client <port> <message>\n");
+        print("\n");
+        print("The server blocks in accept, so run the two in separate shells.\n");
+        return;
+    }
+
+    string mode = argAt(0);
+    int port = atoi(argAt(1));
+    if (port <= 0 || port > 65535) {
+        print("bad port: "); print(argAt(1)); print("\n");
+        return;
+    }
+
+    if (mode == "server") {
+        runServer(port);
+        return;
+    }
+    if (mode == "client") {
+        if (argCount() < 3) {
+            print("client needs a message\n");
+            return;
+        }
+        runClient(port, argAt(2));
+        return;
+    }
+    print("unknown mode: "); print(mode); print("\n");
+    eof: pass;
+}

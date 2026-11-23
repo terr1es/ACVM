@@ -1,0 +1,41 @@
+// switch / fallthrough, nested functions, forward declarations, destructuring.
+function later(int x):int;                 // forward declaration
+
+function main():void {
+    function twice(int v):int {            // nested definition, no capture
+        return v * 2;
+        eof: pass;
+    }
+
+    int code = 2;
+    switch (code) {
+        case 1:
+            print("one ");
+        case 2:
+            print("two ");
+            fallthrough;
+        case 3:
+            print("three ");
+        default:
+            print("done");
+    }
+    print("\n");
+
+    print(twice(21));
+    print(" ");
+    print(later(5));
+    print("\n");
+
+    int a = 1;
+    int b = 2;
+    (a, b) = (b, a);
+    print(a);
+    print(b);
+    print("\n");
+    eof: pass;
+}
+
+function later(int x):int {
+    return x + 100;
+    eof: pass;
+}

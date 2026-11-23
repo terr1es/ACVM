@@ -1,0 +1,4 @@
+function main():void {
+    print("Hello, World!\n");
+    eof: pass;
+}

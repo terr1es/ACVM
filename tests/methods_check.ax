@@ -1,0 +1,261 @@
+//  methods_check.ax — methods declared inside a struct body.
+//
+//  The point of a method is not the call syntax, it is that the receiver's
+//  mutability is visible in the declaration: `self` is a read-only copy, `ptr
+//  self` may write through to the caller's variable. Half of this file is
+//  therefore about which form can do what, and the other half is about a method
+//  being an ordinary function underneath -- recursion, overloads, passing a
+//  struct by value, calling through a pointer.
+//
+//  Run:  acvm run tests/methods_check.ax
+
+function import (return:(test));
+
+//===--- A type with both kinds of receiver --------------------------------===//
+
+struct Counter {
+    int value;
+
+    //  Read-only view of the receiver.
+    function get(self):int {
+        return self.value;
+    }
+
+    //  May write: `self` is a pointer, so the caller sees the change.
+    function bump(ptr self):void {
+        self->value = self->value + 1;
+    }
+
+    function bumpBy(ptr self, int amount):void {
+        self->value = self->value + amount;
+    }
+
+    //  A method may call another method; inside `ptr self`, `self->get()`.
+    function doubleAndRead(ptr self):int {
+        self->bumpBy(self->get());
+        return self->get();
+    }
+
+    //  Two types of the same name: overloads work exactly as at file scope.
+    function describe(self):int {
+        return self.value;
+    }
+
+    function describe(self, int offset):int {
+        return self.value + offset;
+    }
+};
+
+//===--- Static methods ---------------------------------------------------===//
+
+struct Point {
+    int x;
+    int y;
+
+    function lengthSquared(self):int {
+        return self.x * self.x + self.y * self.y;
+    }
+
+    function plus(ptr self, Point other):void {
+        self->x = self->x + other.x;
+        self->y = self->y + other.y;
+    }
+
+    //  No receiver: called as `Point.origin()`. This is the shape a library uses
+    //  to say "make one of these", since Axiom has no constructors.
+    function origin():Point {
+        Point p = {0, 0};
+        return p;
+    }
+
+    function of(int a, int b):Point {
+        Point p = {a, b};
+        return p;
+    }
+};
+
+//===--- Recursion ---------------------------------------------------------===//
+
+struct Math {
+    int unused;
+
+    function factorial(ptr self, int n):int {
+        if (n <= 1) {
+            return 1;
+        }
+        return n * self->factorial(n - 1);
+    }
+};
+
+//===--- A read-only pointer receiver -------------------------------------===//
+
+//  `const ptr self` is allowed and stays read-only: it exists so a method can take
+//  the receiver by pointer (no copy of a large struct) while promising not to
+//  write. Writing through it is an error, which the negative tests cover.
+struct Inspector {
+    int n;
+
+    function read(const ptr self):int {
+        return self->n;
+    }
+};
+
+//===--- Methods on a union -----------------------------------------------===//
+
+union Slot {
+    int asInt;
+    unsigned int8[4] bytes;
+
+    function lowByte(self):int {
+        return self.bytes[0] as int;
+    }
+
+    function setLowByte(ptr self, int v):void {
+        self->bytes[0] = v as unsigned int8;
+    }
+};
+
+//===--- Nested: a method reached through a field -------------------------===//
+
+struct Line {
+    Point from;
+    Point to;
+
+    function lengthSquaredOf(self):int {
+        //  Methods are reachable through any struct-valued expression.
+        return self.from.lengthSquared() + self.to.lengthSquared();
+    }
+};
+
+//  A free function and a static method may share a name: totally different
+//  scopes, so one does not shadow the other.
+function tag():int {
+    return 100;
+}
+
+struct Tagger {
+    function tag():int {
+        return 200;
+    }
+};
+
+//===--- Checks -----------------------------------------------------------===//
+
+function checkValueReceiver():void {
+    testGroup("value receiver");
+    Counter c = {0};
+    checkInt(c.get(), 0, "a value receiver reads the fields");
+    c.value = 9;
+    checkInt(c.get(), 9, "the value receiver sees the current value");
+}
+
+function checkPtrReceiver():void {
+    testGroup("ptr receiver");
+    Counter c = {0};
+    c.bump();
+    checkInt(c.get(), 1, "a ptr receiver writes through to the caller");
+    c.bumpBy(4);
+    checkInt(c.get(), 5, "a ptr receiver with arguments works");
+    checkInt(c.doubleAndRead(), 10, "a method may call another method");
+    checkInt(c.get(), 10, "the intermediate writes are visible");
+}
+
+function checkThroughPointer():void {
+    testGroup("via pointer");
+    Counter c = {0};
+    ptr Counter p = #c;
+    //  `->` with a ptr receiver passes the pointer itself; with a value receiver
+    //  it dereferences. Both have to work on the same object.
+    p->bump();
+    checkInt(p->get(), 1, "both receiver kinds work through '->'");
+    p->bumpBy(2);
+    checkInt(c.get(), 3, "the ptr calls reached the original");
+}
+
+function checkStatic():void {
+    testGroup("static");
+    Point o = Point.origin();
+    checkInt(o.x, 0, "a static method builds a value");
+    checkInt(o.y, 0, "both fields are initialised");
+
+    Point q = Point.of(3, 4);
+    checkInt(q.x, 3, "a static method takes arguments");
+    checkInt(q.lengthSquared(), 25, "the result behaves like any Point");
+}
+
+function checkOverloads():void {
+    testGroup("overloads");
+    Counter c = {0};
+    c.value = 7;
+    checkInt(c.describe(), 7, "the one-argument overload");
+    checkInt(c.describe(3), 10, "the two-argument overload");
+}
+
+function checkRecursion():void {
+    testGroup("recursion");
+    Math m = {0};
+    checkInt(m.factorial(5), 120, "a method may recurse through 'ptr self'");
+    checkInt(m.factorial(0), 1, "the base case");
+}
+
+function checkConstPtrReceiver():void {
+    testGroup("const ptr self");
+    Inspector i = {0};
+    i.n = 33;
+    checkInt(i.read(), 33, "a const ptr receiver reads without copying");
+}
+
+function checkUnion():void {
+    testGroup("union");
+    Slot s = {0};
+    s.asInt = 0;
+    s.setLowByte(65);
+    checkInt(s.lowByte(), 65, "methods work on a union");
+    checkInt(s.asInt, 65, "the other view sees the same bytes");
+}
+
+function checkNestedAndTemporary():void {
+    testGroup("nesting");
+    Line line;
+    line.from = Point.of(0, 0);
+    line.to = Point.of(3, 4);
+    checkInt(line.lengthSquaredOf(), 25, "a method reached through a nested field");
+
+    //  A value receiver accepts a temporary; nothing needs an address.
+    checkInt(Point.of(3, 4).lengthSquared(), 25, "a value receiver works on a temporary");
+
+    //  And through an array element.
+    Point pts[2];
+    pts[0] = Point.of(1, 1);
+    pts[1] = Point.of(2, 2);
+    checkInt(pts[1].lengthSquared(), 8, "a method on an array element");
+}
+
+function checkStructSizeUnchanged():void {
+    testGroup("layout");
+    //  Methods add no storage: two ints, nothing else. This is what lets a struct
+    //  with methods still cross into a native library unchanged.
+    checkInt(sizeof(Point), 8, "methods add no storage");
+}
+
+function checkNameIsolation():void {
+    testGroup("names");
+    checkInt(tag(), 100, "the free function is unaffected");
+    checkInt(Tagger.tag(), 200, "a static method may reuse the name");
+}
+
+function main():void {
+    checkValueReceiver();
+    checkPtrReceiver();
+    checkThroughPointer();
+    checkStatic();
+    checkOverloads();
+    checkRecursion();
+    checkConstPtrReceiver();
+    checkUnion();
+    checkNestedAndTemporary();
+    checkStructSizeUnchanged();
+    checkNameIsolation();
+    testFinish();
+    eof: pass;
+}

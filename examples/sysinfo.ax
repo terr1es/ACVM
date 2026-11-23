@@ -1,0 +1,348 @@
+//  sysinfo.ax — a system self-check: print the runtime setup, then inspect given dirs.
+//
+//  This example shows the **correct use** of most of the os module, slips included:
+//
+//      platformName / archName   platform and arch (no #ifdef in your code)
+//      cwd / exePath             "where am I" vs "where is my binary"
+//      env / envCount            read one variable, or walk them all
+//      pathListSeparator         the PATH separator is not always a colon
+//      cpuCount / pageSize       hardware scale
+//      copyFile / diskFreeBytes  file operations and capacity
+//      runCommand                run an external tool and get its exit code
+//
+//  Usage:
+//
+//      acvm run examples/sysinfo.ax                 # inspect the current directory
+//      acvm run examples/sysinfo.ax -- <dir> [<dir>...]
+//
+//  With no arguments it inspects the current directory.
+
+function import (return:(os));
+function import (return:(io));
+function import (return:(str));
+function import (return:(algorithm));
+
+comptime int PATH_BUFFER = 8192;
+comptime int LINE_BUFFER = 4096;
+
+// ─── output alignment ──────────────────────────────────────────────────────
+//
+//  Fixed label width, values flush left. `padRight` beats hand-added spaces: with mixed
+//  scripts the byte count differs from the display width, so counting spaces goes wrong.
+
+comptime int LABEL_WIDTH = 18;
+
+function private line(string label, string value):void {
+    //  When a label is longer than the width, `padRight` pads nothing and the value
+    //  sticks straight onto it ("PROCESSOR_IDENTIFIER" then the text). So raise the
+    //  minimum to "label + one space", keeping one space of separation in both cases.
+    int width = LABEL_WIDTH;
+    if (label.length + 1 > width) {
+        width = label.length + 1;
+    }
+    print(padRight(label, width, " ") + value + "\n");
+    eof: pass;
+}
+
+function private heading(string title):void {
+    print("\n" + title + "\n");
+    print(repeat("-", displayLength(title)) + "\n");
+    eof: pass;
+}
+
+//  The underline uses display width, not bytes: `Utf8DisplayWidth` keeps an underline
+//  aligned under CJK titles. An os-neutral detail, but self-check output should be tidy.
+function private displayLength(string text):int {
+    return utf8DisplayWidth(text);
+    eof: pass;
+}
+
+// ─── platform ──────────────────────────────────────────────────────────────
+
+function private describePlatform():void {
+    heading("platform");
+    line("os", platformName());
+    line("arch", archName());
+    line("path separator", pathSeparator());
+    line("path list sep.", pathListSeparator());
+    //  `pathJoin` always uses '/' (accepted on every platform), so what it builds does
+    //  not look native on Windows. `toNativePath` is exactly that conversion.
+    line("joined by pathJoin", pathJoin(cwd(), "sub"));
+    line("  -> native", toNativePath(pathJoin(cwd(), "sub")));
+
+    //  All three must agree: if platformName says windows while the separator is "/",
+    //  that is a library bug, not a config problem. The check rides along for free.
+    bool consistent = true;
+    if (platformName() == "windows") {
+        consistent = pathSeparator() == "\\" && pathListSeparator() == ";";
+    } else if (platformName() != "unknown") {
+        consistent = pathSeparator() == "/" && pathListSeparator() == ":";
+    }
+    line("self-consistent", yesNo(consistent));
+    eof: pass;
+}
+
+function private yesNo(bool value):string {
+    if (value) {
+        return "yes";
+    }
+    return "no";
+    eof: pass;
+}
+
+// ─── machine ───────────────────────────────────────────────────────────────
+
+//  Turn a byte count into a readable scale. os reports bytes only; formatting is plain
+//  Axiom — the point of layers: the library never picks MB or MiB for the caller.
+function private humanBytes(int64 bytes):string {
+    if (bytes < 0) {
+        return "unknown";
+    }
+    if (bytes < 1024) {
+        return itoa(bytes, 10) + " B";
+    }
+    //  Divide by powers of 1024, keeping two decimals. `ftoaFixed` is enough; no hand work.
+    double value = bytes as double;
+    string unit = "B";
+    if (value >= 1024.0) { value = value / 1024.0; unit = "KiB"; }
+    if (value >= 1024.0) { value = value / 1024.0; unit = "MiB"; }
+    if (value >= 1024.0) { value = value / 1024.0; unit = "GiB"; }
+    if (value >= 1024.0) { value = value / 1024.0; unit = "TiB"; }
+    return ftoaFixed(value, 2) + " " + unit;
+    eof: pass;
+}
+
+function describeMachine():void {
+    heading("machine");
+    line("processors", itoa(cpuCount(), 10));
+    line("page size", itoa(pageSize(), 10) + " B");
+    line("memory", humanBytes(physicalMemoryBytes()));
+    line("process id", itoa(processId(), 10));
+    line("host", hostName());
+    line("user", userName());
+    eof: pass;
+}
+
+// ─── directories ───────────────────────────────────────────────────────────
+
+function describeDirectories():void {
+    heading("directories");
+    line("cwd", cwd());
+    line("exe", exePath());
+    line("exe dir", pathDir(exePath()));
+    line("temp", tempDir());
+    line("home", homeDir());
+    line("config", configDir("sysinfo"));
+
+    //  This is what exePath is for: started from any directory, it still finds its own
+    //  files. It is not cwd, and confusing the two is the classic bug in tools like this.
+    line("exe dir == cwd", yesNo(pathDir(exePath()) == cwd()));
+    eof: pass;
+}
+
+// ─── environment ───────────────────────────────────────────────────────────
+
+function describeEnvironment():void {
+    heading("environment");
+
+    //  A few variables of interest. "" means both "absent" and "empty", so show both.
+    string keys[4] = {"PATH", "HOME", "TEMP", "PROCESSOR_IDENTIFIER"};
+    for (int i = 0; i < 4; i++) {
+        string name = @(#keys[0] + i);
+        string value = env(name);
+        if (value.length == 0) {
+            line(name, "(unset)");
+        } else if (value.length > 60) {
+            //  Long values report their length only: a PATH filling the screen helps nobody.
+            line(name, itoa(value.length, 10) + " bytes, starts with " +
+                          value[0..30] + "...");
+        } else {
+            line(name, value);
+        }
+    }
+
+    //  Walking them all is O(n²) (each entry re-walks the environment block), so it runs
+    //  only on an explicit request such as "-v", not on every invocation.
+    int count = envCount();
+    line("variable count", itoa(count, 10));
+
+    //  Filter by prefix: the most common real use of enumerating the environment.
+    string prefix = "AXIOM_";
+    int matched = 0;
+    for (int i = 0; i < count; i++) {
+        string entry = envEntryAt(i);
+        if (startsWith(envEntryName(entry), prefix)) {
+            if (matched == 0) {
+                print(padRight("  " + prefix + "*", LABEL_WIDTH, " "));
+            }
+            matched = matched + 1;
+        }
+    }
+    if (matched > 0) {
+        print(itoa(matched, 10) + " found\n");
+    } else {
+        line("  " + prefix + "*", "(none)");
+    }
+    eof: pass;
+}
+
+// ─── PATH ──────────────────────────────────────────────────────────────────
+
+function describePathEntries():void {
+    heading("PATH entries");
+
+    //  Use pathEntries, not splitting env("PATH") on ":": a Windows entry starts "C:",
+    //  so cutting on the colon would chop off every drive letter.
+    SplitList parts = pathEntries();
+    int count = splitCount(#parts);
+    line("count", itoa(count, 10));
+
+    //  Print the first 8 only: PATH often holds dozens, which would drown the rest.
+    int shown = count;
+    if (shown > 8) {
+        shown = 8;
+    }
+    for (int i = 0; i < shown; i++) {
+        string entry = splitAt(#parts, i);
+        string note = "";
+        if (!isDirectory(entry)) {
+            note = "   (missing)";
+        }
+        line("  [" + itoa(i, 10) + "]", entry + note);
+    }
+    if (count > shown) {
+        line("  ...", itoa(count - shown, 10) + " more");
+    }
+    splitFree(#parts);
+    eof: pass;
+}
+
+// ─── inspect one directory ─────────────────────────────────────────────────
+
+//  Capacity and content counts. `diskFreeBytes` reads the volume, so it holds for any file.
+function inspectDirectory(string target):void {
+    heading("inspect: " + target);
+
+    if (!isDirectory(target)) {
+        print("not a directory: " + target + "\n");
+        return;
+    }
+
+    line("free space", humanBytes(diskFreeBytes(target)));
+
+    char names[PATH_BUFFER];
+    int count = listDir(target, #names[0], PATH_BUFFER);
+    if (count < 0) {
+        print("cannot list (unreadable, or more entries than the buffer holds)\n");
+        return;
+    }
+    line("entries", itoa(count, 10));
+
+    //  Sort the names before printing: file system order is undefined, and a listing
+    //  that shifts between runs cannot be compared against a previous run.
+    string files[256] = {""};
+    string dirs[256] = {""};
+    int fileCount = 0;
+    int dirCount = 0;
+    int64 totalBytes = 0;
+    for (int i = 0; i < count; i++) {
+        string name = dirEntryAt(#names[0], PATH_BUFFER, i);
+        string full = pathJoin(target, name);
+        if (isDirectory(full)) {
+            if (dirCount < 256) {
+                @(#dirs[0] + dirCount) = name;
+                dirCount = dirCount + 1;
+            }
+        } else {
+            if (fileCount < 256) {
+                @(#files[0] + fileCount) = name;
+                fileCount = fileCount + 1;
+            }
+            int64 size = fileSizeBytes(full);
+            if (size > 0) {
+                totalBytes = totalBytes + size;
+            }
+        }
+    }
+
+    sortStrings(#files[0], fileCount);
+    sortStrings(#dirs[0], dirCount);
+
+    line("files", itoa(fileCount, 10) + ", " + humanBytes(totalBytes));
+    line("subdirectories", itoa(dirCount, 10));
+
+    for (int i = 0; i < fileCount && i < 10; i++) {
+        string name = @(#files[0] + i);
+        line("  " + name, humanBytes(fileSizeBytes(pathJoin(target, name))));
+    }
+    if (fileCount > 10) {
+        line("  ...", itoa(fileCount - 10, 10) + " more files");
+    }
+    eof: pass;
+}
+
+// ─── calling external commands ─────────────────────────────────────────────
+
+//  Shows "get the output" and "get the exit code" separately, and why they must differ.
+function demonstrateCommands():void {
+    heading("external commands");
+
+    //  Need both output and exit code: runCaptureInto returns them in one call.
+    //  The buffer is on the stack; 4096 bytes fits one command, and short returns -1.
+    char buffer[LINE_BUFFER];
+    int code[1] = {-1};
+    int bytes = runCaptureInto("echo sysinfo-probe", #buffer[0], LINE_BUFFER, #code[0], 1);
+    if (bytes >= 0) {
+        string output = makeString(#buffer[0], bytes);
+        //  Command output ends with a newline; strip it or the report gains a blank line.
+        line("echo output", trimSuffix(output, "\n"));
+        line("echo exit code", itoa(code[0], 10));
+    } else {
+        line("echo output", "(capture failed)");
+    }
+
+    //  Exit code only: runCommand sends output straight to the terminal, good for demos.
+    int failed = runCommand("exit 42");
+    line("exit 42 -> code", itoa(failed, 10));
+
+    //  A failing command. The code is 1 on Windows and 127 in sh, so test for nonzero.
+    int missing = runCommand("no_such_command_sysinfo_xyz");
+    line("missing command", "nonzero: " + yesNo(missing != 0));
+    eof: pass;
+}
+
+// ─── main flow ─────────────────────────────────────────────────────────────
+
+function main():void {
+    print("sysinfo -- " + itoa(argCount(), 10) + " argument(s)\n");
+
+    //  Argument parsing: apart from help, each argument is a directory to inspect. No
+    //  option switches — this program is meant to be read; a `-v` would add guesswork.
+    for (int i = 0; i < argCount(); i++) {
+        string argument = argAt(i);
+        if (argument == "-h" || argument == "--help") {
+            print("usage: sysinfo [dir...]\n");
+            print("  with no directory argument, inspects the current one\n");
+            return;
+        }
+    }
+
+    describePlatform();
+    describeMachine();
+    describeDirectories();
+    describeEnvironment();
+    describePathEntries();
+    demonstrateCommands();
+
+    //  No directory given means the current one — the only unsurprising default.
+    if (argCount() == 0) {
+        inspectDirectory(".");
+    } else {
+        for (int i = 0; i < argCount(); i++) {
+            inspectDirectory(toNativePath(argAt(i)));
+        }
+    }
+
+    print("\ndone\n");
+    eof: pass;
+}

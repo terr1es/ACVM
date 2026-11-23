@@ -1,0 +1,73 @@
+struct Point {
+    int x;
+    int y;
+};
+
+enum Color { RED, GREEN = 5, BLUE };
+
+function add(int a, int b):int {
+    return a + b;
+    eof: print("[eof add]");
+}
+
+function main():void {
+    Point p = {3, 4};
+    print("p.x=");
+    print(p.x);
+    print(" p.y=");
+    print(p.y);
+    print("\n");
+
+    ptr Point pp = #p;
+    pp->x = 10;
+    print("after pp->x = 10: ");
+    print(p.x);
+    print("\n");
+
+    int a[5] = {1, 2, 3};
+    print("len=");
+    print(a.length);
+    print(" a[2]=");
+    print(a[2]);
+    print(" a[4]=");
+    print(a[4]);
+    print("\n");
+
+    int sum = 0;
+    for i in 0..a.length {
+        sum = sum + a[i];
+    }
+    print("sum=");
+    print(sum);
+    print("\n");
+
+    Color c = GREEN;
+    switch (c) {
+        case RED:
+            print("red\n");
+        case GREEN:
+            print("green\n");
+        default:
+            print("other\n");
+    }
+
+    string s = "hello";
+    string t = s + " " + 42 + "!" ;
+    print(t);
+    print(" len=");
+    print(s.length);
+    print(" slice=");
+    print(s[1..3]);
+    print("\n");
+
+    (int, int) pair = (7, 8);
+    int x2 = 0;
+    int y2 = 0;
+    (x2, y2) = pair;
+    print("pair=");
+    print(x2);
+    print(",");
+    print(y2);
+    print("\n");
+    eof: pass;
+}

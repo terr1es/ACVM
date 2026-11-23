@@ -1,0 +1,399 @@
+//  codec.ax — hex, base64, URL percent-encoding. Pure Axiom.
+//
+//      function import (return:(codec));
+//
+//      print(hexEncode("Hi"));                 // 4869
+//      print(hexDecode("4869"));               // Hi
+//      print(base64Encode("Hello"));           // SGVsbG8=
+//      print(urlEncode("a b&c"));              // a%20b%26c
+//      print(urlDecode("a%20b%26c"));          // a b&c
+//
+//  ── why this is all pure Axiom ────────────────────────────────────────────
+//
+//  Encoding is pure byte transformation: no syscalls, and no performance dead end. A C
+//  version is several times faster, but that is "faster", not "possible" -- prefer Axiom.
+//
+//  ── how the output is built ───────────────────────────────────────────────
+//
+//  Every function first computes the **exact output length**, `alloc0`s a buffer, fills it
+//  byte by byte, then calls `makeString` once. It never accumulates `out = out + ch`: that
+//  is an O(n²) copy that also leaves arena garbage every round. Buffering is O(n), no churn.
+//
+//  The length must be exact -- one byte short is an out-of-bounds write. The three formulas:
+//
+//      hex    2 * n
+//      base64 4 * ((n + 2) / 3)
+//      url    at most 3 * n (unreserved characters count 1 byte, the rest 3)
+//
+//  ── how bytes get written in ──────────────────────────────────────────────
+//
+//  `int8` is signed (-128..127) while a raw byte is 0..255, so a value >= 128 must be
+//  reduced by 256 before it can be stored. Reading converts back with `& 255` --
+//  `putByte` / `getByte` each wrap one of those two facts in one place.
+//
+//  `makeString` copies **raw bytes** (no code-unit conversion), so bytes written
+//  back-to-back in the buffer are the string's contents -- the same convention io uses.
+
+module "codec" version "0.1.0";
+
+function import (return:(strbyte));
+
+// ─── byte read/write ───────────────────────────────────────────────────────
+
+//  Writes one byte. `int8` is signed, so a byte above 127 wraps to the negative side.
+function private putByte(ptr int8 buffer, int index, int value):void {
+    int folded = value & 255;
+    if (folded > 127) {
+        folded = folded - 256;
+    }
+    @(buffer + index) = folded as int8;
+    eof: pass;
+}
+
+//  Reads one byte, always 0..255. Used only on our own scratch buffers.
+function private getByte(ptr int8 buffer, int index):int {
+    return (@(buffer + index) as int) & 255;
+    eof: pass;
+}
+
+//  The single test for printable ASCII / unreserved character; urlEncode needs it.
+function private isUnreserved(int code):bool {
+    if (code >= 48 && code <= 57) {
+        return true;    // 0-9
+    }
+    if (code >= 65 && code <= 90) {
+        return true;    // A-Z
+    }
+    if (code >= 97 && code <= 122) {
+        return true;    // a-z
+    }
+    // The four RFC 3986 markers: - . _ ~
+    return code == 45 || code == 46 || code == 95 || code == 126;
+    eof: pass;
+}
+
+//  0..15 -> ASCII code for lowercase hex. Clearer than fetching a byte out of a string,
+//  and it does not depend on character indexing, which strings do not support.
+function private hexDigit(int nibble):int {
+    if (nibble < 10) {
+        return 48 + nibble;         // '0'..'9'
+    }
+    return 87 + nibble;             // 'a'..'f'
+    eof: pass;
+}
+
+//  Hex value of one ASCII character, or -1 when invalid.
+function private hexNibble(int code):int {
+    if (code >= 48 && code <= 57) {
+        return code - 48;           // '0'..'9'
+    }
+    if (code >= 97 && code <= 102) {
+        return code - 87;           // 'a'..'f'
+    }
+    if (code >= 65 && code <= 70) {
+        return code - 55;           // 'A'..'F'
+    }
+    return -1;
+    eof: pass;
+}
+
+// ─── hex ───────────────────────────────────────────────────────────────────
+
+//  Lowercase hex, two digits per byte.
+function hexEncode(string s):string {
+    int n = s.length;
+    if (n == 0) {
+        return "";
+    }
+    ptr int8 out = alloc0(2 * n) as ptr int8;
+    if (out == 0 as ptr int8) {
+        return "";
+    }
+    for (int i = 0; i < n; i++) {
+        int byte = strByteAt(s, i);
+        putByte(out, 2 * i, hexDigit(byte >> 4));
+        putByte(out, 2 * i + 1, hexDigit(byte & 15));
+    }
+    string result = makeString(out as ptr char, 2 * n);
+    free(out);
+    return result;
+    eof: pass;
+}
+
+//  Decodes hex. Returns "" when the length is odd or a character is not a hex
+//  digit — the only signal available without an optional type.
+function hexDecode(string hex):string {
+    int n = hex.length;
+    if (n == 0) {
+        return "";
+    }
+    if (n % 2 != 0) {
+        return "";      // odd length cannot be a byte sequence
+    }
+    ptr int8 out = alloc0(n / 2) as ptr int8;
+    if (out == 0 as ptr int8) {
+        return "";
+    }
+    for (int i = 0; i < n / 2; i++) {
+        int hi = hexNibble(strByteAt(hex, 2 * i));
+        int lo = hexNibble(strByteAt(hex, 2 * i + 1));
+        if (hi < 0 || lo < 0) {
+            free(out);
+            return "";
+        }
+        putByte(out, i, hi * 16 + lo);
+    }
+    string result = makeString(out as ptr char, n / 2);
+    free(out);
+    return result;
+    eof: pass;
+}
+
+// ─── base64 ────────────────────────────────────────────────────────────────
+//
+//  Standard alphabet (RFC 4648) with `=` padding. Not the URL-safe variant (`-` `_`) -- that
+//  is another format and mixing them would force decode to guess. Need it? Encode, replace.
+
+//  ASCII codes of the 64 symbols, in four 16-character blocks matching the alphabet's
+//  segments: A-Z (26), a-z (26), 0-9 (10), + / (2).
+function private base64Char(int index):int {
+    if (index < 26) {
+        return 65 + index;              // 'A'..'Z'
+    }
+    if (index < 52) {
+        return 97 + (index - 26);       // 'a'..'z'
+    }
+    if (index < 62) {
+        return 48 + (index - 52);       // '0'..'9'
+    }
+    if (index == 62) {
+        return 43;                      // '+'
+    }
+    return 47;                          // '/'
+    eof: pass;
+}
+
+//  ASCII code -> 0..63, or -1 when invalid.
+function private base64Value(int code):int {
+    if (code >= 65 && code <= 90) {
+        return code - 65;               // 'A'..'Z'
+    }
+    if (code >= 97 && code <= 122) {
+        return code - 71;               // 'a'..'z'  → 26..51
+    }
+    if (code >= 48 && code <= 57) {
+        return code + 4;                // '0'..'9'  → 52..61
+    }
+    if (code == 43) {
+        return 62;                      // '+'
+    }
+    if (code == 47) {
+        return 63;                      // '/'
+    }
+    return -1;
+    eof: pass;
+}
+
+//  Standard base64 with `=` padding.
+function base64Encode(string s):string {
+    int n = s.length;
+    if (n == 0) {
+        return "";
+    }
+    int groups = (n + 2) / 3;
+    int outLength = groups * 4;
+    ptr int8 out = alloc0(outLength) as ptr int8;
+    if (out == 0 as ptr int8) {
+        return "";
+    }
+
+    int write = 0;
+    int i = 0;
+    while (i + 3 <= n) {
+        // Three bytes form 24 bits, then split into four 6-bit groups.
+        int triple = strByteAt(s, i) * 65536 + strByteAt(s, i + 1) * 256 + strByteAt(s, i + 2);
+        putByte(out, write, base64Char((triple >> 18) & 63));
+        putByte(out, write + 1, base64Char((triple >> 12) & 63));
+        putByte(out, write + 2, base64Char((triple >> 6) & 63));
+        putByte(out, write + 3, base64Char(triple & 63));
+        write = write + 4;
+        i = i + 3;
+    }
+
+    // Tail: one byte left -> two symbols + "=="; two bytes -> three symbols + "=".
+    int remaining = n - i;
+    if (remaining == 1) {
+        int one = strByteAt(s, i) * 65536;
+        putByte(out, write, base64Char((one >> 18) & 63));
+        putByte(out, write + 1, base64Char((one >> 12) & 63));
+        putByte(out, write + 2, 61);    // '='
+        putByte(out, write + 3, 61);
+    } else if (remaining == 2) {
+        int two = strByteAt(s, i) * 65536 + strByteAt(s, i + 1) * 256;
+        putByte(out, write, base64Char((two >> 18) & 63));
+        putByte(out, write + 1, base64Char((two >> 12) & 63));
+        putByte(out, write + 2, base64Char((two >> 6) & 63));
+        putByte(out, write + 3, 61);    // '='
+    }
+
+    string result = makeString(out as ptr char, outLength);
+    free(out);
+    return result;
+    eof: pass;
+}
+
+//  Decodes base64. Returns "" when a character is outside the alphabet or the
+//  length is impossible (a base64 string is always a multiple of 4).
+function base64Decode(string encoded):string {
+    int n = encoded.length;
+    if (n == 0) {
+        return "";
+    }
+    if (n % 4 != 0) {
+        return "";      // not a complete base64 string
+    }
+
+    // Compute the output length first so it is allocated once. Each trailing '=' costs a byte.
+    int padding = 0;
+    if (encoded[n - 1 .. n] == "=") {
+        padding = padding + 1;
+    }
+    if (encoded[n - 2 .. n - 1] == "=") {
+        padding = padding + 1;
+    }
+    int outLength = n / 4 * 3 - padding;
+    if (outLength <= 0) {
+        return "";
+    }
+
+    ptr int8 out = alloc0(outLength) as ptr int8;
+    if (out == 0 as ptr int8) {
+        return "";
+    }
+
+    int write = 0;
+    int i = 0;
+    while (i < n) {
+        int v0 = base64Value(strByteAt(encoded, i));
+        int v1 = base64Value(strByteAt(encoded, i + 1));
+        if (v0 < 0 || v1 < 0) {
+            free(out);
+            return "";
+        }
+        // The last two may be '=', taken as 0; outLength truncates their output anyway.
+        int v2 = base64Value(strByteAt(encoded, i + 2));
+        int v3 = base64Value(strByteAt(encoded, i + 3));
+        if (v2 < 0) {
+            v2 = 0;
+        }
+        if (v3 < 0) {
+            v3 = 0;
+        }
+        int packed = v0 * 262144 + v1 * 4096 + v2 * 64 + v3;
+        if (write < outLength) {
+            putByte(out, write, (packed >> 16) & 255);
+            write = write + 1;
+        }
+        if (write < outLength) {
+            putByte(out, write, (packed >> 8) & 255);
+            write = write + 1;
+        }
+        if (write < outLength) {
+            putByte(out, write, packed & 255);
+            write = write + 1;
+        }
+        i = i + 4;
+    }
+
+    string result = makeString(out as ptr char, outLength);
+    free(out);
+    return result;
+    eof: pass;
+}
+
+// ─── URL percent-encoding ──────────────────────────────────────────────────
+//
+//  Encoding follows RFC 3986: only unreserved characters (A-Z a-z 0-9 - . _ ~) pass through,
+//  everything else becomes `%XX`, and **a space encodes to `%20`, not `+`**.
+//
+//  Decoding is lenient: it accepts `%XX` and also treats `+` as a space -- form encoding
+//  (application/x-www-form-urlencoded) uses `+` everywhere, and rejecting it would only
+//  confuse callers. This deliberate asymmetry is documented in both functions.
+
+function urlEncode(string s):string {
+    int n = s.length;
+    if (n == 0) {
+        return "";
+    }
+    // Worst case: every byte becomes three characters.
+    ptr int8 out = alloc0(3 * n) as ptr int8;
+    if (out == 0 as ptr int8) {
+        return "";
+    }
+
+    int write = 0;
+    for (int i = 0; i < n; i++) {
+        int byte = strByteAt(s, i);
+        if (isUnreserved(byte)) {
+            putByte(out, write, byte);
+            write = write + 1;
+        } else {
+            putByte(out, write, 37);                    // '%'
+            putByte(out, write + 1, hexDigit(byte >> 4));
+            putByte(out, write + 2, hexDigit(byte & 15));
+            write = write + 3;
+        }
+    }
+
+    string result = makeString(out as ptr char, write);
+    free(out);
+    return result;
+    eof: pass;
+}
+
+//  Decodes `%XX` and treats `+` as a space. A malformed `%` sequence is copied
+//  through literally rather than failing the whole string: a URL with one stray
+//  percent sign is far more likely a typo than an attack.
+function urlDecode(string s):string {
+    int n = s.length;
+    if (n == 0) {
+        return "";
+    }
+    ptr int8 out = alloc0(n) as ptr int8;
+    if (out == 0 as ptr int8) {
+        return "";
+    }
+
+    int write = 0;
+    int i = 0;
+    while (i < n) {
+        int byte = strByteAt(s, i);
+        if (byte == 43) {                   // '+'
+            putByte(out, write, 32);
+            write = write + 1;
+            i = i + 1;
+        } else if (byte == 37 && i + 2 < n) {   // '%' with two digits after it
+            int hi = hexNibble(strByteAt(s, i + 1));
+            int lo = hexNibble(strByteAt(s, i + 2));
+            if (hi >= 0 && lo >= 0) {
+                putByte(out, write, hi * 16 + lo);
+                write = write + 1;
+                i = i + 3;
+            } else {
+                // Not a valid escape; emit it as-is, the '%' included.
+                putByte(out, write, byte);
+                write = write + 1;
+                i = i + 1;
+            }
+        } else {
+            putByte(out, write, byte);
+            write = write + 1;
+            i = i + 1;
+        }
+    }
+
+    string result = makeString(out as ptr char, write);
+    free(out);
+    return result;
+    eof: pass;
+}

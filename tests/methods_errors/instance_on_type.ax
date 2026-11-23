@@ -1,0 +1,7 @@
+//  An instance method cannot be called on the type name.
+struct S {
+    int n;
+    function get(self):int { return self.n; }
+};
+
+function main():void { print(S.get()); eof: pass; }

@@ -1,0 +1,21 @@
+//  Pair<Point> is instantiated and sum is **called**, so the method body has to
+//  be checked there; Point has no '+', so the error must point at the operator
+//  inside the method body.
+struct Point { int x; int y; };
+
+struct Pair<T> {
+    T first;
+    T second;
+    function sum(self):T { return self.first + self.second; }
+};
+
+function main():void {
+    Pair<Point> p;
+    p.first.x = 1;
+    p.first.y = 2;
+    p.second.x = 3;
+    p.second.y = 4;
+    Point total = p.sum();
+    print(total.x);
+    eof: pass;
+}

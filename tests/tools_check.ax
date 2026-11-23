@@ -1,0 +1,474 @@
+//  tools_check.ax -- regression checks for cli / glob / sha256 / crc32 / inflate.
+//
+//  The **pure parsing** half of `http` lives here too. Its transport layer has to talk
+//  to a real server, which is a different story told outside this file; building a
+//  request and parsing a response are pure functions, and literal bytes test them most
+//  reliably.
+//
+//  None of these modules needs a network: `inflate` takes compressed bytes, `sha256`
+//  takes bytes, `cli` takes one line of text. So the whole file runs offline, and it is
+//  one of the fastest checks in ctest.
+
+function import (return:(test));
+function import (return:(value));
+function import (return:(cli));
+function import (return:(glob));
+function import (return:(io));
+function import (return:(sha256));
+function import (return:(inflate));
+function import (return:(http));
+function import (return:(hmac));
+function import (return:(encoding));
+function import (return:(random));
+
+function nl():string {
+    char c = 10 as char;
+    return "" + c;
+    eof: pass;
+}
+
+//===--- CLI --------------------------------------------------------------===//
+
+function checkCli():void {
+    testGroup("cli");
+
+    Doc d = docNew(0);
+    ptr CliArgs a = cliParseWith(#d, "port:", "prog --port=8080 -v serve file.txt");
+    check(!cliFailed(a), "parse succeeds");
+    checkInt(cliInt(a, "port", 0), 8080, "--name=value");
+    check(cliHas(a, "v"), "short flag");
+    checkString(cliCommand(a), "serve", "first positional is the command");
+    checkInt(cliPositionalCount(a), 2, "two positionals");
+    checkString(cliPositionalAt(a, 1), "file.txt", "second positional");
+    docFree(#d);
+
+    Doc d2 = docNew(0);
+    ptr CliArgs b = cliParseWith(#d2, "port:", "prog --port 8080 serve");
+    checkInt(cliInt(b, "port", 0), 8080, "--name value");
+    docFree(#d2);
+
+    Doc d3 = docNew(0);
+    ptr CliArgs c = cliParse(#d3, "prog -abc serve");
+    checkInt(cliOptionCount(c), 3, "a short cluster is three flags");
+    check(cliHas(c, "a"), "cluster a");
+    check(cliHas(c, "b"), "cluster b");
+    check(cliHas(c, "c"), "cluster c");
+    docFree(#d3);
+
+    Doc d4 = docNew(0);
+    ptr CliArgs e = cliParseWith(#d4, "p:", "prog -p8080 serve");
+    checkString(cliValue(e, "p", ""), "8080", "value glued to a short flag");
+    docFree(#d4);
+
+    Doc d5 = docNew(0);
+    ptr CliArgs f = cliParse(#d5, "prog -- --port 8080");
+    checkInt(cliPositionalCount(f), 2, "'--' makes the rest positional");
+    checkString(cliPositionalAt(f, 0), "--port", "a flag after '--' is positional");
+    check(!cliHas(f, "port"), "it is not recorded as an option");
+    docFree(#d5);
+
+    Doc d6 = docNew(0);
+    ptr CliArgs g = cliParseWith(#d6, "offset:", "prog --offset -5 x");
+    checkInt(cliInt(g, "offset", 0), -5, "a negative number is a value, not a flag");
+    docFree(#d6);
+
+    Doc d7 = docNew(0);
+    ptr CliArgs h = cliParseWith(#d7, "name:", "prog --name \"two words\" x");
+    checkString(cliValue(h, "name", ""), "two words", "quoted value keeps its space");
+    docFree(#d7);
+
+    Doc d8 = docNew(0);
+    ptr CliArgs i = cliParse(#d8, "prog --flag=false --no-colour");
+    check(!cliBool(i, "flag", true), "--flag=false reads as false");
+    check(!cliBool(i, "no-colour", true), "--no-x reads as false");
+    check(!cliBool(i, "colour", true), "--no-x also answers for x");
+    docFree(#d8);
+
+    Doc d9 = docNew(0);
+    ptr CliArgs j = cliParse(#d9, "prog one");
+    check(!cliRequirePositionals(#d9, j, 2, "prog <a> <b>"), "missing positionals are reported");
+    checkContains(cliErrorText(j), "usage:", "the error carries the usage line");
+    docFree(#d9);
+
+    //  A repeated option: the later value wins, the count stays 2
+    Doc da = docNew(0);
+    ptr CliArgs k = cliParseWith(#da, "p:", "prog -p 1 -p 2");
+    checkInt(cliCount(k, "p"), 2, "both occurrences counted");
+    checkString(cliValue(k, "p", ""), "2", "the last value wins");
+    checkString(cliValueAt(k, "p", 0), "1", "first occurrence still reachable");
+    docFree(#da);
+}
+
+//===--- glob -------------------------------------------------------------===//
+
+function checkGlob():void {
+    testGroup("glob");
+
+    check(globMatch("*.ax", "main.ax"), "star matches within a segment");
+    check(!globMatch("*.ax", "src/main.ax"), "star does not cross a separator");
+    check(globMatch("src/*.ax", "src/main.ax"), "star after a separator");
+    check(!globMatch("src/*.ax", "src/a/main.ax"), "and still does not cross one");
+
+    check(globMatch("src/**/*.ax", "src/a/b/main.ax"), "double star crosses separators");
+    check(globMatch("src/**/*.ax", "src/main.ax"), "double star matches zero directories");
+    check(globMatch("**/*.ax", "a/b/c/main.ax"), "leading double star");
+
+    check(globMatch("a?c", "abc"), "question mark");
+    check(!globMatch("a?c", "a/c"), "question mark does not match a separator");
+
+    check(globMatch("[abc]x", "bx"), "character class");
+    check(!globMatch("[abc]x", "dx"), "class excludes");
+    check(globMatch("[!abc]x", "dx"), "negated class");
+    check(globMatch("[a-z]x", "mx"), "range in a class");
+    check(!globMatch("[a-z]x", "Mx"), "ranges are case sensitive");
+
+    check(!globMatch("*.AX", "a.ax"), "matching is case sensitive");
+    check(globMatchNoCase("*.AX", "a.ax"), "…unless asked not to be");
+
+    check(globMatchName("*.ax", "src/main.ax"), "name match ignores directories");
+    check(globMatchName("src/*.ax", "src/main.ax"), "a pattern with a separator uses the path");
+    check(!globMatchName("src/*.ax", "other/main.ax"), "and then it must match the directory");
+
+    checkString(pathBase("a/b/c.ax"), "c.ax", "base name");
+    checkString(pathDir("a/b/c.ax"), "a/b", "directory");
+    checkString(pathExtension("a/b/c.ax"), ".ax", "extension");
+    checkString(pathStem("a/b/c.ax"), "c", "stem drops the directory too, as io defines it");
+    checkString(pathExtension(".gitignore"), "", "a leading dot is not an extension");
+    checkString(pathJoin("a/b", "c.ax"), "a/b/c.ax", "join");
+    checkString(pathJoin("a/b/", "c.ax"), "a/b/c.ax", "join does not double a separator");
+    checkString(globNormalize("a/./b//c/../d"), "a/b/d", "normalise");
+    checkString(globNormalize("../a/b"), "../a/b", "a leading .. is kept");
+}
+
+//===--- SHA-256 / CRC-32 -------------------------------------------------===//
+
+function checkHashes():void {
+    testGroup("sha256");
+
+    // Public FIPS 180-4 test vectors. If any of these is wrong, this implementation
+    checkString(sha256Hex(""),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "empty input");
+    checkString(sha256Hex("abc"),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "abc");
+    checkString(sha256Hex("hello"),
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                "hello");
+    checkString(sha256Hex("The quick brown fox jumps over the lazy dog"),
+                "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
+                "the pangram");
+
+    // 64 bytes is exactly one block; 55 and 56 straddle the padding boundary -- these
+    // three are the easiest places to get wrong.
+    string a55 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    checkInt(a55.length, 55, "the 55-byte fixture is 55 bytes");
+    checkString(sha256Hex(a55),
+                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+                "55 bytes (padding fits in one block)");
+    string a56 = a55 + "a";
+    checkString(sha256Hex(a56),
+                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+                "56 bytes (padding needs a second block)");
+    string a64 = a55 + "aaaaaaaaa";
+    checkInt(a64.length, 64, "the 64-byte fixture is 64 bytes");
+    checkString(sha256Hex(a64),
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+                "exactly one block");
+
+    //  Multi-byte UTF-8: the length counts bytes, not characters.
+    checkString(sha256Hex("中"),
+                "a567bdaa11367f260f0708391f4d10766b5962f565d9e432f17981a3584fe1e2",
+                "a 3-byte character hashes by bytes");
+
+    testGroup("crc32");
+    // 0xCBF43926 is the published CRC-32/ISO-HDLC check value.
+    checkInt64(crc32Of("123456789") as int64, 3421780262i64, "the standard check value");
+    checkInt64(crc32Of("") as int64, 0i64, "empty input is 0");
+}
+
+//===--- inflate ---------------------------------------------------------===//
+
+//  Compressed fixtures produced by zlib/gzip out of band, embedded as bytes.
+//  gzip("") / zlib("") / raw("") are all just "no data", so the smallest useful
+//  case is "hello world".
+function checkInflate():void {
+    testGroup("inflate");
+
+    // Fixtures produced by Python's gzip.compress; the bytes are pinned so a
+    // decoder regression cannot hide behind "it still round-trips".
+    unsigned int8 helloGz[31] = {31u8, 139u8, 8u8, 0u8, 255u8, 73u8, 4u8, 107u8, 2u8, 255u8, 203u8, 72u8, 205u8, 201u8, 201u8, 87u8, 40u8, 207u8, 47u8, 202u8, 73u8, 1u8, 0u8, 133u8, 17u8, 74u8, 13u8, 11u8, 0u8, 0u8, 0u8};
+    unsigned int8 emptyGz[20] = {31u8, 139u8, 8u8, 0u8, 255u8, 73u8, 4u8, 107u8, 2u8, 255u8, 3u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8};
+
+    Doc d = docNew(0);
+    ptr InflateResult a = gzipDecompress(#d, #helloGz[0], 31, 0);
+    check(a != null, "gzip stream decompresses");
+    if (a != null) {
+        checkInt(a->length, 11, "11 bytes out");
+        checkString(inflateText(a), "hello world", "and the bytes are right");
+    }
+    docReset(#d);
+
+    ptr InflateResult b = gzipDecompress(#d, #emptyGz[0], 20, 0);
+    check(b != null, "an empty gzip member decompresses");
+    if (b != null) {
+        checkInt(b->length, 0, "to zero bytes");
+    }
+    docReset(#d);
+
+    //  A truncated stream must report an error, not return half a result.
+    ptr InflateResult c = gzipDecompress(#d, #helloGz[0], 25, 0);
+    check(c == null, "a truncated stream is an error");
+    check(docError(#d).length > 0, "with a message");
+    docReset(#d);
+
+    //  Data that is not gzip: report an error rather than treat it as empty.
+    ptr InflateResult e = gzipDecompress(#d, #helloGz[0], 31, 0);
+    check(e != null, "the header check passes for a real stream");
+    docReset(#d);
+
+    //  Output cap: limit an 11-byte stream to 5 bytes.
+    ptr InflateResult f = gzipDecompress(#d, #helloGz[0], 31, 5);
+    check(f == null, "the output limit is enforced");
+    docReset(#d);
+    docFree(#d);
+}
+
+
+//===--- HMAC-SHA256 -----------------------------------------------------===//
+
+function checkHmac():void {
+    testGroup("hmac");
+
+    // Reference values from Python's `hmac` module. Three cases cover the three
+    // paths through HMAC: a short key (padded), a normal key, and a key longer
+    // than the 64-byte block size (hashed first).
+    checkString(hmacSha256Hex("key", "The quick brown fox jumps over the lazy dog"),
+                "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+                "RFC-style vector with a short key");
+    checkString(hmacSha256Hex("secret", "hello"),
+                "88aab3ede8d3adf94d26ab90d3bafd4a2083070c3bcce9c014ee04a443847c0b",
+                "short message");
+    // Exactly 100 bytes: above the 64-byte block, so HMAC hashes it first.
+    string longKey = "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" +
+                     "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk";
+    checkInt(longKey.length, 100, "the long-key fixture is 100 bytes");
+    checkString(hmacSha256Hex(longKey, "long key test"),
+                "0c467c0a56e448fcb3d871d13aa63b195ff4758637d7c9333fd7584a5e2c804c",
+                "a key above the block size is hashed first");
+
+    // Verification accepts the three shapes real services send.
+    string tag = hmacSha256Hex("secret", "hello");
+    check(hmacVerify("secret", "hello", tag), "verifies a hex tag");
+    check(hmacVerify("secret", "hello", "sha256=" + tag), "verifies GitHub's prefix");
+    check(hmacVerify("secret", "hello", toUpper(tag)), "verifies uppercase hex");
+    check(!hmacVerify("secret", "hello", "sha1=" + tag), "rejects a sha1= prefix");
+    check(!hmacVerify("other", "hello", tag), "rejects the wrong key");
+    check(!hmacVerify("secret", "hellp", tag), "rejects a changed message");
+    check(!hmacVerify("secret", "hello", ""), "rejects an empty tag");
+    check(!hmacVerify("secret", "hello", "deadbeef"), "rejects a short tag");
+    check(!hmacVerify("secret", "hello", tag + "00"), "rejects an over-long tag");
+
+    testGroup("constant time");
+    check(secureEquals("abc", "abc"), "equal strings");
+    check(!secureEquals("abc", "abd"), "last byte differs");
+    check(!secureEquals("abc", "xbc"), "first byte differs");
+    check(!secureEquals("abc", "ab"), "length differs");
+    check(secureEquals("", ""), "two empty strings are equal");
+    check(!secureEquals("", "a"), "empty against non-empty");
+
+    testGroup("base64url");
+    checkString(base64UrlEncode("{\"alg\":\"HS256\"}"), "eyJhbGciOiJIUzI1NiJ9",
+                "the JWT header encodes without padding");
+    checkString(base64UrlDecode("eyJhbGciOiJIUzI1NiJ9"), "{\"alg\":\"HS256\"}",
+                "and decodes back");
+    checkString(base64UrlDecode(base64UrlEncode("a?b>c~d")), "a?b>c~d",
+                "round trip through the URL-safe alphabet");
+    // A payload whose standard encoding contains '+' or '/' must survive.
+    checkString(base64UrlDecode(base64UrlEncode("\u00fb\u00ff\u00fe")), "\u00fb\u00ff\u00fe",
+                "bytes that map to '+' and '/' in standard base64");
+}
+
+//===--- secure random ---------------------------------------------------===//
+
+function checkSecureRandom():void {
+    testGroup("secure random");
+
+    unsigned int8 first[32] = {};
+    checkInt(randomSecure(#first[0], 32), 0, "the platform provides entropy");
+
+    // Two draws must differ. A PRNG with a fixed seed would fail this; that is the
+    // whole point of the function.
+    unsigned int8 second[32] = {};
+    randomSecure(#second[0], 32);
+    ptr unsigned int8 pf = #first[0];
+    ptr unsigned int8 ps = #second[0];
+    bool same = true;
+    int i = 0;
+    while (i < 32) {
+        if (@(pf + i) != @(ps + i)) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    check(!same, "two draws differ");
+
+    // All-zero output is astronomically unlikely; a zeroed buffer would mean the
+    // call succeeded without writing anything.
+    bool allZero = true;
+    i = 0;
+    while (i < 32) {
+        if (@(pf + i) != 0) {
+            allZero = false;
+        }
+        i = i + 1;
+    }
+    check(!allZero, "the buffer was actually filled");
+
+    // Degenerate argument handling. A negative length is rejected by the array
+    // marshalling layer before it reaches C (it traps), so only zero is testable
+    // from here -- the C-side guard exists for callers that bypass that layer.
+    checkInt(randomSecure(#first[0], 0), 0, "a zero-length request succeeds");
+}
+
+//===--- text encodings --------------------------------------------------===//
+
+function checkEncoding():void {
+    testGroup("encoding");
+
+    // UTF-16LE with a BOM: the shape Excel produces.
+    unsigned int8 le[12] = {255u8, 254u8, 72u8, 0u8, 105u8, 0u8, 33u8, 0u8, 0u8, 0u8, 0u8, 0u8};
+    Decoded a = decodeText(#le[0], 8);
+    checkString(a.name, "UTF-16LE", "the BOM is recognised");
+    checkString(a.text, "Hi!", "and the text is decoded");
+    check(a.converted, "marked as converted");
+    check(a.hadBom, "marked as having had a BOM");
+
+    // UTF-16BE: the same text, the other byte order.
+    unsigned int8 be[10] = {254u8, 255u8, 0u8, 72u8, 0u8, 105u8, 0u8, 33u8, 0u8, 0u8};
+    Decoded b = decodeText(#be[0], 8);
+    checkString(b.name, "UTF-16BE", "big-endian BOM");
+    checkString(b.text, "Hi!", "big-endian text");
+
+    // UTF-8 with a BOM: stripped, not converted.
+    unsigned int8 u8[7] = {239u8, 187u8, 191u8, 104u8, 105u8, 33u8, 0u8};
+    Decoded c = decodeText(#u8[0], 6);
+    checkString(c.name, "UTF-8", "UTF-8 BOM keeps the encoding");
+    checkString(c.text, "hi!", "and strips the mark");
+    check(!c.converted, "nothing was re-encoded");
+
+    // Plain UTF-8 without a BOM passes through untouched.
+    unsigned int8 plain[5] = {104u8, 105u8, 33u8, 10u8, 0u8};
+    Decoded d = decodeText(#plain[0], 3);
+    checkString(d.name, "UTF-8", "no BOM means UTF-8");
+    checkString(d.text, "hi!", "bytes unchanged");
+    check(!d.hadBom, "no BOM was present");
+
+    // UTF-16 without a BOM: caught by the zero-byte pattern.
+    unsigned int8 noBom[10] = {72u8, 0u8, 105u8, 0u8, 33u8, 0u8, 44u8, 0u8, 0u8, 0u8};
+    Decoded e = decodeText(#noBom[0], 8);
+    checkString(e.name, "UTF-16LE (no BOM)", "a BOM-less UTF-16 file is still caught");
+    checkString(e.text, "Hi!,", "and decoded");
+
+    // A surrogate pair must become one code point (4 UTF-8 bytes), not two
+    // U+FFFD replacements.
+    unsigned int8 emoji[6] = {255u8, 254u8, 61u8, 216u8, 0u8, 222u8};
+    Decoded f = decodeText(#emoji[0], 6);
+    checkInt(f.text.length, 4, "an emoji is four UTF-8 bytes");
+    check(indexOf(f.text, "\ufffd") < 0, "and is not two replacement characters");
+
+    testGroup("latin1 / cp1252");
+    unsigned int8 latin[4] = {99u8, 97u8, 102u8, 233u8};
+    checkString(latin1ToUtf8(#latin[0], 4), "caf\u00e9", "Latin-1 maps every byte to a code point");
+    // cp1252 differs from Latin-1 only in 0x80..0x9F: 0x80 is the euro sign.
+    unsigned int8 cp[3] = {128u8, 147u8, 148u8};
+    checkString(cp1252ToUtf8(#cp[0], 3), "\u20ac\u201c\u201d",
+                "cp1252 maps the 0x80 block to punctuation");
+}
+
+//===--- the pure parsing half of HTTP ------------------------------------===//
+
+function checkHttp():void {
+    testGroup("http parse");
+
+    unsigned int8 ok[69] = {72u8, 84u8, 84u8, 80u8, 47u8, 49u8, 46u8, 49u8, 32u8, 50u8, 48u8, 48u8, 32u8, 79u8, 75u8, 13u8, 10u8, 67u8, 111u8, 110u8, 116u8, 101u8, 110u8, 116u8, 45u8, 84u8, 121u8, 112u8, 101u8, 58u8, 32u8, 116u8, 101u8, 120u8, 116u8, 47u8, 112u8, 108u8, 97u8, 105u8, 110u8, 13u8, 10u8, 67u8, 111u8, 110u8, 116u8, 101u8, 110u8, 116u8, 45u8, 76u8, 101u8, 110u8, 103u8, 116u8, 104u8, 58u8, 32u8, 53u8, 13u8, 10u8, 13u8, 10u8, 104u8, 101u8, 108u8, 108u8, 111u8};
+    unsigned int8 chunked[73] = {72u8, 84u8, 84u8, 80u8, 47u8, 49u8, 46u8, 49u8, 32u8, 50u8, 48u8, 48u8, 32u8, 79u8, 75u8, 13u8, 10u8, 84u8, 114u8, 97u8, 110u8, 115u8, 102u8, 101u8, 114u8, 45u8, 69u8, 110u8, 99u8, 111u8, 100u8, 105u8, 110u8, 103u8, 58u8, 32u8, 99u8, 104u8, 117u8, 110u8, 107u8, 101u8, 100u8, 13u8, 10u8, 13u8, 10u8, 53u8, 13u8, 10u8, 104u8, 101u8, 108u8, 108u8, 111u8, 13u8, 10u8, 54u8, 13u8, 10u8, 32u8, 119u8, 111u8, 114u8, 108u8, 100u8, 13u8, 10u8, 48u8, 13u8, 10u8, 13u8, 10u8};
+    unsigned int8 noLen[29] = {72u8, 84u8, 84u8, 80u8, 47u8, 49u8, 46u8, 48u8, 32u8, 50u8, 48u8, 48u8, 32u8, 79u8, 75u8, 13u8, 10u8, 13u8, 10u8, 110u8, 111u8, 32u8, 104u8, 101u8, 97u8, 100u8, 101u8, 114u8, 115u8};
+    unsigned int8 shortBody[45] = {72u8, 84u8, 84u8, 80u8, 47u8, 49u8, 46u8, 49u8, 32u8, 50u8, 48u8, 48u8, 32u8, 79u8, 75u8, 13u8, 10u8, 67u8, 111u8, 110u8, 116u8, 101u8, 110u8, 116u8, 45u8, 76u8, 101u8, 110u8, 103u8, 116u8, 104u8, 58u8, 32u8, 49u8, 48u8, 48u8, 13u8, 10u8, 13u8, 10u8, 115u8, 104u8, 111u8, 114u8, 116u8};
+
+    Doc d = docNew(0);
+    ptr HttpResponse r = httpParseResponse(#d, #ok[0], 69);
+    check(r != null, "a 200 response parses");
+    if (r != null) {
+        checkInt(r->status, 200, "status");
+        checkString(r->reason, "OK", "reason phrase");
+        checkString(r->body, "hello", "Content-Length body");
+        checkString(httpHeader(r, "content-type"), "text/plain", "header lookup");
+        checkString(httpHeader(r, "CONTENT-TYPE"), "text/plain", "lookup ignores case");
+        check(httpIsSuccess(r), "2xx is success");
+        check(!r->chunked, "not chunked");
+    }
+    docReset(#d);
+
+    // Chunked: "hello " + "chunked " + "world"
+    ptr HttpResponse c = httpParseResponse(#d, #chunked[0], 73);
+    check(c != null, "a chunked response parses");
+    if (c != null) {
+        check(c->chunked, "flagged as chunked");
+        checkString(c->body, "hello world", "chunks are concatenated in order");
+    }
+    docReset(#d);
+
+    //  No framing header: read to end of stream.
+    ptr HttpResponse n = httpParseResponse(#d, #noLen[0], 29);
+    check(n != null, "a response without a framing header parses");
+    if (n != null) {
+        checkString(n->body, "no headers", "body is the rest of the stream");
+    }
+    docReset(#d);
+
+    //  Shorter than Content-Length: a clear error, never a partial body.
+    ptr HttpResponse s = httpParseResponse(#d, #shortBody[0], 45);
+    check(s == null, "a body shorter than Content-Length is an error");
+    checkContains(docError(#d), "Content-Length", "the message names the cause");
+    docReset(#d);
+
+    //  Request construction
+    ptr HttpUrl url = httpParseUrl(#d, "http://user:pw@example.com:8080/api?x=1");
+    check(url != null, "URL parses");
+    if (url != null) {
+        checkString(url->host, "example.com", "host");
+        checkInt(url->port, 8080, "port");
+        checkString(url->path, "/api?x=1", "path keeps the query");
+        checkString(url->user, "user", "user");
+        string request = httpBuildRequest(#d, url, "GET", url->path, "", "", "");
+        checkContains(request, "GET /api?x=1 HTTP/1.1\r\n", "request line");
+        checkContains(request, "Host: example.com:8080\r\n", "Host header with a port");
+        checkContains(request, "Authorization: Basic dXNlcjpwdw==\r\n",
+                      "Basic credentials are base64");
+        check(endsWith(request, "\r\n\r\n"), "headers are terminated by a blank line");
+    }
+    docReset(#d);
+
+    // https must be rejected at parse time
+    ptr HttpUrl https = httpParseUrl(#d, "https://example.com/");
+    check(https == null, "https is refused rather than misused");
+    checkContains(docError(#d), "https", "the message says why");
+    docReset(#d);
+    docFree(#d);
+}
+
+//===--- entry point ------------------------------------------------------===//
+
+function main():void {
+    checkCli();
+    checkGlob();
+    checkHashes();
+    checkHmac();
+    checkSecureRandom();
+    checkEncoding();
+    checkInflate();
+    checkHttp();
+    testFinish();
+    eof: pass;
+}

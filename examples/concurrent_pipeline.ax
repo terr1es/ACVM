@@ -1,0 +1,241 @@
+//  concurrent_pipeline.ax — concurrency and parallelism, and which does what.
+//
+//  This example shows two "concurrency" modules in the stdlib **solving different things**:
+//
+//      sync      several processes share state → solves **races** (correctness)
+//      parallel  pure data crunching           → solves **speed** (multi-core)
+//
+//  First half is concurrency: three workers form a pipeline over channels and guard the
+//  shared stats with a mutex and atomics. Second half is parallelism: sort and sum it all.
+//
+//  Run: acvm run examples/concurrent_pipeline.ax
+//
+//  ── why the two halves sit together ───────────────────────────────────────
+//
+//  Alone, either module looks redundant: if parallel speeds things up on many cores, why
+//  keep cooperative processes? And the argument runs the other way just as well.
+//
+//  Because they do not overlap. `process` owns **structure** — who produces, who consumes,
+//  who waits for whom: data flow, not arithmetic. `parallel` only **spreads pure maths
+//  over cores** and cannot express "wait for the producer to send the next batch".
+//
+//  ── the concurrent half carries a real race ───────────────────────────────
+//
+//  Without the lock the totals come out low (spec §2.2.1.6: `x = x + 1` is not atomic,
+//  a safe point can split it). Dropping the channel capacity would hide "produce outruns
+//  consume", so the channel deliberately gets 4 slots only.
+
+function import (return:(sync));
+function import (return:(parallel));
+function import (return:(os));
+function import (return:(algorithm));
+
+comptime int BATCHES = 6;
+comptime int PER_BATCH = 20000;
+comptime int TOTAL = BATCHES * PER_BATCH;
+comptime int CHANNEL_CAPACITY = 4;
+
+// ─── shared state ──────────────────────────────────────────────────────────
+//
+// All `int` (aligned scalar loads and stores are atomic). Sub-byte integers cannot be used
+// here: `int4` / `int12` read-modify-write is several instructions, not atomic across procs.
+
+global Channel gBatches;
+global Mutex gStatsLock;
+global int gBatchesPending = 2;      // done only when producer and consumer both finish
+global int gProducedBatches = 0;
+global int gConsumedBatches = 0;
+global int gConsumedValues = 0;
+//  The sum surely exceeds int32: 120k values under 100k reach 12 billion worst case.
+global int64 gChecksum = 0;
+global int gMaxSeen = 0;
+global int gMinSeen = 0;
+global int gMinInitialised = 0;
+//  Initialisation-ready flag.
+//
+//  **This one cannot be dropped.** A `process` function starts at program launch, before
+//  `main`'s first statement — so any worker code assuming `main` has set up shared
+//  resources falls through (seen: consumer ran before main allocated, null deref crash).
+//
+//  Workers wait on this first; main sets it once channels, lock and buffer are ready.
+global int gReady = 0;
+
+//  The buffer the consumer fills.
+//
+//  **Heap-allocate it; do not write `global int gBuffer[TOTAL]`.** Not a style choice:
+//  a 120 000-element global (480 KB) touched by two `process` functions trips the VM's
+//  internal `std::bad_alloc`, while an `alloc` buffer of the same size is fine. 60 000
+//  elements (240 KB) already crashes. Big buffers belong on the heap anyway, so: heap.
+global ptr int gBuffer;
+
+// ─── producer: make six batches, push one batch id per batch ───────────────
+//
+// The channel carries ints only, so here it signals rather than ships: batch id 0..5 marks
+// the slice the consumer writes into its buffer. On purpose — sending `string` over a
+// channel drags in arena ownership (roll back the sender's arena and the receiver dangles).
+
+function process producer():void {
+    //  Wait for main to build the channel. `awaitReach` yields inside, so main runs.
+    awaitReach(#gReady, 1);
+
+    int batch = 0;
+    while (batch < BATCHES) {
+        chanPush(#gBatches, batch);
+        atomicIncrement(#gProducedBatches);
+        batch = batch + 1;
+    }
+    chanClose(#gBatches);
+    atomicDecrement(#gBatchesPending);
+    return;
+    eof: pass;
+}
+
+// ─── consumer: generate data per batch id, update stats under the lock ─────
+//
+// Two easy mistakes, both handled here:
+//
+//  1. **Get the write offset right**: `batch * PER_BATCH`, not "values consumed so far" —
+//     the latter drifts under concurrency, because gConsumedValues is shared.
+//  2. **`gMinSeen` needs initialising**: assign on the first value, compare only after.
+//     Use a `gMinInitialised` flag, not 0 as a sentinel (the data really does contain 0).
+
+function process consumer():void {
+    awaitReach(#gReady, 1);
+
+    int batch = 0;
+    while (chanPop(#gBatches, #batch)) {
+        int base = batch * PER_BATCH;
+
+        //  Generate this batch. Seed with the batch id so the result is reproducible.
+        unsigned int seed = ((batch + 1) as unsigned int) * 2654435761u32 + 12345u32;
+        int i = 0;
+        while (i < PER_BATCH) {
+            seed = seed * 1664525u32 + 1013904223u32;
+            //  `>> 8` not `>> 16`: 16 bits gives 0..65535, so modulo 100000 does nothing
+            //  and the range halves. 24 bits is enough.
+            int value = ((seed >> 8) as int) % 100000;
+            @(#gBuffer[0] + base + i) = value;
+
+            //  Local only, no shared writes — the shorter the critical section, the better.
+            i = i + 1;
+        }
+
+        //  Take the lock once per batch, not per element: locking per element would make
+        //  the lock overhead dwarf the work itself.
+        mutexLock(#gStatsLock);
+        int j = 0;
+        while (j < PER_BATCH) {
+            int value = @(#gBuffer[0] + base + j);
+            gChecksum = gChecksum + (value as int64);
+            if (atomicLoad(#gMinInitialised) == 0) {
+                gMinSeen = value;
+                gMaxSeen = value;
+                atomicStore(#gMinInitialised, 1);
+            } else {
+                if (value < gMinSeen) { gMinSeen = value; }
+                if (value > gMaxSeen) { gMaxSeen = value; }
+            }
+            j = j + 1;
+        }
+        gConsumedValues = gConsumedValues + PER_BATCH;
+        gConsumedBatches = gConsumedBatches + 1;
+        mutexUnlock(#gStatsLock);
+    }
+    atomicDecrement(#gBatchesPending);
+    return;
+    eof: pass;
+}
+
+// ─── parallel stage ────────────────────────────────────────────────────────
+//
+// The TOTAL elements from the concurrent half go to the cores for three jobs: sort,
+// sum, extremes. All pure data work with no shared state, so no lock is needed.
+
+function private parallelStage():void {
+    print("-- parallel stage --\n");
+
+    //  Record the sum first, for cross-checking (parallel summing must not change it).
+    int64 beforeSum = parallelSumInt(#gBuffer[0], TOTAL, 1);
+    print("sum before sort: " + itoa(beforeSum, 10) + "\n");
+
+    //  Sort: chunk, quicksort each, merge pairwise. Returns the number of threads used.
+    int threads = parallelSortInt(#gBuffer[0], TOTAL, 0);
+    print("sorted with " + itoa(threads, 10) + " thread(s)\n");
+    print("ascending: " + itoa(isSortedAsc(#gBuffer[0], TOTAL) as int, 10) + "\n");
+
+    //  Sorting keeps the same elements, so the sum must be identical — a strong assertion.
+    int64 afterSum = parallelSumInt(#gBuffer[0], TOTAL, 1);
+    print("sum after sort:  " + itoa(afterSum, 10) + "\n");
+    print("sum preserved:   " + itoa((beforeSum == afterSum) as int, 10) + "\n");
+
+    //  Parallel extremes, cross-checked against the serial version.
+    int parMax = parallelMaxInt(#gBuffer[0], TOTAL, 0);
+    int parMin = parallelMinInt(#gBuffer[0], TOTAL, 0);
+    int serialMaxAt = maxIndex(#gBuffer[0], TOTAL);
+    print("max: " + itoa(parMax, 10) + " (algorithm says " +
+          itoa(@(#gBuffer[0] + serialMaxAt), 10) + ")\n");
+    print("min: " + itoa(parMin, 10) + "\n");
+
+    //  After sorting the extremes sit at the ends; this also proves the merge lost nothing.
+    print("first: " + itoa(@#gBuffer[0], 10) +
+          "  last: " + itoa(@(#gBuffer[0] + TOTAL - 1), 10) + "\n");
+    eof: pass;
+}
+
+// ─── main flow ─────────────────────────────────────────────────────────────
+
+function main():void {
+    print("cpus: " + itoa(cpuCount(), 10) + "\n");
+    print("total values: " + itoa(TOTAL, 10) + "\n\n");
+
+    //  Set everything up before a worker touches it. The channel buffer is a stack
+    //  array of 4 — deliberately tiny, so the producer is sure to be caught and wait.
+    int slots[CHANNEL_CAPACITY] = {0, 0, 0, 0};
+    gBatches = makeChannel(#slots[0], CHANNEL_CAPACITY);
+    gStatsLock = makeMutex();
+
+    //  Main buffer: 120k ints = 480 KB, heap allocated (why: see where gBuffer is declared).
+    gBuffer = alloc(TOTAL * 4) as ptr int;
+    if (gBuffer == 0 as ptr int) {
+        print("error: cannot allocate the work buffer\n");
+        return;
+    }
+
+    //  Both workers are already running; here main waits for them to finish.
+    print("-- concurrent stage --\n");
+    //  All ready, release both workers. This must precede awaitCount — otherwise main
+    //  waits on the workers while they wait on gReady, and both sides hang.
+    atomicStore(#gReady, 1);
+
+    if (!awaitCount(#gBatchesPending)) {
+        print("timed out waiting for workers\n");
+        return;
+    }
+    print("batches produced: " + itoa(gProducedBatches, 10) + "\n");
+    print("batches consumed: " + itoa(gConsumedBatches, 10) + "\n");
+    print("values consumed:  " + itoa(gConsumedValues, 10) + "\n");
+    print("checksum:         " + itoa(gChecksum, 10) + "\n");
+    print("min / max:        " + itoa(gMinSeen, 10) + " / " + itoa(gMaxSeen, 10) + "\n\n");
+
+    //  The consumer must take every batch, or the parallel stage would sum partial data.
+    if (atomicLoad(#gConsumedBatches) != BATCHES) {
+        print("error: only " + itoa(gConsumedBatches, 10) + " of " +
+              itoa(BATCHES, 10) + " batches arrived\n");
+        return;
+    }
+
+    parallelStage();
+
+    //  Cross-check: the concurrent checksum must equal a fresh sum of the same buffer.
+    int64 recomputed = parallelSumInt(#gBuffer[0], TOTAL, 1);
+    if (recomputed != gChecksum) {
+        print("\nMISMATCH: checksum " + itoa(gChecksum, 10) +
+              " but buffer sums to " + itoa(recomputed, 10) + "\n");
+        return;
+    }
+    print("\nchecksum agrees with buffer: yes\n");
+
+    free(gBuffer);
+    print("\ndone\n");
+    eof: pass;
+}

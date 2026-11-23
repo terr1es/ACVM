@@ -1,0 +1,7 @@
+// One identity per file.
+module "duplicate" version "1.0.0";
+module "duplicate" version "2.0.0";
+
+function main():void {
+    eof: pass;
+}

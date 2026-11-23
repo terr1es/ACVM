@@ -1,0 +1,9 @@
+//  The receiver must be written in its implicit form; a named parameter makes it
+//  a static method, so `S self` here triggers the "you wrote the receiver as an
+//  ordinary parameter" diagnostic.
+struct S {
+    int n;
+    function get(S self):int { return self.n; }
+};
+
+function main():void { pass; eof: pass; }

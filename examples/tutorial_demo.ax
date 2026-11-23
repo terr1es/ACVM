@@ -1,0 +1,256 @@
+//===--- tutorial_demo.ax - runnable companion to the stdlib tutorial ------===//
+//
+//  Each section maps to one chapter in docs/tutorial/ and calls only the usual entry points.
+//  The aim is not full API coverage (the tutorial does that) but one command that says "setup is good".
+//
+//      ACVM_STDLIB=<repo>/stdlib acvm run examples/tutorial_demo.ax
+//
+//  Output should match the "=>" in each section comment. Any line that differs means
+//  the stdlib or a DLL disagrees with what the docs describe.
+//
+//  All 18 modules are exercised; parallel / threadpool need their DLLs,
+//  the other 6 fall back to Axiom code when a DLL is missing, with identical results.
+
+function import (return:(vec, algorithm, timsort, str, strbyte, codec,
+                         io, os, time, sync, parallel, threadpool,
+                         hash, map, set, test, random, stddec));
+
+//  ── print helpers ──────────────────────────────────────────────────────────
+
+function line(string title):void {
+    print("── ");
+    print(title);
+    print(" ");
+    for i in 0..40 {
+        print("-");
+    }
+    print("\n");
+    eof: pass;
+}
+
+function ints(ptr int data, int count):void {
+    for i in 0..count {
+        print(itoa(data[i], 10));
+        print(" ");
+    }
+    print("\n");
+    eof: pass;
+}
+
+//  The io / os buffered APIs need a stack or global char array (docs/tutorial/04-io.md §4.4 ①)
+global char gBuf[8192];
+global int  gSetBuf[4096];
+
+function main():void {
+
+    //  ── 1. vec ────────────────────────────────────────────────────────────
+    //  Doubles its capacity with a floor of 4: start at 2, push 5 items, end at 8
+    line("1 vec");
+    Vec v = makeVecHeap(2, sizeof(int));
+    for i in 0..5 {
+        vecPushInt(#v, i * i);
+    }
+    print("count="); print(itoa(v.count, 10));
+    print(" capacity="); print(itoa(v.capacity, 10));   // => 5 8
+    print(" get(3)="); print(itoa(vecGetInt(#v, 3), 10));  // => 9
+    print("\n");
+    vecFree(#v);
+
+    //  ── 2. algorithm / timsort ────────────────────────────────────────────
+    line("2 algorithm");
+    int a[6] = {5, 2, 8, 1, 9, 3};
+    sort(#a[0], 6);
+    print("sort:      "); ints(#a[0], 6);              // => 1 2 3 5 8 9
+
+    print("lower(3)="); print(itoa(lowerBound(#a[0], 6, 3), 10));
+    print(" bin(8)="); print(itoa(binarySearch(#a[0], 6, 8), 10));
+    print(" bin(7)="); print(itoa(binarySearch(#a[0], 6, 7), 10));  // => 2 4 -1
+    print("\n");
+
+    int u[7] = {1, 1, 2, 2, 2, 3, 4};
+    print("unique="); print(itoa(uniqueSorted(#u[0], 7), 10));      // => 4
+    print("\n");
+
+    int64 w[5] = {4i64, 1i64, 9i64, 3i64, 7i64};
+    print("median64="); print(itoa(medianValue64(#w[0], 5) as int, 10));
+    print("\n");
+
+    int ts[6] = {5, 2, 8, 1, 9, 3};
+    timSort(#ts[0], 6);
+    print("timSort:   "); ints(#ts[0], 6);              // => 1 2 3 5 8 9
+
+    int statData[6] = {2, 4, 4, 4, 5, 9};        // keep a separate copy, do not reuse sorted a
+    double st[2] = {0.0, 0.0};
+    int n = variance(#st[0], 2, #statData[0], 6);
+    print("var n="); print(itoa(n, 10));
+    print(" mean="); print(ftoaFixed(st[0], 4));
+    print(" var="); print(ftoaFixed(st[1], 4));         // => 1 4.6667 4.5556
+    print("\n");
+
+    //  ── 3. str / strbyte / codec ──────────────────────────────────────────
+    line("3 str");
+    SplitList parts = makeSplit("a,b,,c", ",");
+    print("split="); print(itoa(splitCount(#parts), 10));   // => 4, empty fields are kept
+    print(" join="); print(joinList(#parts, "/"));          // => a/b//c
+    print("\n");
+    splitFree(#parts);
+
+    print("replace:  "); print(replace("a.b.c", ".", "-"));     // => a-b.c (first hit only)
+    print("\nreplaceAll: "); print(replaceAll("a.b.c", ".", "-"));  // => a-b-c
+    print("\n");
+
+    string zh = "中文字";
+    print("bytes="); print(itoa(zh.length, 10));
+    print(" chars="); print(itoa(utf8CharCount(zh), 10));
+    print(" width="); print(itoa(utf8DisplayWidth(zh), 10)); // => 9 3 6
+    print("\n");
+
+    print("hex="); print(hexEncode("Hi"));
+    print(" b64="); print(base64Encode("Hello"));
+    print(" url="); print(urlEncode("a b&c"));               // => 4869 SGVsbG8= a%20b%26c
+    print("\n");
+
+    //  ── 4. io ─────────────────────────────────────────────────────────────
+    line("4 io");
+    int wrote = writeTextFile("tutorial_demo.tmp", "hello\n");
+    int size = fileSize("tutorial_demo.tmp");
+    int read = readTextFile("tutorial_demo.tmp", #gBuf[0], 8192);
+    print("write="); print(itoa(wrote, 10));
+    print(" size="); print(itoa(size, 10));
+    print(" read="); print(itoa(read, 10));                  // => 6 6 6
+    print("\n");
+    if (read > 0) {
+        print("content=["); print(makeString(#gBuf[0], read)); print("]\n");
+    }
+    print("missing="); print(itoa(readTextFile("no_such.txt", #gBuf[0], 64), 10));  // => -1
+    print("\n");
+    print("base="); print(pathBase("a/b/c.txt"));
+    print(" ext="); print(pathExtension("a/b/c.txt"));
+    print(" stem="); print(pathStem("a/b/c.txt"));           // => c.txt .txt c
+    print("\n");
+    removeFile("tutorial_demo.tmp");
+
+    //  ── 5. os ─────────────────────────────────────────────────────────────
+    line("5 os");
+    print("platform="); print(platformName());
+    print(" arch="); print(archName());
+    print(" cpus>0=");
+    if (cpuCount() > 0) { print("yes"); } else { print("no"); }
+    print("\n");
+    print("HOME set=");
+    if (envHas("HOME")) { print("yes"); } else { print("no"); }
+    print(" missing env=["); print(env("AXIOM_NO_SUCH_VAR")); print("]\n");
+
+    //  ── 6. time ───────────────────────────────────────────────────────────
+    line("6 time");
+    int64 epoch = 1700000000123i64;
+    print("utc="); print(timeFormatIsoMs(timeToCivil(epoch)));
+    print("\nlocal offset="); print(timeLocalOffsetString(epoch));
+    print(" weekday="); print(itoa(timeDayOfWeek(timeToCivil(epoch)), 10));  // => 2 (Tuesday)
+    print("\n");
+    if (timeIsLeapYear(2024)) {
+        print("2024 leap, feb="); print(itoa(timeDaysInMonth(2024, 2), 10));  // => 29
+        print("\n");
+    }
+
+    //  ── 7. sync / parallel / threadpool ──────────────────────────────────
+    line("7 concurrency");
+    int counter[1] = {0};
+    atomicIncrement(#counter[0]);
+    atomicAdd(#counter[0], 10);
+    print("atomic="); print(itoa(counter[0], 10));            // => 11
+    print("\n");
+
+    Mutex m = makeMutex();
+    if (mutexLock(#m)) {
+        print("mutex locked\n");
+        mutexUnlock(#m);
+    }
+
+    int par[8] = {5, 3, 1, 4, 2, 8, 6, 7};
+    int64 psum = parallelSumInt(#par[0], 8, 0);
+    print("parallelSum="); print(itoa(psum as int, 10));      // => 36
+    print("\n");
+    parallelSortInt(#par[0], 8, 0);
+    print("parallelSort: "); ints(#par[0], 8);               // => 1 2 3 4 5 6 7 8
+
+    int64 pool = threadPoolCreate(0);
+    int64 tsum = threadPoolSum(pool, #par[0], 8);
+    print("threads="); print(itoa(threadPoolThreads(pool), 10));
+    print(" poolSum="); print(itoa(tsum as int, 10));         // => 36
+    print("\n");
+    threadPoolDestroy(pool);
+
+    //  ── 8. hash / map / set ──────────────────────────────────────────────
+    line("8 containers");
+    HashSetInt hs = makeHashSetInt(8);
+    hashSetIntAdd(#hs, 42);
+    hashSetIntAdd(#hs, 42);
+    print("hash count="); print(itoa(hashSetIntCount(#hs), 10));   // => 1 (deduplicated)
+    print(" has42=");
+    if (hashSetIntContains(#hs, 42)) { print("yes"); } else { print("no"); }
+    print("\n");
+    hashSetIntFree(#hs);
+
+    SetInt st2 = makeSetInt(#gSetBuf[0], 4096);
+    setIntAdd(#st2, 5);
+    setIntAdd(#st2, 3);
+    setIntAdd(#st2, 5);
+    print("set count="); print(itoa(setIntCount(#st2), 10));
+    print(" order=");
+    for i in 0..setIntCount(#st2) {                 // ascending order, not insertion order
+        print(itoa(setIntAt(#st2, i), 10));
+        print(" ");
+    }
+    print("\n");                                    // => 2  3 5
+    setIntFree(#st2);
+
+    int mk[16] = {0};
+    int mv[16] = {0};
+    MapIntInt mp = makeMapIntInt(#mk[0], #mv[0], 16);
+    mapIntPut(#mp, 5, 50);
+    mapIntPut(#mp, 1, 10);
+    print("map order=");
+    for i in 0..mapIntCount(#mp) {
+        print(itoa(mapIntKeyAt(#mp, i), 10));
+        print("=");
+        print(itoa(mapIntValueAt(#mp, i), 10));
+        print(" ");
+    }
+    print("\n");                                    // => 1=10 5=50
+    int got = 0;
+    if (mapIntGet(#mp, 5, #got)) {                  // the out pointer must be set up first
+        print("map get="); print(itoa(got, 10)); print("\n");
+    }
+    mapIntIntFree(#mp);
+
+    //  ── 9. test / random ────────────────────────────────────────────────
+    line("9 test / random");
+    testGroup("demo");
+    checkInt(1 + 1, 2, "one plus one");
+    checkString("ab", "ab", "string eq");
+    int failed = testEnd();                          // returns the failure count, keeps going
+
+    unsigned int state[1] = {12345u32};
+    print("rand below 100: ");
+    for i in 0..3 {
+        print(itoa(randBelow(#state[0], 1, 100), 10));
+        print(" ");
+    }
+    print("\n");
+
+    //  ── 10. stddec (native family; not stdlib — see 10-native.md §10.4 ⑧b) ──
+    line("10 stddec");
+    int sd[5] = {5, 1, 4, 2, 3};
+    print("nativeSort="); print(itoa(nativeSort(#sd[0], 5) as int, 10));  // => 0 (0 = success)
+    print(" -> "); ints(#sd[0], 5);
+    print("nativeSum="); print(itoa(nativeSum(#sd[0], 5) as int, 10));    // => 15
+    print(" gcd(12,18)="); print(itoa(nativeGcd(12, 18) as int, 10));     // => 6
+    print("\n");
+
+    if (failed > 0) {
+        trap();
+    }
+    print("\nall sections done\n");
+    eof: pass;
+}

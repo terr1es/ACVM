@@ -1,0 +1,158 @@
+//  generic_struct_demo.ax — a type that carries a type.
+//
+//  A generic struct is compiled once per type argument: `Pair<int>` and
+//  `Pair<double>` are two types with two layouts, two sets of methods and two
+//  entries in `sizeof`. Nothing is erased and nothing is dispatched at run time.
+//
+//  This is what a third-party library needs to ship containers. The standard
+//  library's `Vec` predates it and uses a byte view (`ptr int8` + `elemSize`),
+//  which is the right choice for "copy bytes, do not look inside"; a generic
+//  struct is the right choice when the code has to *use* the element type.
+//
+//  Run:  acvm run examples/generic_struct_demo.ax
+
+function import (return:(io));
+
+//===--- One type parameter -------------------------------------------------===//
+
+struct Pair<T> {
+    T first;
+    T second;
+
+    //  A value receiver: read only, the caller's value is untouched.
+    function sum(self):T { return self.first + self.second; }
+
+    //  A pointer receiver: writes through to the caller.
+    function swap(ptr self):void {
+        T tmp = self->first;
+        self->first = self->second;
+        self->second = tmp;
+    }
+
+    //  A static method. It has no argument to infer `T` from, so it is called on
+    //  the instantiated type name: `Pair<int>.make(...)`.
+    function make(T a, T b):Pair<T> {
+        Pair<T> p = {a, b};
+        return p;
+    }
+};
+
+//===--- Two type parameters -----------------------------------------------===//
+
+struct Either<A, B> {
+    A left;
+    B right;
+
+    function describe(self):void {
+        //  The two members were declared with different type parameters, so their
+        //  types here are whatever the instantiation bound them to.
+        print("(");
+        print(self.left);
+        print(", ");
+        print(self.right);
+        print(")\n");
+    }
+};
+
+//===--- A struct that holds an instance of itself, through a pointer --------===//
+
+//  By value would be impossible (no finite size); through a pointer it is the
+//  ordinary linked-list shape, and the instantiation already exists by the time
+//  the field is resolved.
+struct Chain<T> {
+    T head;
+    ptr Chain<T> tail;
+};
+
+//  Walks a chain and adds up its heads. Written once, for any element type.
+function chainSum(ptr Chain<int> first, int count):int {
+    int total = 0;
+    ptr Chain<int> cursor = first;
+    for (int i = 0; i < count; i++) {
+        total = total + cursor->head;
+        cursor = cursor->tail;
+    }
+    return total;
+}
+
+//===--- A generic body using a generic struct ------------------------------===//
+
+//  `U` here is the function's parameter, and `Pair<U>` is the struct instantiated
+//  with it. `pairOf<int>` produces `Pair<int>`; `pairOf<double>` produces
+//  `Pair<double>`.
+function pairOf<U>(U a, U b):Pair<U> {
+    Pair<U> p = {a, b};
+    return p;
+}
+
+//===--- A generic union ----------------------------------------------------===//
+
+//  Same instantiation rule; the layout stays C's union layout (all members at
+//  offset 0), so the two views below really are the same bytes.
+union Slot<T> {
+    T value;
+    unsigned int64 bits;
+};
+
+function showInt(string label, int value):void {
+    print(label);
+    print(value);
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    //  Two instances of one template: separate layouts.
+    print("sizeof(Pair<int>)    = "); print(sizeof(Pair<int>)); print("\n");
+    print("sizeof(Pair<double>) = "); print(sizeof(Pair<double>)); print("\n");
+    print("sizeof(Pair<int64>)  = "); print(sizeof(Pair<int64>)); print("\n\n");
+
+    Pair<int> p = {3, 4};
+    showInt("p.sum()              = ", p.sum());
+    p.swap();
+    print("after swap           = "); print(p.first); print(", "); print(p.second); print("\n");
+
+    Pair<double> q = Pair<double>.make(1.5, 2.5);
+    print("Pair<double>.make    = "); print(q.sum()); print("\n");
+    //  `Pair<int>.make` and `Pair<double>.make` are different functions.
+    Pair<int> r = Pair<int>.make(10, 20);
+    showInt("Pair<int>.make       = ", r.sum());
+    print("\n");
+
+    //  Two parameters, bound independently.
+    Either<int, double> mixed = {7, 2.5};
+    print("Either<int,double>   = ");
+    mixed.describe();
+
+    //  Nested instantiation. The closing `>>` is lexed as one token and split.
+    Pair<Pair<int>> nested = {{1, 2}, {3, 4}};
+    showInt("nested: sums of sums = ", nested.first.sum() + nested.second.sum());
+    print("\n");
+
+    //  A chain: `ptr Chain<int>` inside `Chain<int>`.
+    Chain<int> a;
+    Chain<int> b;
+    Chain<int> c;
+    a.head = 1;
+    b.head = 2;
+    c.head = 3;
+    a.tail = #b;
+    b.tail = #c;
+    c.tail = 0 as ptr Chain<int>;
+    showInt("chainSum             = ", chainSum(#a, 3));
+    print("\n");
+
+    //  A generic function instantiating the struct with its own parameter.
+    Pair<int> fromFn = pairOf(5, 6);
+    showInt("pairOf(5, 6).sum()   = ", fromFn.sum());
+    print("pairOf(1.5, 2.5)     = ");
+    print(pairOf(1.5, 2.5).sum());
+    print("\n\n");
+
+    //  A generic union keeps the union layout.
+    Slot<int> slot;
+    slot.value = -1;
+    print("Slot<int>.value      = "); print(slot.value); print("\n");
+    print("slot.bits (same bytes)= "); print(slot.bits as int64); print("\n");
+    eof: pass;
+}

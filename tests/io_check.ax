@@ -1,0 +1,322 @@
+//  io_check.ax — the I/O library.
+//
+//  Two halves, tested differently.
+//
+//  The formatting and path functions are plain Axiom in stdlib/io.ax, so they run
+//  everywhere and their results are compared value by value.
+//
+//  The file functions need io.dll; there is no fallback, because opening a file is
+//  not something the language can express. They are exercised against a scratch
+//  file in the working directory, which is removed at the end -- so a run leaves
+//  no residue behind, and a failed run is visible in the file system rather than
+//  only in the exit code.
+//
+//  Run:  acvm run tests/io_check.ax
+
+function import (return:(io));
+
+comptime int BUFFER = 4096;
+
+//  Prints a string with brackets so leading and trailing spaces are visible.
+function private show(string label, string value):void {
+    print(label);
+    print("=[");
+    print(value);
+    print("]\n");
+    eof: pass;
+}
+
+//  A path is rebuilt from its parts; if pathDir / pathBase disagree with each
+//  other this fails, which is the property worth pinning.
+function private checkRebuild(string path):void {
+    print("rebuild ");
+    print(path);
+    print(": ");
+    print(pathJoin(pathDir(path), pathBase(path)) == path);
+    print("\n");
+    eof: pass;
+}
+
+function private checkPaths():void {
+    show("base", pathBase("a/b/c.txt"));
+    show("dir", pathDir("a/b/c.txt"));
+    show("ext", pathExtension("a/b/c.txt"));
+    show("stem", pathStem("a/b/c.txt"));
+    show("join", pathJoin("a/b", "c.txt"));
+    show("join trailing sep", pathJoin("a/b/", "c.txt"));
+    show("join empty dir", pathJoin("", "c.txt"));
+    show("join empty name", pathJoin("a/b", ""));
+
+    //  No separator at all: base is the whole thing, dir is empty.
+    show("bare base", pathBase("c.txt"));
+    show("bare dir", pathDir("c.txt"));
+    show("bare join", pathJoin(pathDir("c.txt"), pathBase("c.txt")));
+
+    //  Windows separators are understood even off Windows.
+    show("win base", pathBase("a\\b\\c.txt"));
+    show("win dir", pathDir("a\\b\\c.txt"));
+
+    //  A dotfile has no extension; the dot is part of the name.
+    show("dotfile ext", pathExtension(".gitignore"));
+    show("dotfile stem", pathStem(".gitignore"));
+
+    //  A file with several dots: only the last one is the extension.
+    show("multi ext", pathExtension("a/b/archive.tar.gz"));
+    show("multi stem", pathStem("a/b/archive.tar.gz"));
+
+    //  Trailing separator: the last component is empty.
+    show("trailing base", pathBase("a/b/"));
+
+    //  Extension predicates, both spellings.
+    print("has .txt: ");
+    print(pathHasExtension("a/b/c.txt", ".txt"));
+    print(" has txt: ");
+    print(pathHasExtension("a/b/c.txt", "txt"));
+    print(" has .md: ");
+    print(pathHasExtension("a/b/c.txt", ".md"));
+    print(" has empty: ");
+    print(pathHasExtension("a/b/c.txt", ""));
+    print("\n");
+
+    //  Stem + extension must equal base, for every shape above.
+    print("stem+ext ok: ");
+    print(pathStem("a/b/archive.tar.gz") + pathExtension("a/b/archive.tar.gz") ==
+          pathBase("a/b/archive.tar.gz"));
+    print("\n");
+
+    checkRebuild("a/b/c.txt");
+    checkRebuild("c.txt");
+    checkRebuild("a/b/archive.tar.gz");
+    checkRebuild("/root");
+    eof: pass;
+}
+
+function private checkFormatting():void {
+    show("padLeft", padLeft("x", 5, " "));
+    show("padRight", padRight("x", 5, "."));
+    show("padLeft wide fill", padLeft("x", 5, "--"));
+    show("padLeft noop", padLeft("abcdef", 3, " "));
+    show("padLeft empty fill", padLeft("x", 5, ""));
+    show("padZero", padZero("42", 5));
+    show("padZero already", padZero("12345", 3));
+
+    show("formatInt", formatInt(42, 6));
+    show("formatInt neg", formatInt(-42, 6));
+    show("formatIntPadded", formatIntPadded(7, 4));
+    show("formatIntPadded neg", formatIntPadded(-7, 4));
+
+    //  hexByte must always be two digits, and wrap negatives into 0..255.
+    print("hex:");
+    for (int i = 0; i < 256; i = i + 51) {
+        print(" ");
+        print(hexByte(i));
+    }
+    print(" ");
+    print(hexByte(256));    // wraps to 0
+    print(" ");
+    print(hexByte(-1));     // wraps to 255
+    print("\n");
+    eof: pass;
+}
+
+function private checkFiles():void {
+    string name = "io_check_scratch.txt";
+
+    //  Start from a known state even if an earlier run died midway.
+    removeFile(name);
+    print("exists before: ");
+    print(fileExists(name));
+    print("\n");
+
+    //  Writing takes a string: a string crosses the boundary as UTF-8 bytes, so
+    //  there is no buffer to pack by hand.
+    print("write: ");
+    print(writeTextFile(name, "Hello" + "\n"));
+    print("\n");
+
+    print("exists after: ");
+    print(fileExists(name));
+    print(" size: ");
+    print(fileSize(name));
+    print("\n");
+
+    //  Read it back and compare the text, not just the length: a shifted read
+    //  would still report the right size.
+    char readBack[BUFFER] = {0 as char};
+    int count = readTextFile(name, #readBack[0], BUFFER);
+    string text = makeString(#readBack[0], count);
+    print("read count: ");
+    print(count);
+    print(" equal: ");
+    print(text == "Hello" + "\n");
+    print(" content: [");
+    print(text);
+    print("]\n");
+
+    //  Append adds to the end.
+    print("append: ");
+    print(appendTextFile(name, "AB"));
+    print(" size now: ");
+    print(fileSize(name));
+    print("\n");
+
+    count = readTextFile(name, #readBack[0], BUFFER);
+    print("after append: [");
+    print(makeString(#readBack[0], count));
+    print("]\n");
+
+    //  A file bigger than the buffer is refused rather than truncated.
+    char small[4] = {0 as char, 0 as char, 0 as char, 0 as char};
+    print("too small: ");
+    print(readTextFile(name, #small[0], 4));
+    print("\n");
+
+    //  Missing file: every reader reports -1 and the predicate says false.
+    print("missing size: ");
+    print(fileSize("io_check_does_not_exist.txt"));
+    print(" exists: ");
+    print(fileExists("io_check_does_not_exist.txt"));
+    print(" read: ");
+    print(readTextFile("io_check_does_not_exist.txt", #small[0], 4));
+    print("\n");
+
+    //  A directory is not a file.
+    print("dir isDirectory: ");
+    print(isDirectory("."));
+    print(" dir fileExists: ");
+    print(fileExists("."));
+    print(" dir fileSize: ");
+    print(fileSize("."));
+    print("\n");
+
+    //  Rename then delete, checking each step.
+    print("rename: ");
+    print(renameFile(name, "io_check_renamed.txt"));
+    print(" old: ");
+    print(fileExists(name));
+    print(" new: ");
+    print(fileExists("io_check_renamed.txt"));
+    print("\n");
+
+    print("remove: ");
+    print(removeFile("io_check_renamed.txt"));
+    print(" gone: ");
+    print(fileExists("io_check_renamed.txt"));
+    print("\n");
+
+    //  Removing something absent is a failure, not a crash.
+    print("remove missing: ");
+    print(removeFile("io_check_does_not_exist.txt"));
+    print("\n");
+
+    //  makeDir is idempotent so "ensure this exists" is one call.
+    print("makeDir: ");
+    print(makeDir("io_check_dir"));
+    print(" again: ");
+    print(makeDir("io_check_dir"));
+    print(" isDirectory: ");
+    print(isDirectory("io_check_dir"));
+    print("\n");
+    //  The directory is created empty, so removing it here is what keeps this test
+    //  from leaving residue behind -- which the header promises it does not.
+    removeDir("io_check_dir");
+
+    //  Empty content is a legal write, not a failure.
+    print("empty write: ");
+    print(writeTextFile("io_check_empty.txt", ""));
+    print(" size: ");
+    print(fileSize("io_check_empty.txt"));
+    print("\n");
+    removeFile("io_check_empty.txt");
+    eof: pass;
+}
+
+//  Directory listing. One `listDir` call writes every name into a buffer (NUL
+//  separated, double NUL terminated); `dirCount` / `dirEntryAt` parse it on the pure
+//  Axiom side. Here: create a scratch directory, put two files in it, list it, then
+//  delete everything.
+function private checkDirectories():void {
+    string dir = "io_check_dir_listing";
+    //  A previous run may have died part-way; clear it out first. Files before directories.
+    removeFile(pathJoin(dir, "alpha.txt"));
+    removeFile(pathJoin(dir, "beta.csv"));
+    removeDir(dir);
+
+    print("\ndir: make: ");
+    print(makeDir(dir));
+    print("\n");
+
+    print("dir: write a: ");
+    print(writeTextFile(pathJoin(dir, "alpha.txt"), "a"));
+    print(" b: ");
+    print(writeTextFile(pathJoin(dir, "beta.csv"), "b"));
+    print("\n");
+
+    char names[2048];
+    int count = listDir(dir, #names[0], 2048);
+    print("dir: count: ");
+    print(count);
+    print("\n");
+
+    //  Print the names in alphabetical order so the output does not depend on the
+    //  order the file system returns them in -- that order is undefined, and a test
+    //  asserting it would break on a different file system.
+    print("dir: dirCount agrees: ");
+    print(dirCount(#names[0], 2048) == count);
+    print("\n");
+
+    string found = "";
+    for (int i = 0; i < count; i++) {
+        string name = dirEntryAt(#names[0], 2048, i);
+        if (indexOf(name, ".") >= 0) {
+            found = found + "[" + name + "]";
+        }
+    }
+    print("dir: contains alpha: ");
+    print(indexOf(found, "alpha.txt") >= 0);
+    print(" contains beta: ");
+    print(indexOf(found, "beta.csv") >= 0);
+    print("\n");
+
+    //  `.` and `..` must be skipped, or every caller would have to filter them itself.
+    bool noDots = true;
+    for (int i = 0; i < count; i++) {
+        string name = dirEntryAt(#names[0], 2048, i);
+        if (name == "." || name == "..") {
+            noDots = false;
+        }
+    }
+    print("dir: skips dot entries: ");
+    print(noDots);
+    print("\n");
+
+    //  A buffer that is too small reports -1 rather than returning a shorter listing.
+    char tiny[4];
+    print("dir: too small: ");
+    print(listDir(dir, #tiny[0], 4));
+    print("\n");
+
+    //  A directory that does not exist.
+    print("dir: missing: ");
+    print(listDir("io_check_no_such_dir", #names[0], 2048));
+    print("\n");
+
+    //  Cleanup: delete the files inside, then the directory.
+    removeFile(pathJoin(dir, "alpha.txt"));
+    removeFile(pathJoin(dir, "beta.csv"));
+    print("dir: remove: ");
+    print(removeDir(dir));
+    print(" gone: ");
+    print(!isDirectory(dir));
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    checkPaths();
+    checkFormatting();
+    checkFiles();
+    checkDirectories();
+    print("done\n");
+    eof: pass;
+}

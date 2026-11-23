@@ -1,0 +1,172 @@
+//  generics_check.ax -- generic functions (monomorphisation).
+//
+//  Generics here are not sugar: every distinct type argument is compiled into a
+//  **separate** function, so each check below establishes that the instances really
+//  are separate, rather than that something happened to work.
+//
+//  The other half is the error path. The first generic diagnostic a library author
+//  meets has to be readable, so failed inference, conflicting types and bodyless
+//  declarations all need clear messages -- those are pins by acvm's negative tests
+//  (tests/generics_errors/ and the expect-fail cases in CMake).
+
+function import (return:(test));
+
+//===--- the basics: one type parameter -------------------------------------===//
+
+function maxOf<T>(T a, T b):T {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+function minOf<T>(T a, T b):T {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+//===--- pointer parameters: T inferred from the element type ---------------===//
+
+function sumOf<T>(ptr T data, int count):T {
+    T total = 0 as T;
+    for (int i = 0; i < count; i++) {
+        total = total + @(data + i);
+    }
+    return total;
+}
+
+function fillWith<T>(ptr T data, int count, T value):void {
+    for (int i = 0; i < count; i++) {
+        @(data + i) = value;
+    }
+    eof: pass;
+}
+
+//===--- more than one type parameter --------------------------------------===//
+
+function firstOf<A, B>(A first, B second):A {
+    return first;
+}
+
+//===--- a generic calling a generic ---------------------------------------===//
+
+function maxOf3<T>(T a, T b, T c):T {
+    return maxOf(maxOf(a, b), c);
+}
+
+//===--- recursion through a generic ---------------------------------------===//
+
+function powOf<T>(T base, int exponent):T {
+    if (exponent <= 0) {
+        return 1 as T;
+    }
+    return base * powOf(base, exponent - 1);
+}
+
+//===--- coexisting with a concrete overload: the concrete one wins --------===//
+
+function label(int value):string {
+    return "concrete";
+}
+
+function label<T>(T value):string {
+    return "generic";
+}
+
+//===--- a struct as a type argument (only operator-free operations) ------===//
+
+struct Pair {
+    int left;
+    int right;
+};
+
+function passThrough<T>(T value):T {
+    return value;
+}
+
+//===--- checks ------------------------------------------------------------===//
+
+function checkIntInstances():void {
+    testGroup("int");
+    checkInt(maxOf(3, 7), 7, "maxOf picks the larger int");
+    checkInt(maxOf(7, 3), 7, "maxOf is order independent");
+    checkInt(minOf(3, 7), 3, "minOf picks the smaller int");
+    //  One template, two widths: each instance must be right and must not bleed into the other.
+    checkInt64(maxOf(5000000000i64, 4000000000i64), 5000000000i64,
+               "maxOf works at int64 width");
+    checkInt(maxOf(3, 7), 7, "the int instance still works after the int64 one");
+}
+
+function checkFloatInstances():void {
+    testGroup("float");
+    checkNear(maxOf(2.5, 1.5), 2.5, 0.0, "maxOf works on double");
+    checkNear(minOf(2.5, 1.5), 1.5, 0.0, "minOf works on double");
+}
+
+function checkCharInstances():void {
+    testGroup("char");
+    check(maxOf('x', 'a') == 'x', "maxOf works on char");
+}
+
+function checkPointerInstances():void {
+    testGroup("ptr");
+    int xs[4] = {1, 2, 3, 4};
+    checkInt(sumOf(#xs[0], 4), 10, "sumOf infers T from ptr int");
+
+    int64 ys[3] = {10, 20, 30};
+    checkInt64(sumOf(#ys[0], 3), 60, "sumOf infers T from ptr int64");
+
+    int zeros[5] = {9, 9, 9, 9, 9};
+    fillWith(#zeros[0], 5, 0);
+    checkInt(zeros[0] + zeros[1] + zeros[2] + zeros[3] + zeros[4], 0,
+             "fillWith infers T from the value argument");
+}
+
+function checkMultipleParameters():void {
+    testGroup("multi");
+    checkInt(firstOf(9, 1.5), 9, "firstOf returns the first type");
+    checkString(firstOf("kept", 7), "kept", "firstOf works when A is string");
+}
+
+function checkNestedCalls():void {
+    testGroup("nested");
+    checkInt(maxOf3(4, 9, 2), 9, "a generic calling a generic");
+    checkInt(maxOf3(2, 2, 2), 2, "equal arguments");
+}
+
+function checkRecursion():void {
+    testGroup("recursion");
+    checkInt(powOf(2, 10), 1024, "recursive generic, 2^10");
+    checkInt(powOf(2, 0), 1, "recursive generic, exponent 0");
+    checkInt64(powOf(3i64, 5), 243, "recursive generic at int64 width");
+}
+
+function checkOverloadPriority():void {
+    testGroup("overload");
+    checkString(label(42), "concrete", "a concrete overload wins over the generic");
+    checkString(label(2.5), "generic", "the generic takes over when no concrete fits");
+}
+
+function checkStructInstance():void {
+    testGroup("struct");
+    Pair p = {1, 2};
+    Pair q = passThrough(p);
+    checkInt(q.left, 1, "a struct survives being passed through a generic");
+    checkInt(q.right, 2, "both members are copied");
+}
+
+function main():void {
+    checkIntInstances();
+    checkFloatInstances();
+    checkCharInstances();
+    checkPointerInstances();
+    checkMultipleParameters();
+    checkNestedCalls();
+    checkRecursion();
+    checkOverloadPriority();
+    checkStructInstance();
+    testFinish();
+    eof: pass;
+}

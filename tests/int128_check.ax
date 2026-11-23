@@ -1,0 +1,104 @@
+//  int128_check.ax -- `int128` is the VM's full width, not "one more than int127".
+//
+//  Background: `int128` used to be rejected ("an integer width must be in [2, 127]").
+//  Not because it was impossible, but because three separate boundaries each clamped
+//  at 127:
+//
+//    * `signedMinOf` / `signedMaxOf` in IntRange.h treated any bits >= 127 as 127;
+//    * `literalMin` / `literalMax` in SemaExpr.cpp were **hand copies** of those two,
+//      also clamped at 127 -- and the diagnostic truncated a 128-bit value to
+//      `long long`, printing 2^127-1 as -1;
+//    * both places used a bare `a + b`, which at 128 bits is C++ signed overflow
+//      (undefined behaviour), so the optimizer could delete the check entirely.
+//
+//  So this checks both that the arithmetic works and that overflow is caught at every
+//  layer, with the same answer at every optimization level.
+
+function import (return:(test));
+
+comptime int128 INT128_MAX = 170141183460469231731687303715884105727i128;   // 2^127-1
+
+struct WithWide {
+    int8 tag;
+    int128 payload;
+};
+
+//  Width and alignment: 16 bytes, align 16, so { int8; int128 } pads to 32.
+function checkLayout():void {
+    testGroup("layout");
+
+    checkInt(sizeof(int128), 16, "int128 is 16 bytes");
+    checkInt(alignof(int128), 16, "int128 aligns to 16");
+    checkInt(sizeof(WithWide), 32, "a 1-byte field before an int128 pads to 32");
+    checkInt(sizeof(int128[4]), 64, "int128 arrays are packed at their own width");
+}
+
+//  The two ends of the range. min can only be reached as -max-1: the literal parser
+//  rejects anything >= 2^127, the same annoyance as writing INT64_MIN in C.
+function checkRange():void {
+    testGroup("range");
+
+    int128 maxv = INT128_MAX;
+    int128 minv = -maxv - 1;
+
+    checkInt128(maxv, INT128_MAX, "2^127-1 is representable");
+    checkInt128(minv, -INT128_MAX - 1, "-2^127 is representable");
+    checkInt128(minv + maxv, -1, "min + max == -1");
+    checkInt128(maxv / 2, 85070591730234615865843651857942052863i128, "max / 2");
+    checkInt128((maxv / 2) * 2 + 1, maxv, "round trip through / and *");
+}
+
+//  Arithmetic must really use all 128 bits rather than truncating somewhere inside.
+function checkArithmetic():void {
+    testGroup("arithmetic");
+
+    int128 a = 1;
+    int128 big = a << 100;
+    checkInt128(big, 1267650600228229401496703205376i128, "1 << 100 survives in an int128");
+    checkInt128(big >> 100, 1, "…and shifts back");
+
+    int128 neg = -(big);
+    checkInt128(neg, -1267650600228229401496703205376i128, "negation keeps all 128 bits");
+
+    //  Summing two values that both exceed 64 bits: the low half matches the true
+    //  value either way, so only a real 128-bit implementation gets the high half right.
+    int128 hi = (a << 64) + 7;
+    checkInt128(hi * 3, 55340232221128654869i128, "(2^64+7)*3 needs the high half");
+
+    //  Bit operations spanning both halves.
+    int128 lowPart = 0xFFFF;
+    int128 mixed = (a << 96) | lowPart;
+    checkInt128(mixed >> 96, 1, "high bits and low bits coexist");
+    checkInt128(mixed & lowPart, 65535, "masking the low half");
+}
+
+//  Mixing int128 with a narrow type must promote by value, not by bit pattern.
+function checkMixedWidths():void {
+    testGroup("mixed widths");
+
+    int128 wide = 100;
+    int8  narrow = -7;
+    checkInt128(wide + narrow, 93, "int128 + int8");
+    checkInt128((narrow as int128) * wide, -700, "int8 widened then multiplied");
+    check(wide > (narrow as int128), "comparison across widths");
+}
+
+//  unsigned int127 must still reach 2^127-1: adding int128 must not shrink it.
+function checkUnsigned127():void {
+    testGroup("unsigned int127");
+
+    unsigned int127 umax = 170141183460469231731687303715884105727i128 as unsigned int127;
+    checkInt128(umax as int128, INT128_MAX, "unsigned int127 still reaches 2^127-1");
+    //  Unsigned wraps modulo 2^127, so +1 returns to zero.
+    checkInt128((umax + 1) as int128, 0, "unsigned int127 wraps at 2^127");
+}
+
+function main():void {
+    checkLayout();
+    checkRange();
+    checkArithmetic();
+    checkMixedWidths();
+    checkUnsigned127();
+    testFinish();
+    eof: pass;
+}

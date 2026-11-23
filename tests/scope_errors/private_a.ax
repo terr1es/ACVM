@@ -1,0 +1,11 @@
+// Library A: a `private helper` with the same name and signature as library B's.
+
+function private helper(int x):int {
+    return x;
+    eof: pass;
+}
+
+function aOwn():int {
+    return helper(1);
+    eof: pass;
+}

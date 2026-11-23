@@ -1,0 +1,105 @@
+//  address_assign_check.ax — storing an address into a computed lvalue.
+//
+//  This is a regression test for a real bug. `member = #local` and
+//  `arr[i] = #local` used to store nothing at all, silently: the optimizer
+//  folded
+//
+//      LOCAL_ADDR x        ; rvalue: take the address of x
+//      STORE  ptr          ; the target address sits one level down
+//
+//  into `STORE_LOCAL x`, which writes the top of the stack into x — a different
+//  operation entirely. The field stayed zero (the pointer was always null),
+//  while `local = #x` worked, because that took another code-generation path.
+//  A list node's `next = #other` never connected.
+//
+//  The test only does the one right thing: store it, then dereference it back.
+//
+//  Run:  acvm run tests/address_assign_check.ax
+
+function import (return:(test));
+
+struct Holder {
+    int before;
+    ptr int link;
+    int after;
+};
+
+struct Node {
+    int value;
+    ptr Node nextNode;
+};
+
+global ptr int gLink;
+
+function checkStructMember():void {
+    testGroup("member");
+
+    int x = 42;
+    Holder h;
+    h.before = 1;
+    h.after = 3;
+    h.link = #x;
+
+    checkInt(@(h.link), 42, "storing an address into a struct member keeps the address");
+    checkInt(h.before, 1, "the member before it is untouched");
+    checkInt(h.after, 3, "the member after it is untouched");
+}
+
+function checkArrayElement():void {
+    testGroup("element");
+
+    int x = 7;
+    ptr int links[3];
+    links[0] = #x;
+    links[1] = 0 as ptr int;
+
+    checkInt(@(links[0]), 7, "storing an address into an array element keeps the address");
+    check(links[1] == 0 as ptr int, "the neighbouring element is untouched");
+}
+
+function checkLinkedNode():void {
+    testGroup("linked");
+
+    Node a;
+    Node b;
+    a.value = 1;
+    b.value = 2;
+    a.nextNode = #b;
+
+    checkInt(a.nextNode->value, 2, "the link follows to the other node");
+
+    //  two hops
+    Node c;
+    c.value = 3;
+    a.nextNode->nextNode = #c;
+    checkInt(a.nextNode->nextNode->value, 3, "a second hop through stored addresses");
+}
+
+function checkGlobal():void {
+    testGroup("global");
+
+    int x = 9;
+    gLink = #x;
+    checkInt(@gLink, 9, "storing an address into a global keeps the address");
+}
+
+function checkStructPointer():void {
+    testGroup("aggregate");
+
+    Holder h;
+    h.before = 5;
+    ptr Holder p = #h;
+    checkInt(p->before, 5, "a pointer to a struct still reaches its members");
+    p->before = 6;
+    checkInt(h.before, 6, "writing through it reaches the original");
+}
+
+function main():void {
+    checkStructMember();
+    checkArrayElement();
+    checkLinkedNode();
+    checkGlobal();
+    checkStructPointer();
+    testFinish();
+    eof: pass;
+}

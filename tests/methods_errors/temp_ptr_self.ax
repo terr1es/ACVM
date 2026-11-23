@@ -1,0 +1,8 @@
+//  A ptr receiver needs a variable that can be modified; a temporary has no address.
+struct S {
+    int n;
+    function bump(ptr self):void { self->n = self->n + 1; }
+    function make():S { S s = {0}; return s; }
+};
+
+function main():void { S.make().bump(); eof: pass; }

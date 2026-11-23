@@ -1,0 +1,406 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Axiom",
+  "scopeName": "source.axiom",
+  "fileTypes": [
+    "ax"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#chars"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#member"
+    },
+    {
+      "include": "#typedecl"
+    },
+    {
+      "include": "#funcdecl"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#builtins"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.axiom",
+          "begin": "//",
+          "end": "$",
+          "patterns": [
+            {
+              "name": "comment.line.double-slash.axiom",
+              "match": "TODO|FIXME|XXX|HACK|NOTE",
+              "captures": {
+                "0": {
+                  "name": "keyword.other.todo.axiom"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "comment.block.axiom",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [
+            {
+              "name": "keyword.other.todo.axiom",
+              "match": "TODO|FIXME|XXX|HACK|NOTE"
+            }
+          ]
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.triple.axiom",
+          "begin": "r?\"\"\"",
+          "end": "\"\"\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.axiom",
+              "match": "\\\\(?:[nrt0\\\\'\"abfv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4})"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.raw.axiom",
+          "begin": "\\br\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "invalid.illegal.raw-escape.axiom",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.axiom",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.axiom",
+              "match": "\\\\(?:[nrt0\\\\'\"abfv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4})"
+            },
+            {
+              "name": "invalid.illegal.unknown-escape.axiom",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "chars": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.axiom",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.axiom",
+              "match": "\\\\(?:[nrt0\\\\'\"abfv]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4})"
+            },
+            {
+              "name": "invalid.illegal.unknown-escape.axiom",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "invalid.illegal.numeric-suffix.axiom",
+          "match": "\\b0(?:[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|[bB][01](?:_?[01])*|\\d(?:_?\\d)*)(?:i\\d+|u\\d+|f\\d+)[A-Za-z0-9_]+"
+        },
+        {
+          "name": "constant.numeric.hex.axiom",
+          "match": "\\b0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*(?:i\\d+|u\\d+)?\\b"
+        },
+        {
+          "name": "constant.numeric.binary.axiom",
+          "match": "\\b0[bB][01](?:_?[01])*(?:i\\d+|u\\d+)?\\b"
+        },
+        {
+          "name": "constant.numeric.float.axiom",
+          "match": "(?<![\\w.])(?:\\d(?:_?\\d)*\\.(?:\\d(?:_?\\d)*)?|\\.\\d(?:_?\\d)*|\\d(?:_?\\d)*[eE][+-]?\\d(?:_?\\d)*)(?:[eE][+-]?\\d(?:_?\\d)*)?(?:f\\d+|d)?(?!\\w)"
+        },
+        {
+          "name": "constant.numeric.integer.axiom",
+          "match": "\\b\\d(?:_?\\d)*(?:i\\d+|u\\d+)?(?![\\w.])"
+        }
+      ]
+    },
+    "member": {
+      "patterns": [
+        {
+          "match": "(\\.)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(\\()",
+          "captures": {
+            "1": {
+              "name": "punctuation.dot.axiom"
+            },
+            "2": {
+              "name": "entity.name.function.method.axiom"
+            },
+            "3": {
+              "name": "punctuation.section.parens.begin.axiom"
+            }
+          }
+        },
+        {
+          "match": "(\\.)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "punctuation.dot.axiom"
+            },
+            "2": {
+              "name": "variable.other.property.axiom"
+            }
+          }
+        },
+        {
+          "match": "(->)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.arrow.axiom"
+            },
+            "2": {
+              "name": "variable.other.property.axiom"
+            }
+          }
+        }
+      ]
+    },
+    "typedecl": {
+      "patterns": [
+        {
+          "match": "\\b(struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.axiom"
+            },
+            "2": {
+              "name": "entity.name.type.axiom"
+            }
+          }
+        }
+      ]
+    },
+    "funcdecl": {
+      "patterns": [
+        {
+          "match": "\\b(function)\\s+(import|private|global|event|process)\\b(?:\\s+([A-Za-z_][A-Za-z0-9_]*))?",
+          "captures": {
+            "1": {
+              "name": "storage.type.function.axiom"
+            },
+            "2": {
+              "name": "storage.modifier.function-kind.axiom"
+            },
+            "3": {
+              "name": "entity.name.function.axiom"
+            }
+          }
+        },
+        {
+          "match": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.function.axiom"
+            },
+            "2": {
+              "name": "entity.name.function.axiom"
+            }
+          }
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.numeric.axiom",
+          "match": "\\bdouble\\d+\\.\\d+\\b"
+        },
+        {
+          "name": "storage.type.numeric.axiom",
+          "match": "\\b(?:int|float)\\d+\\b"
+        },
+        {
+          "match": "\\b(unsigned)(\\s+)((?:int|char)\\d*)\\b",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.unsigned.axiom"
+            },
+            "3": {
+              "name": "storage.type.numeric.axiom"
+            }
+          }
+        },
+        {
+          "name": "storage.type.axiom",
+          "match": "\\b(?:int|float|double|char|bool|string|void|vector|ptr)\\b"
+        },
+        {
+          "name": "storage.type.user.axiom",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "storage.modifier.axiom",
+          "match": "\\b(?:const|comptime|global)\\b"
+        },
+        {
+          "name": "keyword.control.axiom",
+          "match": "\\b(?:if|else|while|for|in|loop|switch|case|default|fallthrough|break|continue|return|pass|next)\\b"
+        },
+        {
+          "name": "keyword.control.block.axiom",
+          "match": "\\b(?:eof|virtual|arena_scope)\\b"
+        },
+        {
+          "name": "keyword.other.import.axiom",
+          "match": "\\b(?:import|is_cf)\\b"
+        },
+        {
+          "name": "keyword.other.library.axiom",
+          "match": "\\blibrary\\b"
+        },
+        {
+          "name": "keyword.operator.cast.axiom",
+          "match": "\\bas\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.axiom",
+          "match": "\\b(?:alloc0?|free|memcpy|memmove|yield|trap|sizeof|alignof|dup|makeString|stringToHeapBuffer)\\b"
+        },
+        {
+          "name": "support.function.io.axiom",
+          "match": "\\b(?:print|eprint|log|readLine|readToken|readInt|readFloat)\\b"
+        },
+        {
+          "name": "support.function.string.axiom",
+          "match": "\\b(?:itoa|ftoa|atoi|atof|indexOf|lastIndexOf|substring|startsWith|endsWith|trim|toUpper|toLower|replace|split)\\b"
+        },
+        {
+          "name": "support.function.math.axiom",
+          "match": "\\b(?:sqrt|fabs|floor|ceil|round|trunc|sin|cos|tan|asin|acos|atan|atan2|exp|log2|log10|pow|fmod|min|max|abs)\\b"
+        },
+        {
+          "name": "support.function.assert.axiom",
+          "match": "\\bassert\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.axiom",
+          "match": "\\b(?:true|false|null)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.axiom",
+          "match": "->"
+        },
+        {
+          "name": "keyword.operator.range.axiom",
+          "match": "\\.\\."
+        },
+        {
+          "name": "keyword.operator.deref.axiom",
+          "match": "@"
+        },
+        {
+          "name": "keyword.operator.addr.axiom",
+          "match": "#"
+        },
+        {
+          "name": "keyword.operator.increment.axiom",
+          "match": "\\+\\+|--"
+        },
+        {
+          "name": "keyword.operator.assignment.compound.axiom",
+          "match": "(?:<<|>>|[-+*/%&|^])=(?!=)"
+        },
+        {
+          "name": "keyword.operator.assignment.axiom",
+          "match": "=(?!=)"
+        },
+        {
+          "name": "keyword.operator.comparison.axiom",
+          "match": "==|!=|<=|>=|&&|\\|\\|"
+        },
+        {
+          "name": "keyword.operator.comparison.axiom",
+          "match": "<(?!<)|>(?!>)"
+        },
+        {
+          "name": "keyword.operator.bitwise.axiom",
+          "match": "&|\\||\\^|~"
+        },
+        {
+          "name": "keyword.operator.shift.axiom",
+          "match": "<<|>>"
+        },
+        {
+          "name": "keyword.operator.arithmetic.axiom",
+          "match": "[-+*/%]"
+        },
+        {
+          "name": "keyword.operator.ternary.axiom",
+          "match": "\\?|:"
+        },
+        {
+          "name": "punctuation.terminator.axiom",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.axiom",
+          "match": ","
+        },
+        {
+          "name": "punctuation.dot.axiom",
+          "match": "\\."
+        }
+      ]
+    }
+  }
+}

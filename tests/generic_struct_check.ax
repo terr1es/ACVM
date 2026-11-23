@@ -1,0 +1,235 @@
+//  generic_struct_check.ax — generic struct / union.
+//
+//  A generic struct is not a "template expanded at run time": every distinct type
+//  argument produces an **independent type**, with its own layout, its own
+//  methods and its own `Type` node. So the checks below fall into two groups:
+//
+//    * each instance's layout must match a hand-written struct of the same shape
+//      exactly (size, alignment, member offsets);
+//    * instances must not bleed into each other (writing through `Pair<int>` must
+//      not disturb the layout of `Pair<int64>`).
+//
+//  Run:  acvm run tests/generic_struct_check.ax
+
+function import (return:(test));
+
+//===--- types --------------------------------------------------------------===//
+
+struct Pair<T> {
+    T first;
+    T second;
+
+    function sum(self):T { return self.first + self.second; }
+    function swap(ptr self):void {
+        T tmp = self->first;
+        self->first = self->second;
+        self->second = tmp;
+    }
+    function make(T a, T b):Pair<T> {
+        Pair<T> p = {a, b};
+        return p;
+    }
+};
+
+struct Box<T> {
+    T value;
+
+    function get(self):T { return self.value; }
+};
+
+//  nesting: a field of the instance is itself another instance
+struct Nested<T> {
+    Pair<T> inner;
+    int tag;
+};
+
+//  two parameters, each used once
+struct Either<A, B> {
+    A left;
+    B right;
+};
+
+//  Self-reference is only possible through a pointer
+struct Node<T> {
+    T value;
+    ptr Node<T> nextNode;
+};
+
+//  A generic union: layout must still be C's (every member at offset 0)
+union Slot<T> {
+    T value;
+    int64 raw;
+};
+
+//  A hand-written struct of the same shape, to check the layout against
+struct PairIntManual {
+    int first;
+    int second;
+};
+
+//===--- using a generic struct inside a generic function -------------------===//
+
+function pairOf<U>(U a, U b):Pair<U> {
+    Pair<U> p = {a, b};
+    return p;
+}
+
+function boxedSum<V>(V a, V b):V {
+    Box<V> x = {a};
+    Box<V> y = {b};
+    return x.get() + y.get();
+}
+
+//===--- checks -------------------------------------------------------------===//
+
+function checkLayout():void {
+    testGroup("layout");
+    //  `Pair<int>` must be identical in shape to two hand-written ints
+    checkInt(sizeof(Pair<int>), sizeof(PairIntManual), "Pair<int> matches a hand-written pair");
+    checkInt(alignof(Pair<int>), alignof(PairIntManual), "Pair<int> aligns like a hand-written pair");
+
+    //  One template, different arguments: each size is right on its own
+    checkInt(sizeof(Pair<int64>), 16, "Pair<int64> is two 8 byte members");
+    checkInt(sizeof(Box<double>), 8, "Box<double> is one double");
+    checkInt(sizeof(Either<int, double>), 16, "Either<int,double> aligns to the double");
+
+    //  A nested instance's size is a function of the inner size
+    checkInt(sizeof(Nested<int>), 12, "Nested<int> is Pair<int> plus an int");
+
+    //  A union instance keeps union layout: sized to its largest member
+    checkInt(sizeof(Slot<int>), 8, "Slot<int> is sized by int64, not by the sum");
+    checkInt(sizeof(Slot<double>), 8, "Slot<double> is one double");
+}
+
+function checkMembers():void {
+    testGroup("members");
+
+    Pair<int> pi = {1, 2};
+    checkInt(pi.first, 1, "the first member of Pair<int>");
+    checkInt(pi.second, 2, "the second member of Pair<int>");
+
+    //  Same member name, different types, no interference
+    Pair<int64> pl = {10, 20};
+    checkInt64(pl.first, 10i64, "Pair<int64> keeps its own field types");
+    checkInt(pi.first, 1, "the int instance is untouched by the int64 one");
+
+    Box<double> bd = {2.5};
+    checkNear(bd.value, 2.5, 0.0, "Box<double> holds a double");
+
+    //  Nested field
+    Nested<int> n;
+    n.inner.first = 7;
+    n.inner.second = 8;
+    n.tag = 9;
+    checkInt(n.inner.first + n.inner.second + n.tag, 24, "nested instance fields are reachable");
+
+    Either<int, double> e = {3, 4.5};
+    checkInt(e.left, 3, "the first type parameter");
+    checkNear(e.right, 4.5, 0.0, "the second type parameter");
+}
+
+function checkMethods():void {
+    testGroup("methods");
+
+    Pair<int> p = {3, 4};
+    checkInt(p.sum(), 7, "a value receiver sees both members");
+
+    p.swap();
+    checkInt(p.first, 4, "a pointer receiver writes back: first");
+    checkInt(p.second, 3, "a pointer receiver writes back: second");
+
+    //  Methods are instantiated per instance too: `Pair<int>.make` returns `Pair<int>`
+    Pair<int> made = Pair<int>.make(5, 6);
+    checkInt(made.sum(), 11, "a static method returns an instance");
+
+    Pair<double> madeD = Pair<double>.make(1.5, 2.5);
+    checkNear(madeD.sum(), 4.0, 0.0, "the double instance has its own static method");
+}
+
+function checkGenericFunction():void {
+    testGroup("in generics");
+
+    //  `Pair<U>` inside `pairOf<int>` must be `Pair<int>`
+    Pair<int> a = pairOf(10, 20);
+    checkInt(a.sum(), 30, "a generic function instantiates the struct with its own U");
+
+    Pair<double> b = pairOf(1.5, 2.5);
+    checkNear(b.sum(), 4.0, 0.0, "the double instantiation is separate");
+
+    checkInt(boxedSum(3, 4), 7, "a generic struct used inside another generic body");
+    checkNear(boxedSum(1.5, 2.5), 4.0, 0.0, "…for doubles too");
+}
+
+function checkNestedInstantiation():void {
+    testGroup("nested");
+
+    //  `Pair<Pair<int>>`: two levels, closed by `>>`
+    Pair<Pair<int>> deep;
+    deep.first.first = 1;
+    deep.first.second = 2;
+    deep.second.first = 3;
+    deep.second.second = 4;
+    checkInt(deep.first.first + deep.first.second + deep.second.first + deep.second.second, 10,
+             "two levels of instantiation are reachable");
+    checkInt(sizeof(Pair<Pair<int>>), 16, "two levels of instantiation are laid out");
+
+    //  three levels
+    Box<Box<Box<int>>> three;
+    three.value.value.value = 9;
+    checkInt(three.value.value.value, 9, "three levels, closing on `>>>`");
+}
+
+function checkSelfReference():void {
+    testGroup("self reference");
+
+    Node<int> a;
+    Node<int> b;
+    a.value = 1;
+    b.value = 2;
+    a.nextNode = #b;
+    checkInt(a.value, 1, "the value of the head");
+    checkInt(a.nextNode->value, 2, "following a pointer to the same instance type");
+    checkInt(sizeof(Node<int>), 16, "a self-referential instance has a finite size");
+
+    a.nextNode = 0 as ptr Node<int>;
+    check(a.nextNode == 0 as ptr Node<int>, "a null pointer to an instance type");
+}
+
+function checkUnionInstance():void {
+    testGroup("union instance");
+
+    Slot<int> s;
+    s.value = -1;
+    checkInt(s.value, -1, "the generic member of a union instance");
+    //  another view of the same slot
+    checkInt64(s.raw as int64, 4294967295i64, "the int64 view of the same bytes");
+
+    Slot<double> d;
+    d.value = 1.0;
+    checkNear(d.value, 1.0, 0.0, "a union instance over a different type");
+}
+
+function checkZeroInit():void {
+    testGroup("init");
+
+    Pair<int> p;
+    p.first = 3;
+    p.second = 4;
+    checkInt(p.sum(), 7, "an instance can be filled member by member");
+
+    Pair<int> zeroed = {0, 0};
+    checkInt(zeroed.sum(), 0, "an instance takes a brace initialiser");
+}
+
+function main():void {
+    checkLayout();
+    checkMembers();
+    checkMethods();
+    checkGenericFunction();
+    checkNestedInstantiation();
+    checkSelfReference();
+    checkUnionInstance();
+    checkZeroInit();
+    testFinish();
+    eof: pass;
+}

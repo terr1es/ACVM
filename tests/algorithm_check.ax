@@ -1,0 +1,739 @@
+//  algorithm_check.ax — exercises every function in the algorithm library.
+//
+//  The point is differential testing. Run it twice and diff the output:
+//
+//      acvm run tests/algorithm_check.ax > with-dll.txt      (C runs)
+//      (move algorithm.dll out of the search path)
+//      acvm run tests/algorithm_check.ax > without-dll.txt   (Axiom runs)
+//      diff with-dll.txt without-dll.txt
+//
+//  Identical output means the two implementations agree. Where a function's
+//  result is a *permutation* the tests print the invariant instead of the array,
+//  because both sides are allowed to arrange elements differently as long as the
+//  contract holds -- `partitionInts` and `nthElement` are the two cases.
+//
+//  Every case prints on one line, prefixed with its name, so a mismatch points at
+//  the function that broke rather than at a wall of numbers.
+
+function import (return:(algorithm));
+
+comptime int N = 12;
+
+//  Deterministic filler: an LCG, so both runs start from identical arrays.
+function private fill(ptr int data, int count, unsigned int seed):void {
+    unsigned int state = seed;
+    for (int i = 0; i < count; i++) {
+        state = state * 1664525u32 + 1013904223u32;
+        @(data + i) = ((state >> 16) as int) % 100;
+    }
+    eof: pass;
+}
+
+function private show(string label, ptr int data, int count):void {
+    print(label);
+    print(":");
+    for (int i = 0; i < count; i++) {
+        print(" ");
+        print(@(data + i));
+    }
+    print("\n");
+    eof: pass;
+}
+
+//  Copies `count` elements, so a case that rearranges its input does not disturb
+//  the cases after it.
+function private clone(ptr int destination, ptr int source, int count):void {
+    for (int i = 0; i < count; i++) {
+        @(destination + i) = @(source + i);
+    }
+    eof: pass;
+}
+
+// ─── search ────────────────────────────────────────────────────────────────
+
+function private checkSearch():void {
+    //  Sorted with duplicates on purpose: `2` at two positions, `6` present, `5`
+    //  and `10` absent, and the ends are probed.
+    int data[10] = {1, 2, 2, 3, 6, 6, 7, 8, 9, 9};
+
+    print("lowerBound:");
+    for (int i = 0; i <= 10; i++) {
+        print(" ");
+        print(lowerBound(#data[0], 10, i));
+    }
+    print("\n");
+
+    print("upperBound:");
+    for (int i = 0; i <= 10; i++) {
+        print(" ");
+        print(upperBound(#data[0], 10, i));
+    }
+    print("\n");
+
+    print("binarySearch:");
+    for (int i = 0; i <= 10; i++) {
+        print(" ");
+        print(binarySearch(#data[0], 10, i));
+    }
+    print("\n");
+
+    //  Empty array: every search must report "not here" without touching memory.
+    ptr int empty = 0 as ptr int;
+    print("empty lowerBound: ");
+    print(lowerBound(empty, 0, 5));
+    print(" binarySearch: ");
+    print(binarySearch(empty, 0, 5));
+    print("\n");
+
+    //  Single element, both keys.
+    int one[1] = {7};
+    print("single: ");
+    print(lowerBound(#one[0], 1, 7));
+    print(" ");
+    print(upperBound(#one[0], 1, 7));
+    print(" ");
+    print(binarySearch(#one[0], 1, 6));
+    print(" ");
+    print(binarySearch(#one[0], 1, 8));
+    print("\n");
+    eof: pass;
+}
+
+// ─── selection ─────────────────────────────────────────────────────────────
+
+function private checkSelection():void {
+    int base[N] = {0};
+    fill(#base[0], N, 2024u32);
+
+    int work[N] = {0};
+    int scratch[N] = {0};
+
+    //  k-th smallest for every k. Only a[k] is compared: the rest of the array is
+    //  rearranged by whichever partition ran, and that arrangement is not part of
+    //  the contract.
+    print("nthElement:");
+    for (int k = 0; k < N; k++) {
+        clone(#work[0], #base[0], N);
+        nthElement(#work[0], N, k);
+        print(" ");
+        print(@(#work[0] + k));
+    }
+    print("\n");
+
+    //  Cross-check against a full sort: the k-th element of a sorted copy is the
+    //  same number, so this catches an off-by-one in the selection itself.
+    clone(#scratch[0], #base[0], N);
+    sort(#scratch[0], N);
+    print("nthElement vs sorted:");
+    for (int k = 0; k < N; k++) {
+        clone(#work[0], #base[0], N);
+        nthElement(#work[0], N, k);
+        if (@(#work[0] + k) == @(#scratch[0] + k)) {
+            print(" ok");
+        } else {
+            print(" MISMATCH");
+        }
+    }
+    print("\n");
+
+    //  Out-of-range k must be a no-op, not a crash.
+    clone(#work[0], #base[0], N);
+    nthElement(#work[0], N, -1);
+    nthElement(#work[0], N, N);
+    print("nthElement out-of-range left array alone: ");
+    print(equalInts(#work[0], N, #base[0], N));
+    print("\n");
+
+    //  Median, odd and even counts, on copies.
+    int odd[9] = {0};
+    fill(#odd[0], 9, 77u32);
+    clone(#work[0], #odd[0], 9);
+    int oddMedian = medianValue(#work[0], 9);
+    clone(#scratch[0], #odd[0], 9);
+    sort(#scratch[0], 9);
+    print("median odd: ");
+    print(oddMedian);
+    print(" expected ");
+    print(@(#scratch[0] + 4));
+    print("\n");
+
+    int even[8] = {0};
+    fill(#even[0], 8, 99u32);
+    clone(#work[0], #even[0], 8);
+    int evenMedian = medianValue(#work[0], 8);
+    clone(#scratch[0], #even[0], 8);
+    sort(#scratch[0], 8);
+    print("median even: ");
+    print(evenMedian);
+    print(" expected ");
+    print((@(#scratch[0] + 3) + @(#scratch[0] + 4)) / 2);
+    print("\n");
+
+    print("median empty: ");
+    print(medianValue(0 as ptr int, 0));
+    print("\n");
+    eof: pass;
+}
+
+// ─── sequence operations ───────────────────────────────────────────────────
+
+function private checkSequence():void {
+    int data[7] = {1, 2, 3, 4, 5, 6, 7};
+    int work[8] = {0};
+
+    clone(#work[0], #data[0], 7);
+    rotateInts(#work[0], 7, 2);
+    show("rotate left 2", #work[0], 7);
+
+    clone(#work[0], #data[0], 7);
+    rotateInts(#work[0], 7, -2);
+    show("rotate right 2", #work[0], 7);
+
+    clone(#work[0], #data[0], 7);
+    rotateInts(#work[0], 7, 7);
+    show("rotate by count", #work[0], 7);
+
+    clone(#work[0], #data[0], 7);
+    rotateInts(#work[0], 7, 0);
+    show("rotate by 0", #work[0], 7);
+
+    //  partitionInts: the split point is compared, plus the invariant. The
+    //  arrangement inside each side is unspecified, so the array is not printed.
+    int mixed[8] = {5, 1, 9, 3, 7, 2, 8, 4};
+    for (int pivot = 0; pivot <= 10; pivot = pivot + 5) {
+        clone(#work[0], #mixed[0], 8);
+        int split = partitionInts(#work[0], 8, pivot);
+        int below = 0;
+        int above = 0;
+        for (int i = 0; i < split; i++) {
+            if (@(#work[0] + i) < pivot) { below++; }
+        }
+        for (int i = split; i < 8; i++) {
+            if (@(#work[0] + i) >= pivot) { above++; }
+        }
+        print("partition pivot ");
+        print(pivot);
+        print(": split ");
+        print(split);
+        print(" left ok ");
+        print(below == split);
+        print(" right ok ");
+        print(above == 8 - split);
+        print("\n");
+    }
+
+    //  uniqueSorted on a sorted array with runs of duplicates.
+    int dupes[10] = {1, 1, 2, 2, 2, 3, 5, 5, 8, 8};
+    int uniqueCount = uniqueSorted(#dupes[0], 10);
+    print("unique count: ");
+    print(uniqueCount);
+    print("\n");
+    show("unique", #dupes[0], uniqueCount);
+
+    //  Already unique, and the degenerate sizes.
+    int distinct[4] = {4, 5, 6, 7};
+    print("unique already: ");
+    print(uniqueSorted(#distinct[0], 4));
+    print("\n");
+    int single[1] = {3};
+    print("unique single: ");
+    print(uniqueSorted(#single[0], 1));
+    print("\n");
+
+    //  mergeInts: two ascending runs into a third array.
+    int left[5] = {1, 4, 7, 10, 13};
+    int right[4] = {2, 3, 11, 12};
+    int merged[10] = {0};
+    fillInts(#merged[0], 10, -1);
+    int mergedCount = mergeInts(#merged[0], 10, #left[0], 5, #right[0], 4);
+    print("merge count: ");
+    print(mergedCount);
+    print("\n");
+    show("merged", #merged[0], mergedCount);
+
+    //  Equal keys must keep the left run's element first.
+    int leftEq[3] = {1, 2, 2};
+    int rightEq[3] = {2, 2, 3};
+    int mergedEq[6] = {0};
+    int eqCount = mergeInts(#mergedEq[0], 6, #leftEq[0], 3, #rightEq[0], 3);
+    print("merge equal count: ");
+    print(eqCount);
+    print("\n");
+    show("merge equal", #mergedEq[0], eqCount);
+
+    //  Not enough room: -1 and the destination untouched.
+    int tight[2] = {0};
+    fillInts(#tight[0], 2, 0);
+    print("merge too small: ");
+    print(mergeInts(#tight[0], 2, #left[0], 5, #right[0], 4));
+    show("  destination", #tight[0], 2);
+
+    //  Empty runs.
+    print("merge one empty: ");
+    print(mergeInts(#merged[0], 10, #left[0], 5, #right[0], 0));
+    print("\n");
+
+    //  fillInts across the whole range and the empty case.
+    int filled[5] = {0};
+    fillInts(#filled[0], 5, 42);
+    show("filled", #filled[0], 5);
+    fillInts(#filled[0], 0, 7);
+    show("filled zero count", #filled[0], 5);
+    eof: pass;
+}
+
+// ─── queries ───────────────────────────────────────────────────────────────
+
+function private checkQueries():void {
+    int data[6] = {4, 8, 1, 8, 9, 8};
+
+    print("findInt:");
+    print(" ");
+    print(findInt(#data[0], 6, 4));
+    print(" ");
+    print(findInt(#data[0], 6, 8));
+    print(" ");
+    print(findInt(#data[0], 6, 9));
+    print(" ");
+    print(findInt(#data[0], 6, 5));
+    print("\n");
+
+    print("countInt:");
+    print(" ");
+    print(countInt(#data[0], 6, 8));
+    print(" ");
+    print(countInt(#data[0], 6, 1));
+    print(" ");
+    print(countInt(#data[0], 6, 7));
+    print("\n");
+
+    print("minIndex: ");
+    print(minIndex(#data[0], 6));
+    print(" maxIndex: ");
+    print(maxIndex(#data[0], 6));
+    print("\n");
+
+    //  Ties go to the earliest index, so maxIndex is 1 rather than 3 or 5.
+    int ties[4] = {7, 7, 7, 7};
+    print("ties min/max: ");
+    print(minIndex(#ties[0], 4));
+    print(" ");
+    print(maxIndex(#ties[0], 4));
+    print("\n");
+
+    int ascending[5] = {1, 2, 2, 3, 4};
+    int descending[5] = {4, 3, 2, 1, 0};
+    print("isSortedAsc ascending: ");
+    print(isSortedAsc(#ascending[0], 5));
+    print(" descending: ");
+    print(isSortedAsc(#descending[0], 5));
+    print(" single: ");
+    print(isSortedAsc(#ascending[0], 1));
+    print(" empty: ");
+    print(isSortedAsc(0 as ptr int, 0));
+    print("\n");
+
+    int same[5] = {1, 2, 2, 3, 4};
+    int different[5] = {1, 2, 3, 3, 4};
+    print("equalInts same: ");
+    print(equalInts(#ascending[0], 5, #same[0], 5));
+    print(" different: ");
+    print(equalInts(#ascending[0], 5, #different[0], 5));
+    print(" empty: ");
+    print(equalInts(0 as ptr int, 0, 0 as ptr int, 0));
+    print("\n");
+
+    print("empty min/max/find/count: ");
+    print(minIndex(0 as ptr int, 0));
+    print(" ");
+    print(maxIndex(0 as ptr int, 0));
+    print(" ");
+    print(findInt(0 as ptr int, 0, 1));
+    print(" ");
+    print(countInt(0 as ptr int, 0, 1));
+    print("\n");
+    eof: pass;
+}
+
+// ─── heap ──────────────────────────────────────────────────────────────────
+
+function private checkHeap():void {
+    int data[10] = {0};
+    fill(#data[0], 10, 13131u32);
+
+    makeHeap(#data[0], 10);
+    print("makeHeap isHeap: ");
+    print(isHeap(#data[0], 10));
+    print("\n");
+    show("heap", #data[0], 10);
+
+    //  Append a larger element than everything present, then restore.
+    int grown[11] = {0};
+    for (int i = 0; i < 10; i++) {
+        @(#grown[0] + i) = @(#data[0] + i);
+    }
+    @(#grown[0] + 10) = 1000;
+    pushHeap(#grown[0], 11);
+    print("pushHeap isHeap: ");
+    print(isHeap(#grown[0], 11));
+    print(" root: ");
+    print(@#grown[0]);
+    print("\n");
+
+    //  Smallest possible push: the root must not change.
+    int tiny[11] = {0};
+    for (int i = 0; i < 10; i++) {
+        @(#tiny[0] + i) = @(#data[0] + i);
+    }
+    @(#tiny[0] + 10) = -1000;
+    pushHeap(#tiny[0], 11);
+    print("pushHeap small root: ");
+    print(@#tiny[0]);
+    print(" isHeap: ");
+    print(isHeap(#tiny[0], 11));
+    print("\n");
+
+    //  Repeatedly popping must yield a descending sequence: that is the property
+    //  a priority queue relies on, and it does not depend on the heap layout.
+    int queue[10] = {0};
+    for (int i = 0; i < 10; i++) {
+        @(#queue[0] + i) = @(#data[0] + i);
+    }
+    print("popHeap order:");
+    for (int remaining = 10; remaining > 0; remaining--) {
+        popHeap(#queue[0], remaining);
+        print(" ");
+        print(@(#queue[0] + remaining - 1));
+    }
+    print("\n");
+
+    // A null pointer is only meaningful with a zero count; a null with a
+    // non-zero count is a genuine null dereference and is left untested here.
+    print("empty heap: ");
+    print(isHeap(0 as ptr int, 0));
+    print("\n");
+
+    int trivia[1] = {5};
+    print("single heap: ");
+    print(isHeap(#trivia[0], 1));
+    print("\n");
+    eof: pass;
+}
+
+// ─── additions: set operations, heap sorting, selection, statistics ────────
+
+function private checkSets():void {
+    int A[5] = {1, 3, 5, 7, 9};
+    int B[4] = {3, 4, 5, 8};
+    int out[12] = {0};
+
+    int n = intersectSorted(#out[0], 12, #A[0], 5, #B[0], 4);
+    print("intersect: ");
+    print(n);
+    show("", #out[0], n);
+
+    n = unionSorted(#out[0], 12, #A[0], 5, #B[0], 4);
+    print("union: ");
+    print(n);
+    show("", #out[0], n);
+
+    n = differenceSorted(#out[0], 12, #A[0], 5, #B[0], 4);
+    print("difference: ");
+    print(n);
+    show("", #out[0], n);
+
+    //  Disjoint, identical, empty.
+    int C[3] = {2, 4, 6};
+    n = intersectSorted(#out[0], 12, #A[0], 5, #C[0], 3);
+    print("intersect disjoint: ");
+    print(n);
+    print("\n");
+
+    n = unionSorted(#out[0], 12, #A[0], 5, #A[0], 5);
+    print("union identical: ");
+    print(n);
+    show("", #out[0], n);
+
+    n = differenceSorted(#out[0], 12, #A[0], 5, #B[0], 0);
+    print("difference empty: ");
+    print(n);
+    show("", #out[0], n);
+
+    //  Capacity too small must report -1, not overflow.
+    print("intersect narrow: ");
+    print(intersectSorted(#out[0], 1, #A[0], 5, #B[0], 4));
+    print("\n");
+    eof: pass;
+}
+
+function private checkHeapSorting():void {
+    int data[9] = {5, 3, 9, 1, 7, 2, 8, 6, 4};
+    int work[9] = {0};
+
+    clone(#work[0], #data[0], 9);
+    heapSort(#work[0], 9);
+    show("heapSort", #work[0], 9);
+    print("heapSort sorted: ");
+    print(isSortedAsc(#work[0], 9));
+    print("\n");
+
+    //  k largest end up in the tail, ascending.
+    clone(#work[0], #data[0], 9);
+    int moved = topK(#work[0], 9, 3);
+    print("topK moved: ");
+    print(moved);
+    show("  tail", #work[0] + 6, 3);
+
+    //  partialSort puts the k smallest at the front, sorted.
+    clone(#work[0], #data[0], 9);
+    int sortedPrefix = partialSort(#work[0], 9, 4);
+    print("partialSort: ");
+    print(sortedPrefix);
+    show("  head", #work[0], 4);
+
+    //  k >= count degenerates to a full sort; k == 0 does nothing.
+    clone(#work[0], #data[0], 9);
+    print("partialSort all: ");
+    print(partialSort(#work[0], 9, 9));
+    show("", #work[0], 9);
+
+    clone(#work[0], #data[0], 9);
+    topK(#work[0], 9, 0);
+    print("topK 0 untouched: ");
+    print(equalInts(#work[0], 9, #data[0], 9));
+    print("\n");
+    eof: pass;
+}
+
+function private checkNewQueries():void {
+    int data[7] = {4, 8, 1, 8, 9, 8, 2};
+
+    print("findLastInt(8): ");
+    print(findLastInt(#data[0], 7, 8));
+    print(" findInt(8): ");
+    print(findInt(#data[0], 7, 8));
+    print(" findLastInt(5): ");
+    print(findLastInt(#data[0], 7, 5));
+    print("\n");
+
+    int ascending[5] = {1, 2, 2, 3, 4};
+    int descending[5] = {4, 3, 2, 1, 0};
+    print("isSortedDesc asc/desc/single/empty: ");
+    print(isSortedDesc(#ascending[0], 5));
+    print(" ");
+    print(isSortedDesc(#descending[0], 5));
+    print(" ");
+    print(isSortedDesc(#ascending[0], 1));
+    print(" ");
+    print(isSortedDesc(0 as ptr int, 0));
+    print("\n");
+
+    int mm[4] = {0, 0, 0, 0};
+    int rc = minMax(#mm[0], 4, #data[0], 7);
+    print("minMax rc: ");
+    print(rc);
+    print(" min/max/atMin/atMax: ");
+    print(@(#mm[0] + 0));
+    print(" ");
+    print(@(#mm[0] + 1));
+    print(" ");
+    print(@(#mm[0] + 2));
+    print(" ");
+    print(@(#mm[0] + 3));
+    print("\n");
+
+    int tiny[2] = {0, 0};
+    print("minMax too small: ");
+    print(minMax(#tiny[0], 2, #data[0], 7));
+    print(" empty: ");
+    print(minMax(#mm[0], 4, 0 as ptr int, 0));
+    print("\n");
+    eof: pass;
+}
+
+function private checkRemoveAndPercentile():void {
+    int data[8] = {1, 2, 2, 3, 5, 5, 5, 8};
+    int work[8] = {0};
+
+    clone(#work[0], #data[0], 8);
+    int kept = removeValue(#work[0], 8, 5);
+    print("removeValue(5): ");
+    print(kept);
+    show("", #work[0], kept);
+
+    clone(#work[0], #data[0], 8);
+    print("removeValue(absent): ");
+    print(removeValue(#work[0], 8, 42));
+    print("\n");
+
+    print("percentileSorted:");
+    for (int p = 0; p <= 100; p = p + 25) {
+        print(" ");
+        print(percentileSorted(#data[0], 8, p));
+    }
+    print("\n");
+
+    //  Clamping: out-of-range percentiles land on the ends.
+    print("percentile -10 / 200: ");
+    print(percentileSorted(#data[0], 8, -10));
+    print(" ");
+    print(percentileSorted(#data[0], 8, 200));
+    print("\n");
+
+    int one[1] = {7};
+    print("percentile single: ");
+    print(percentileSorted(#one[0], 1, 50));
+    print("\n");
+    eof: pass;
+}
+
+function private checkVariance():void {
+    //  mean 5, population variance 4: the textbook case.
+    int data[8] = {2, 4, 4, 4, 5, 5, 7, 9};
+    double stats[2] = {0.0, 0.0};
+    int rc = variance(#stats[0], 2, #data[0], 8);
+    print("variance rc: ");
+    print(rc);
+    print(" mean: ");
+    print(@(#stats[0] + 0));
+    print(" var: ");
+    print(@(#stats[0] + 1));
+    print("\n");
+
+    //  Constant input has zero variance.
+    int flat[4] = {3, 3, 3, 3};
+    variance(#stats[0], 2, #flat[0], 4);
+    print("flat mean/var: ");
+    print(@(#stats[0] + 0));
+    print(" ");
+    print(@(#stats[0] + 1));
+    print("\n");
+
+    double narrow[1] = {0.0};
+    print("variance too small: ");
+    print(variance(#narrow[0], 1, #data[0], 8));
+    print("\n");
+    eof: pass;
+}
+
+
+// ─── string sorting ────────────────────────────────────────────────────────
+//
+//  `sortStrings` is pure Axiom only (a native sort cannot read string contents),
+//  so this is not a differential test -- there is one implementation. It is checked
+//  against a reference insertion sort instead, over randomized input, plus the
+//  shapes that break naive quicksort: already sorted, reversed, all equal, and
+//  prefix chains.
+
+function private referenceSortStrings(ptr string data, int count, ptr string out):void {
+    for (int i = 0; i < count; i++) {
+        @(out + i) = @(data + i);
+    }
+    for (int i = 1; i < count; i++) {
+        string key = @(out + i);
+        int j = i - 1;
+        bool placed = false;
+        while (j >= 0 && !placed) {
+            if (@(out + j) > key) {
+                @(out + j + 1) = @(out + j);
+                j = j - 1;
+            } else {
+                placed = true;
+            }
+        }
+        @(out + j + 1) = key;
+    }
+    eof: pass;
+}
+
+function private printStrings(string label, ptr string data, int count):void {
+    print(label); print(" [");
+    for (int i = 0; i < count; i++) {
+        print(@(data + i)); print(" ");
+    }
+    print("] sorted="); print(isSortedStrings(data, count)); print("\n");
+    eof: pass;
+}
+
+function checkStringSorting():void {
+    string asc[5] = {"alpha", "bravo", "charlie", "delta", "echo"};
+    printStrings("stsort asc     ", #asc[0], 5);
+
+    string desc[5] = {"echo", "delta", "charlie", "bravo", "alpha"};
+    sortStrings(#desc[0], 5);
+    printStrings("stsort desc    ", #desc[0], 5);
+
+    string equal[4] = {"same", "same", "same", "same"};
+    sortStrings(#equal[0], 4);
+    printStrings("stsort equal   ", #equal[0], 4);
+
+    string prefix[5] = {"abcd", "ab", "abc", "a", ""};
+    sortStrings(#prefix[0], 5);
+    printStrings("stsort prefix  ", #prefix[0], 5);
+
+    string single[1] = {"only"};
+    sortStrings(#single[0], 1);
+    printStrings("stsort single  ", #single[0], 1);
+
+    //  Empty range must not touch memory.
+    string empty[1] = {"untouched"};
+    sortStrings(#empty[0], 0);
+    printStrings("stsort empty   ", #empty[0], 1);
+
+    //  Numbers as text sort lexicographically, not numerically: "10" < "2".
+    string numeric[4] = {"10", "2", "1", "20"};
+    sortStrings(#numeric[0], 4);
+    printStrings("stsort numeric ", #numeric[0], 4);
+
+    //  Randomized agreement with the reference implementation, sizes large enough
+    //  to exercise the quicksort path rather than the insertion tail.
+    comptime int CAP = 200;
+    string src[CAP];
+    string mine[CAP];
+    string ref[CAP];
+    unsigned int seed = 987654321u32;
+    int failures = 0;
+    for (int round = 0; round < 40; round++) {
+        seed = seed * 1103515245u32 + 12345u32;
+        int n = ((seed >> 13) & 255u32) as int;
+        if (n > CAP) {
+            n = CAP;
+        }
+        for (int i = 0; i < n; i++) {
+            seed = seed * 1103515245u32 + 12345u32;
+            int64 raw = (seed >> 8) as int64;
+            string value = itoa((raw % 997i64) as int + 1000, 10);
+            @(#src[0] + i) = value;
+            @(#mine[0] + i) = value;
+        }
+        sortStrings(#mine[0], n);
+        referenceSortStrings(#src[0], n, #ref[0]);
+        bool ok = isSortedStrings(#mine[0], n);
+        for (int i = 0; i < n; i++) {
+            if (!(@(#mine[0] + i) == @(#ref[0] + i))) {
+                ok = false;
+            }
+        }
+        if (!ok) {
+            failures = failures + 1;
+        }
+    }
+    print("stsort fuzz failures="); print(failures); print("\n");
+    eof: pass;
+}
+
+function main():void {
+    checkSearch();
+    checkSelection();
+    checkSequence();
+    checkQueries();
+    checkHeap();
+    checkSets();
+    checkHeapSorting();
+    checkNewQueries();
+    checkRemoveAndPercentile();
+    checkVariance();
+    checkStringSorting();
+    print("done\n");
+    eof: pass;
+}

@@ -1,0 +1,213 @@
+//  test.ax — assertions and a summary, so tests need not print and eyeball results.
+//
+//      function import (return:(test));
+//
+//      function main():void {
+//          checkInt(Add(2, 3), 5, "2+3");
+//          checkString(join(...), "a,b", "join");
+//          testFinish();          // print the summary; trap if anything failed (exit 1)
+//          eof: pass;
+//      }
+//
+//  Output looks like:
+//
+//      [PASS] 2+3
+//      [FAIL] join: expected [a,b], got [a,b,]
+//      == 1 passed, 1 failed ==
+//
+//  ── why not just `assert` ─────────────────────────────────────────────────
+//
+//  `assert` is a builtin that traps on failure: the process stops there and every
+//  later assertion is skipped. What a test run wants is "how many broke, and
+//  which", so this records and continues instead, summarizing once at the end.
+//
+//  ── exit code ─────────────────────────────────────────────────────────────
+//
+//  `testFinish` calls `trap()` when anything failed, so the exit code is 1 and CI
+//  and `ctest` read the result directly instead of parsing output text. The price
+//  is one extra stderr line: `runtime error: explicit trap()`. Expected, not a bug.
+//
+//  For the summary alone use `testEnd()`: it returns the failure count, no trap.
+//
+//  ── state is global ───────────────────────────────────────────────────────
+//
+//  Counts are `global`. A library avoids this -- a flat scope pollutes importers -- but
+//  a test script is a program, not a library, and the `Test` prefix keeps names apart.
+
+module "test" version "0.1.0";
+
+global int TestPassed = 0;
+global int TestFailed = 0;
+
+// ─── recording ─────────────────────────────────────────────────────────────
+
+//  Prints a section header. Purely cosmetic: it makes a long test log readable.
+function testGroup(string name):void {
+    print("-- " + name + " --\n");
+    eof: pass;
+}
+
+//  Marks the current test as failed without comparing anything. Use it for the
+//  "should never happen" branches, where the condition itself is the assertion.
+function fail(string name):void {
+    TestFailed = TestFailed + 1;
+    print("[FAIL] " + name + "\n");
+    eof: pass;
+}
+
+//  Marks it as passed. Exposed so a check that needs custom formatting can still
+//  report through the same counters.
+function recordPass(string name):void {
+    TestPassed = TestPassed + 1;
+    print("[PASS] " + name + "\n");
+    eof: pass;
+}
+
+// ─── assertions ────────────────────────────────────────────────────────────
+
+//  The base check: everything else reports through this.
+function check(bool condition, string name):void {
+    if (condition) {
+        recordPass(name);
+    } else {
+        fail(name);
+    }
+    eof: pass;
+}
+
+//  Asserts `actual == expected`. Reports `[PASS] name` or
+//  `[FAIL] name: expected E, got A` and bumps the matching global counter.
+//
+//  Argument order is `(actual, expected, name)` -- the reverse of the wording
+//  "expected E, got A" that the failure message prints, so a swapped call is
+//  invisible until the assertion fails with the two values exchanged.
+function checkInt(int actual, int expected, string name):void {
+    if (actual == expected) {
+        recordPass(name);
+        return;
+    }
+    TestFailed = TestFailed + 1;
+    print("[FAIL] " + name + ": expected " + itoa(expected, 10) +
+          ", got " + itoa(actual, 10) + "\n");
+    eof: pass;
+}
+
+//  Asserts `actual == expected` for `int64`. Same argument order and reporting
+//  as `checkInt`; exists because `itoa` takes `int` and comparing through a
+//  narrowing cast would hide a difference above 2^31.
+function checkInt64(int64 actual, int64 expected, string name):void {
+    if (actual == expected) {
+        recordPass(name);
+        return;
+    }
+    TestFailed = TestFailed + 1;
+    print("[FAIL] " + name + ": expected " + itoa(expected, 10) +
+          ", got " + itoa(actual, 10) + "\n");
+    eof: pass;
+}
+
+//  Asserts `actual == expected` for `int128`. Same argument order and reporting as
+//  `checkInt`. `itoa` formats any integer width, so no cast is needed on either
+//  side -- a narrowing cast here would hide exactly the difference a 128-bit value
+//  is used to detect.
+function checkInt128(int128 actual, int128 expected, string name):void {
+    if (actual == expected) {
+        recordPass(name);
+        return;
+    }
+    TestFailed = TestFailed + 1;
+    print("[FAIL] " + name + ": expected " + itoa(expected, 10) +
+          ", got " + itoa(actual, 10) + "\n");
+    eof: pass;
+}
+
+//  Compares strings by content. Marks both sides with brackets so a stray space
+//  or a missing trailing newline is visible in the log.
+function checkString(string actual, string expected, string name):void {
+    if (actual == expected) {
+        recordPass(name);
+        return;
+    }
+    TestFailed = TestFailed + 1;
+    print("[FAIL] " + name + ": expected [" + expected + "], got [" + actual + "]\n");
+    eof: pass;
+}
+
+//  `fabs` is a builtin (the libm set), so a tolerance check needs no hand-written abs.
+function checkNear(double actual, double expected, double tolerance, string name):void {
+    if (fabs(actual - expected) <= tolerance) {
+        recordPass(name);
+        return;
+    }
+    TestFailed = TestFailed + 1;
+    print("[FAIL] " + name + ": expected " + ftoa(expected) + " ±" + ftoa(tolerance) +
+          ", got " + ftoa(actual) + "\n");
+    eof: pass;
+}
+
+//  Element-wise array comparison. Reports the first differing index, because
+//  "arrays differ" alone sends the reader hunting.
+function checkInts(ptr int actual, ptr int expected, int count, string name):void {
+    for (int i = 0; i < count; i++) {
+        int want = @(expected + i);
+        int got = @(actual + i);
+        if (want != got) {
+            TestFailed = TestFailed + 1;
+            print("[FAIL] " + name + ": at index " + itoa(i, 10) +
+                  " expected " + itoa(want, 10) + ", got " + itoa(got, 10) + "\n");
+            return;
+        }
+    }
+    recordPass(name);
+    eof: pass;
+}
+
+//  True when `haystack` contains `needle`.
+function checkContains(string haystack, string needle, string name):void {
+    if (indexOf(haystack, needle) >= 0) {
+        recordPass(name);
+        return;
+    }
+    TestFailed = TestFailed + 1;
+    print("[FAIL] " + name + ": [" + haystack + "] does not contain [" + needle + "]\n");
+    eof: pass;
+}
+
+//  Empty-string assertion. `split` / `trim` results often need exactly this one.
+function checkEmpty(string actual, string name):void {
+    checkString(actual, "", name);
+    eof: pass;
+}
+
+// ─── summary ───────────────────────────────────────────────────────────────
+
+function testCountPassed():int {
+    return TestPassed;
+    eof: pass;
+}
+
+//  Failures so far, across all groups. The counter is global and never reset by
+//  `testGroup`, so this is the whole-run total, not the current group's.
+function testCountFailed():int {
+    return TestFailed;
+    eof: pass;
+}
+
+//  Prints the summary and returns the failure count. Does not trap, so a caller
+//  can do its own teardown first.
+function testEnd():int {
+    print("== " + itoa(TestPassed, 10) + " passed, " + itoa(TestFailed, 10) + " failed ==\n");
+    return TestFailed;
+    eof: pass;
+}
+
+//  Prints the summary and traps when anything failed, so the process exits 1.
+//  This is what a test script should end with.
+function testFinish():void {
+    int failures = testEnd();
+    if (failures > 0) {
+        // One stderr line is expected: trap is the only way to change the exit code.
+        trap();
+    }
+    eof: pass;
+}

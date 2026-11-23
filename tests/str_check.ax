@@ -1,0 +1,162 @@
+//  str_check.ax -- the str module: splitting, joining, replacing, UTF-8 boundaries.
+//
+//  Written against the assertion framework in test.ax, so failures accumulate and are
+//  summarised instead of stopping at the first one.
+
+function import (return:(str));
+function import (return:(test));
+
+function private splitText(string text, string sep):string {
+    SplitList parts = makeSplit(text, sep);
+    string out = joinList(#parts, "|");
+    splitFree(#parts);
+    return out;
+    eof: pass;
+}
+
+function private countFields(string text, string sep):int {
+    SplitList parts = makeSplit(text, sep);
+    int n = splitCount(#parts);
+    splitFree(#parts);
+    return n;
+    eof: pass;
+}
+
+function private checkSplitting():void {
+    testGroup("split");
+
+    checkInt(countFields("a,b,c", ","), 3, "three fields");
+    checkString(splitText("a,b,c", ","), "a|b|c", "content");
+
+    //  Empty leading and trailing fields are kept -- required for CSV, or columns shift.
+    checkInt(countFields("a,b,", ","), 3, "trailing empty kept");
+    checkString(splitText("a,b,", ","), "a|b|", "trailing content");
+    checkInt(countFields(",a", ","), 2, "leading empty kept");
+    checkString(splitText(",a", ","), "|a", "leading content");
+
+    //  Splitting an empty string gives "one empty field", not "zero fields".
+    checkInt(countFields("", ","), 1, "empty text is one empty field");
+    checkString(splitText("", ","), "", "empty text content");
+
+    //  An empty separator does not split: one item, avoiding an infinite loop.
+    checkInt(countFields("abc", ""), 1, "empty separator yields one item");
+    checkString(splitText("abc", ""), "abc", "empty separator content");
+
+    //  A multi-byte separator over multi-byte content.
+    checkString(splitText("a::b::c", "::"), "a|b|c", "multi-byte separator");
+    checkString(splitText("中,文", ","), "中|文", "multibyte fields");
+
+    //  Out-of-range access returns an empty string, not a crash.
+    SplitList one = makeSplit("solo", ",");
+    checkString(splitAt(#one, 5), "", "splitAt out of range");
+    checkString(splitAt(#one, -1), "", "splitAt negative");
+    splitFree(#one);
+    eof: pass;
+}
+
+function private checkJoining():void {
+    testGroup("join");
+
+    string words[3] = {"a", "b", "c"};
+    checkString(join(#words[0], 3, "-"), "a-b-c", "join three");
+    checkString(join(#words[0], 1, "-"), "a", "join one");
+    checkString(join(#words[0], 0, "-"), "", "join zero");
+    checkString(join(#words[0], 3, ""), "abc", "join with empty separator");
+
+    //  Round trip: split then join must reproduce the input, when no separators repeat.
+    string original = "x,y,z";
+    checkString(splitText(original, ","), "x|y|z", "round trip intermediate");
+    SplitList parts = makeSplit(original, ",");
+    checkString(joinList(#parts, ","), original, "split then join");
+    splitFree(#parts);
+    eof: pass;
+}
+
+function private checkReplacing():void {
+    testGroup("replace");
+
+    checkString(replace("a-b-c", "-", "+"), "a+b-c", "replace first only");
+    checkString(replaceAll("a-b-c", "-", "+"), "a+b+c", "replace all");
+    checkString(replaceAll("aaaa", "aa", "b"), "bb", "non-overlapping");
+    checkString(replace("abc", "", "X"), "abc", "empty needle is a no-op");
+    checkString(replaceAll("abc", "", "X"), "abc", "empty needle all is a no-op");
+    checkString(replaceAll("abc", "z", "X"), "abc", "absent needle");
+    checkString(replaceAll("a", "a", ""), "", "replace with empty");
+    checkString(replaceAll("中中", "中", "文"), "文文", "multibyte replace");
+
+    checkString(repeat("ab", 3), "ababab", "repeat");
+    checkString(repeat("ab", 0), "", "repeat zero");
+    checkString(repeat("ab", -2), "", "repeat negative");
+
+    checkInt(countOf("a,b,,c", ","), 3, "count commas");
+    checkInt(countOf("abc", ""), 0, "count with empty needle");
+    checkInt(countOf("aaaa", "aa"), 2, "count non-overlapping");
+    eof: pass;
+}
+
+function private checkUtf8():void {
+    testGroup("utf-8");
+
+    //  "a<CJK>b" is 5 bytes but 3 characters; that difference is why these functions exist.
+    string mixed = "a中b";
+    checkInt(mixed.length, 5, "length is bytes");
+    checkInt(utf8CharCount(mixed), 3, "char count");
+    checkInt(utf8CharCount("hello"), 5, "ascii char count");
+    checkInt(utf8CharCount(""), 0, "empty char count");
+    checkInt(utf8CharCount("中文"), 2, "two cjk chars");
+
+    //  Character index to byte offset: 'a' at 0, the CJK char at 1, 'b' at 4, end at 5.
+    checkInt(utf8ByteOffset(mixed, 0), 0, "offset of char 0");
+    checkInt(utf8ByteOffset(mixed, 1), 1, "offset of char 1");
+    checkInt(utf8ByteOffset(mixed, 2), 4, "offset of char 2");
+    checkInt(utf8ByteOffset(mixed, 3), 5, "offset past end clamps");
+    checkInt(utf8ByteOffset(mixed, 99), 5, "far past end clamps");
+    checkInt(utf8ByteOffset(mixed, -1), 0, "negative clamps");
+
+    checkString(utf8Slice(mixed, 1, 2), "中", "slice middle char");
+    checkString(utf8Slice(mixed, 0, 2), "a中", "slice two chars");
+    checkString(utf8Slice(mixed, 2, 3), "b", "slice last char");
+    checkString(utf8Slice(mixed, 1, 99), "中b", "slice clamps end");
+    checkString(utf8Slice(mixed, 2, 1), "", "backwards slice is empty");
+    checkString(utf8Slice("", 0, 1), "", "slice empty");
+
+    check(utf8IsAscii("hello"), "ascii true");
+    check(!utf8IsAscii("café"), "ascii false");
+
+    //  Display width is an approximation: 1 for ASCII, 2 for anything else.
+    checkInt(utf8DisplayWidth("hello"), 5, "width ascii");
+    checkInt(utf8DisplayWidth(mixed), 4, "width mixed");
+    eof: pass;
+}
+
+function private checkAffixes():void {
+    testGroup("prefix and suffix");
+
+    checkString(trimPrefix("res/abc.png", "res/"), "abc.png", "trim prefix");
+    checkString(trimPrefix("abc.png", "res/"), "abc.png", "absent prefix");
+    checkString(trimPrefix("abc", ""), "abc", "empty prefix");
+    checkString(trimPrefix("ab", "abc"), "ab", "prefix longer than text");
+
+    checkString(trimSuffix("abc.png", ".png"), "abc", "trim suffix");
+    checkString(trimSuffix("abc.png", ".jpg"), "abc.png", "absent suffix");
+    checkString(trimSuffix("abc", ""), "abc", "empty suffix");
+    checkString(trimSuffix("ab", "cab"), "ab", "suffix longer than text");
+
+    checkString(afterPrefix("k=v", "k=", "none"), "v", "after prefix hit");
+    checkString(afterPrefix("x=v", "k=", "none"), "none", "after prefix miss");
+
+    checkString(collapseRuns("a,,,b,,c", ","), "a,b,c", "collapse runs");
+    checkString(collapseRuns("abc", ","), "abc", "collapse no runs");
+    checkString(collapseRuns("", ","), "", "collapse empty");
+    eof: pass;
+}
+
+function main():void {
+    checkSplitting();
+    checkJoining();
+    checkReplacing();
+    checkUtf8();
+    checkAffixes();
+    testFinish();
+    eof: pass;
+}

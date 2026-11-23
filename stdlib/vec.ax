@@ -1,0 +1,410 @@
+//  vec.ax — ASTL's lowest-level container: a growable array addressed by byte.
+//
+//      function import (return:(vec));
+//
+//      int store[8] = {0};
+//      Vec v = vecInit(#store[0], 8, sizeof(int));
+//      vecPushInt(#v, 42);
+//      print(vecGetInt(#v, 0));         // 42
+//
+//  ── why "by byte" and not "by type" ───────────────────────────────────────
+//
+//  "One Vec for all element types" uses a **byte view**: a `ptr int8` plus the element
+//  size, with a `memcpy` of `elemSize` bytes per access -- address in, address out.
+//
+//  Generic functions work; **generic structs** do not, so `Vec<T>`,
+//  a type that carries a parameter, still cannot be written. Even if it could, leaving
+//  it byte-addressed is right: a container only moves `elemSize` bytes and never needs to
+//  know T, and generics would only split one implementation per type. What really wants
+//  generics -- sorting, searching -- is already generic in `algorithm`.
+//
+//  The price is type safety: `vecAt` returns `ptr char`, and the caller casts it itself.
+//
+//  The direct benefit of this design: `Vec` need not know what an element is, so one
+//  implementation serves `int` and `struct` alike, without copying code per type.
+//
+//  ── memory: borrow first, own later ───────────────────────────────────────
+//
+//  By default it uses a caller-provided buffer (a stack array: no allocation, no leak
+//  risk). When capacity runs out, `vecPush` tries `alloc` for a larger block and moves
+//  the old data over; from then on the `Vec` **owns** it and `vecFree` releases the block.
+//
+//  "Borrow -> own" is the only reason `owned` exists: a stack array cannot be `free`d and
+//  heap memory must be, so without the distinction the first growth frees a stack address.
+//
+//  ── must be paired ────────────────────────────────────────────────────────
+//
+//  Any Vec that has ever grown must get one `vecFree` at the end. Forget it and you
+//  have a leak, proportional to the data size. To avoid the question entirely: give it
+//  enough capacity that it never grows -- `owned` stays false and `vecFree` does nothing.
+
+module "vec" version "0.1.0";
+
+comptime int VEC_MIN_CAPACITY = 4;
+
+struct Vec {
+    /// Element storage. Addressed by byte, hence `ptr int8` and not `ptr char`
+    /// (the latter has a stride of 2 bytes, which misaligns odd-sized elements).
+    ptr int8 data;
+    int count;
+    int capacity;
+    int elemSize;
+    /// When true, `data` comes from `alloc` and `vecFree` releases it; when false it is
+    /// the caller's buffer and `vecFree` only zeroes the struct.
+    bool owned;
+};
+
+// ─── lifecycle ─────────────────────────────────────────────────────────────
+
+//  Builds a vector over a caller-owned buffer and returns it by value. This is
+//  the form to use at the declaration site; `vecInit` exists for the case where
+//  the header already lives somewhere (a struct field, an array element).
+//
+//      int store[16] = {0};
+//      Vec v = makeVec(#store[0], 16, sizeof(int));
+function makeVec(ptr char buffer, int capacity, int elemSize):Vec {
+    Vec v = {buffer as ptr int8, 0, capacity, elemSize, false};
+    return v;
+    eof: pass;
+}
+
+//  Same, for an `int` array: the element size is implied. This overload exists
+//  because `#arr[0]` is a `ptr int`, and requiring a cast for the most common
+//  element type would be noise at every call site.
+//
+//      int store[16] = {0};
+//      Vec v = makeVec(#store[0], 16);
+function makeVec(ptr int buffer, int capacity):Vec {
+    Vec v = {buffer as ptr int8, 0, capacity, sizeof(int), false};
+    return v;
+    eof: pass;
+}
+
+//  Builds a vector with its own heap storage. On failure the returned vector has
+//  `data == null` and `capacity == 0`; every operation tolerates that state, so
+//  checking `v.data` is enough to detect it.
+function makeVecHeap(int capacity, int elemSize):Vec {
+    Vec v = {0 as ptr int8, 0, 0, 0, false};
+    if (capacity <= 0 || elemSize <= 0) {
+        return v;
+    }
+    ptr int8 block = alloc(capacity * elemSize) as ptr int8;
+    if (block == 0 as ptr int8) {
+        return v;
+    }
+    v.data = block;
+    v.capacity = capacity;
+    v.elemSize = elemSize;
+    v.owned = true;
+    return v;
+    eof: pass;
+}
+
+//  Binds `v` to a caller-owned buffer. `capacity` and `elemSize` are both in
+//  bytes-worth-of-one-element terms: `capacity` counts elements, `elemSize` is
+//  the byte size of one element. Nothing is allocated, so there is nothing to
+//  free unless the vector later grows.
+function vecInit(ptr Vec v, ptr char buffer, int capacity, int elemSize):void {
+    v->data = buffer as ptr int8;
+    v->count = 0;
+    v->capacity = capacity;
+    v->elemSize = elemSize;
+    v->owned = false;
+    eof: pass;
+}
+
+//  Creates a vector with its own heap storage. Returns false when the allocation
+//  cannot be honoured (zero or negative capacity, or a bad element size).
+function vecInitHeap(ptr Vec v, int capacity, int elemSize):bool {
+    if (capacity <= 0 || elemSize <= 0) {
+        return false;
+    }
+    ptr int8 block = alloc(capacity * elemSize) as ptr int8;
+    if (block == 0 as ptr int8) {
+        return false;
+    }
+    v->data = block;
+    v->count = 0;
+    v->capacity = capacity;
+    v->elemSize = elemSize;
+    v->owned = true;
+    return true;
+    eof: pass;
+}
+
+//  Like `makeVecHeap`, but the block is zeroed first.
+//
+//  Needed by anything that uses the vector as a **fixed slot array** rather than
+//  a growable list: `alloc` returns uninitialised memory, so a table that treats
+//  "slot state == 0" as empty would see garbage states and read garbage keys.
+//  Cost is one memset over the block, which is negligible next to the allocation.
+function makeVecHeapZero(int capacity, int elemSize):Vec {
+    Vec v = {0 as ptr int8, 0, 0, 0, false};
+    if (capacity <= 0 || elemSize <= 0) {
+        return v;
+    }
+    ptr int8 block = alloc0(capacity * elemSize) as ptr int8;
+    if (block == 0 as ptr int8) {
+        return v;
+    }
+    v.data = block;
+    v.count = capacity;
+    v.capacity = capacity;
+    v.elemSize = elemSize;
+    v.owned = true;
+    return v;
+    eof: pass;
+}
+
+//  Releases the storage if this vector owns it, then clears the header so a
+//  double free cannot happen. Safe to call on a borrowed vector: it releases
+//  nothing and only resets the fields.
+function vecFree(ptr Vec v):void {
+    if (v->owned && v->data != 0 as ptr int8) {
+        free(v->data);
+    }
+    v->data = 0 as ptr int8;
+    v->count = 0;
+    v->capacity = 0;
+    v->owned = false;
+    eof: pass;
+}
+
+// ─── capacity ──────────────────────────────────────────────────────────────
+
+//  Ensures room for at least `minCapacity` elements, growing by doubling.
+//
+//  A borrowed buffer is *promoted*: a heap block is allocated, the elements are
+//  copied, and `owned` becomes true. The old buffer is left untouched (it was
+//  never ours to free), so the caller's array still holds the original data and
+//  is simply no longer used by this vector.
+//
+//  Returns false when `minCapacity` cannot be reached, in which case the vector
+//  is unchanged and the caller must cope with the original capacity.
+function vecReserve(ptr Vec v, int minCapacity):bool {
+    if (minCapacity <= v->capacity) {
+        return true;
+    }
+    if (v->elemSize <= 0) {
+        return false;
+    }
+
+    int grown = v->capacity * 2;
+    if (grown < minCapacity) {
+        grown = minCapacity;
+    }
+    if (grown < VEC_MIN_CAPACITY) {
+        grown = VEC_MIN_CAPACITY;
+    }
+
+    ptr int8 fresh = alloc(grown * v->elemSize) as ptr int8;
+    if (fresh == 0 as ptr int8) {
+        return false;
+    }
+    if (v->count > 0 && v->data != 0 as ptr int8) {
+        memcpy(fresh, v->data, v->count * v->elemSize);
+    }
+    // Only release what we allocated. A borrowed buffer belongs to the caller.
+    if (v->owned && v->data != 0 as ptr int8) {
+        free(v->data);
+    }
+    v->data = fresh;
+    v->capacity = grown;
+    v->owned = true;
+    return true;
+    eof: pass;
+}
+
+// ─── element access ────────────────────────────────────────────────────────
+
+//  Address of element `index`, or a null pointer when it is out of range.
+//  The caller decides what the bytes mean:
+//
+//      int value = @(vecAt(#v, 0) as ptr int);
+function vecAt(ptr Vec v, int index):ptr char {
+    if (index < 0 || index >= v->count || v->elemSize <= 0) {
+        return 0 as ptr char;
+    }
+    return (v->data + index * v->elemSize) as ptr char;
+    eof: pass;
+}
+
+//  Appends a copy of `*element`. Returns false when the vector is full and could
+//  not grow, in which case nothing was written.
+function vecPush(ptr Vec v, ptr char element):bool {
+    if (v->elemSize <= 0 || element == 0 as ptr char) {
+        return false;
+    }
+    if (!vecReserve(v, v->count + 1)) {
+        return false;
+    }
+    memcpy(v->data + v->count * v->elemSize, element, v->elemSize);
+    v->count = v->count + 1;
+    return true;
+    eof: pass;
+}
+
+//  Removes the last element and copies it to `out` when `out` is not null.
+//  Returns false on an empty vector.
+function vecPop(ptr Vec v, ptr char out):bool {
+    if (v->count <= 0) {
+        return false;
+    }
+    v->count = v->count - 1;
+    if (out != 0 as ptr char) {
+        memcpy(out, v->data + v->count * v->elemSize, v->elemSize);
+    }
+    return true;
+    eof: pass;
+}
+
+//  Inserts a copy of `*element` at `index`, shifting the tail up. `index` may
+//  equal `count` (append). Returns false when the index is out of range or the
+//  vector cannot grow.
+function vecInsert(ptr Vec v, int index, ptr char element):bool {
+    if (index < 0 || index > v->count || v->elemSize <= 0) {
+        return false;
+    }
+    if (!vecReserve(v, v->count + 1)) {
+        return false;
+    }
+    // Shift [index, count) one element up. memmove, not memcpy: the ranges
+    // overlap by design.
+    const int tail = v->count - index;
+    if (tail > 0) {
+        memmove(v->data + (index + 1) * v->elemSize, v->data + index * v->elemSize,
+                tail * v->elemSize);
+    }
+    memcpy(v->data + index * v->elemSize, element, v->elemSize);
+    v->count = v->count + 1;
+    return true;
+    eof: pass;
+}
+
+//  Removes the element at `index`, shifting the tail down. Returns false when
+//  the index is out of range.
+function vecRemove(ptr Vec v, int index):bool {
+    if (index < 0 || index >= v->count || v->elemSize <= 0) {
+        return false;
+    }
+    const int tail = v->count - index - 1;
+    if (tail > 0) {
+        memmove(v->data + index * v->elemSize, v->data + (index + 1) * v->elemSize,
+                tail * v->elemSize);
+    }
+    v->count = v->count - 1;
+    return true;
+    eof: pass;
+}
+
+//  Drops every element without releasing storage: the capacity stays, so the
+//  next pushes do not reallocate.
+function vecClear(ptr Vec v):void {
+    v->count = 0;
+    eof: pass;
+}
+
+// ─── int convenience wrappers ──────────────────────────────────────────────
+//
+//  The generic API is address-based, which is verbose for the most common case.
+//  These four are the same operations with the pointer plumbing done here.
+//  A vector used through them must have `elemSize == sizeof(int)`.
+
+//  Appends one `int`. Intended for vectors created with `sizeof(int)`.
+function vecPushInt(ptr Vec v, int value):bool {
+    int slot = value;
+    return vecPush(v, #slot as ptr char);
+    eof: pass;
+}
+
+//  Reads element `index` as an `int`; returns 0 when out of range, which the
+//  caller cannot distinguish from a stored zero. Use `vecAt` when that matters.
+function vecGetInt(ptr Vec v, int index):int {
+    ptr char slot = vecAt(v, index);
+    if (slot == 0 as ptr char) {
+        return 0;
+    }
+    int value = @(slot as ptr int);
+    return value;
+    eof: pass;
+}
+
+//  Overwrites element `index` with `value`. Out-of-range writes are ignored.
+function vecSetInt(ptr Vec v, int index, int value):void {
+    ptr char slot = vecAt(v, index);
+    if (slot == 0 as ptr char) {
+        return;
+    }
+    int copy = value;
+    memcpy(slot, #copy, sizeof(int));
+    eof: pass;
+}
+
+//  Address of element `index` viewed as `ptr int`, or null when out of range.
+//  This is the form to hand to the `algorithm` library, which works on `ptr int`.
+function vecIntData(ptr Vec v):ptr int {
+    return v->data as ptr int;
+    eof: pass;
+}
+
+// ─── string convenience wrappers ───────────────────────────────────────────
+//
+//  The same four as the int ones, only the element is `string` (a 16-byte descriptor:
+//  data pointer + byte length). Requires `elemSize == sizeof(string)` beforehand.
+//
+//  **Copying the descriptor is not copying the characters.** Strings are immutable, so
+//  storing a `string`'s 16 bytes in a vector and reading them back still points at the
+//  same characters in the arena -- safe, and free. One byte view therefore holds them all.
+//
+//  The reason this group exists is practical: hand-writing it looks like
+//
+//      string s = "x";
+//      vecPush(#v, #s as ptr char);              // push
+//      string got = @(vecAt(#v, 0) as ptr string);   // fetch
+//
+//  Two casts and one address-of in two lines, plus the null case from `vecAt` to think
+//  about. The same boilerplate appeared in `str.ax` and in `map.ax`, and I hit it again
+//  writing tests (forgot `#s`, passed the first 8 bytes). Wrapping it here ends that.
+//
+//  Appends one `string`. Intended for vectors created with `sizeof(string)`.
+function vecPushStr(ptr Vec v, string value):bool {
+    return vecPush(v, #value as ptr char);
+    eof: pass;
+}
+
+//  Reads element `index` as a `string`; returns "" when out of range or when the
+//  vector's element size is not `sizeof(string)`.
+//
+//  Returns an empty string when the element size does not match instead of reading
+//  half a string of garbage -- a common mistake is a `sizeof(int)` vector read here.
+function vecGetStr(ptr Vec v, int index):string {
+    if (v->elemSize != sizeof(string)) {
+        return "";
+    }
+    ptr char slot = vecAt(v, index);
+    if (slot == 0 as ptr char) {
+        return "";
+    }
+    return @(slot as ptr string);
+    eof: pass;
+}
+
+//  Overwrites element `index`. Out-of-range writes are ignored.
+function vecSetStr(ptr Vec v, int index, string value):void {
+    if (v->elemSize != sizeof(string)) {
+        return;
+    }
+    ptr char slot = vecAt(v, index);
+    if (slot == 0 as ptr char) {
+        return;
+    }
+    @(slot as ptr string) = value;
+    eof: pass;
+}
+
+//  Base address viewed as `ptr string`, for handing to `sortStrings` /
+//  `binarySearchStrings` and the other functions that take `ptr string`.
+function vecStrData(ptr Vec v):ptr string {
+    return v->data as ptr string;
+    eof: pass;
+}

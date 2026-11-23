@@ -1,0 +1,7 @@
+//  `const ptr self` is a read-only pointer receiver: writing through it is an error.
+struct S {
+    int n;
+    function bad(const ptr self):void { self->n = 1; }
+};
+
+function main():void { pass; eof: pass; }

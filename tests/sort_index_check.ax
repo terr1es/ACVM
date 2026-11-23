@@ -1,0 +1,246 @@
+//  sort_index_check.ax -- indirect sorting (argsort): sort indices, move no elements.
+//
+//  Axiom has no function pointers, so an array of structs cannot be sorted directly.
+//  The answer is to sort an array of indices:
+//
+//      int ages[3]  = {30, 25, 35};
+//      int order[3] = {0};
+//      fillIdentity(#order[0], 3);
+//      sortIndicesByKey(#order[0], #ages[0], 3);
+//      //  now people[order[0]] is the youngest
+//
+//  Three properties are checked, each one where a lazy implementation goes wrong:
+//
+//    1. **The permutation is valid**: order must be a permutation of 0..n-1, with no
+//       duplicates and nothing dropped.
+//    2. **Stable**: elements with equal keys keep their original order -- otherwise
+//       people of the same age shuffle, and that shuffle looks like a bug in the
+//       output yet cannot be reproduced.
+//    3. **keys untouched**: order is what gets sorted; keys must not change by a byte.
+
+function import (return:(algorithm));
+function import (return:(test));
+
+//  Renders order as "a b c", so the whole permutation compares at once.
+function private render(ptr int order, int count):string {
+    string out = "";
+    for (int i = 0; i < count; i++) {
+        if (i > 0) { out = out + " "; }
+        out = out + itoa(@(order + i), 10);
+    }
+    return out;
+    eof: pass;
+}
+
+//  Whether a permutation is valid: each 0..count-1 appears exactly once.
+//  Uses marks and counting rather than sorting, so it does not depend on the code under test.
+function private isPermutation(ptr int order, int count):bool {
+    int seen[64] = {0};
+    if (count > 64) {
+        return false;       // this test only looks at small arrays
+    }
+    for (int i = 0; i < count; i++) {
+        int at = @(order + i);
+        if (at < 0 || at >= count) {
+            return false;
+        }
+        seen[at] = seen[at] + 1;
+    }
+    for (int i = 0; i < count; i++) {
+        if (seen[i] != 1) {
+            return false;
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+function private checkBasic():void {
+    testGroup("sortIndicesByKey");
+
+    int ages[3] = {30, 25, 35};
+    int order[3] = {0};
+    fillIdentity(#order[0], 3);
+    checkString(render(#order[0], 3), "0 1 2", "fillIdentity gives the identity");
+
+    sortIndicesByKey(#order[0], #ages[0], 3);
+    checkString(render(#order[0], 3), "1 0 2", "sorted by age");
+    check(isSortedByKey(#order[0], #ages[0], 3), "keys in order");
+    check(isPermutation(#order[0], 3), "still a permutation");
+
+    //  keys must be untouched: order is what gets sorted.
+    checkInt(ages[0], 30, "keys[0] untouched");
+    checkInt(ages[1], 25, "keys[1] untouched");
+    checkInt(ages[2], 35, "keys[2] untouched");
+
+    //  Input that is already ascending must not be disturbed.
+    int sorted[4] = {1, 2, 3, 4};
+    int same[4] = {0};
+    fillIdentity(#same[0], 4);
+    sortIndicesByKey(#same[0], #sorted[0], 4);
+    checkString(render(#same[0], 4), "0 1 2 3", "already sorted stays identity");
+
+    //  Descending input.
+    int down[4] = {9, 7, 5, 3};
+    int fix[4] = {0};
+    fillIdentity(#fix[0], 4);
+    sortIndicesByKey(#fix[0], #down[0], 4);
+    checkString(render(#fix[0], 4), "3 2 1 0", "descending input reverses");
+
+    //  Empty and single element are the boundaries.
+    int none[1] = {0};
+    fillIdentity(#none[0], 0);
+    sortIndicesByKey(#none[0], #none[0], 0);
+    recordPass("count 0 does not crash");
+    sortIndicesByKey(#none[0], #none[0], 1);
+    checkString(render(#none[0], 1), "0", "count 1 unchanged");
+    eof: pass;
+}
+
+function private checkStability():void {
+    testGroup("stability");
+
+    //  Only two key values, alternating. A stable sort keeps their original order.
+    int keys[6] = {1, 0, 1, 0, 1, 0};
+    int order[6] = {0};
+    fillIdentity(#order[0], 6);
+    sortIndicesByKey(#order[0], #keys[0], 6);
+
+    //  All the 0s first, ascending by original index (1 3 5), then 0 2 4.
+    checkString(render(#order[0], 6), "1 3 5 0 2 4", "equal keys keep original order");
+    check(isSortedByKey(#order[0], #keys[0], 6), "still sorted");
+    eof: pass;
+}
+
+function private checkMergePath():void {
+    testGroup("large array (merge path)");
+
+    //  25 elements cross the insertion-sort threshold and take the merge path, the
+    //  one production code actually uses.
+    int keys[25] = {0};
+    int order[25] = {0};
+    for (int i = 0; i < 25; i++) {
+        keys[i] = i % 5;            // five values, five times each
+        order[i] = i;
+    }
+    sortIndicesByKey(#order[0], #keys[0], 25);
+
+    check(isSortedByKey(#order[0], #keys[0], 25), "merge path sorted");
+    check(isPermutation(#order[0], 25), "merge path permutation valid");
+
+    //  Stability must hold on the merge path too; `<=` taking the left run is why.
+    //  An array name cannot take part in pointer arithmetic (a signed/unsigned mixup
+    //  at compile time), so take its address first.
+    ptr int keyView = #keys[0];
+    ptr int orderView = #order[0];
+    int unstable = 0;
+    for (int i = 1; i < 25; i++) {
+        if (@(keyView + @(orderView + i - 1)) == @(keyView + @(orderView + i)) &&
+            @(orderView + i - 1) > @(orderView + i)) {
+            unstable = unstable + 1;
+        }
+    }
+    checkInt(unstable, 0, "merge path is stable");
+
+    //  Within equal keys the indices must start 0,5,10,15,20.
+    checkInt(@(orderView + 0), 0, "first of key 0");
+    checkInt(@(orderView + 1), 5, "second of key 0");
+    checkInt(@(orderView + 4), 20, "last of key 0");
+    checkInt(@(orderView + 5), 1, "first of key 1");
+    eof: pass;
+}
+
+function private checkOtherKeys():void {
+    testGroup("int64 and string keys");
+
+    //  int64: timestamp magnitudes.
+    int64 stamps[4] = {1700000000000, 1600000000000, 1800000000000, 1650000000000};
+    int byStamp[4] = {0};
+    fillIdentity(#byStamp[0], 4);
+    sortIndicesByKey64(#byStamp[0], #stamps[0], 4);
+    checkString(render(#byStamp[0], 4), "1 3 0 2", "int64 sorted");
+    check(isSortedByKey64(#byStamp[0], #stamps[0], 4), "int64 in order");
+    ptr int64 stampView = #stamps[0];
+    ptr int byStampView = #byStamp[0];
+    checkInt64(@(stampView + @(byStampView + 0)), 1600000000000, "earliest timestamp first");
+
+    //  string: names.
+    string names[4] = {"delta", "alpha", "charlie", "bravo"};
+    int byName[4] = {0};
+    fillIdentity(#byName[0], 4);
+    sortIndicesByString(#byName[0], #names[0], 4);
+    checkString(render(#byName[0], 4), "1 3 2 0", "string sorted");
+    check(isSortedByString(#byName[0], #names[0], 4), "string in order");
+    ptr string nameView = #names[0];
+    ptr int byNameView = #byName[0];
+    checkString(@(nameView + @(byNameView + 0)), "alpha", "alphabetically first");
+
+    //  String stability: the same name at different indices.
+    string dup[4] = {"b", "a", "a", "b"};
+    int byDup[4] = {0};
+    fillIdentity(#byDup[0], 4);
+    sortIndicesByString(#byDup[0], #dup[0], 4);
+    checkString(render(#byDup[0], 4), "1 2 0 3", "string sort is stable too");
+    eof: pass;
+}
+
+function private checkDescending():void {
+    testGroup("descending via reversal");
+
+    int ages[4] = {25, 40, 30, 50};
+    int order[4] = {0};
+    fillIdentity(#order[0], 4);
+    sortIndicesByKey(#order[0], #ages[0], 4);
+    checkString(render(#order[0], 4), "0 2 1 3", "ascending first");
+
+    reverseIndices(#order[0], 4);
+    checkString(render(#order[0], 4), "3 1 2 0", "reversed for descending");
+    ptr int ageView = #ages[0];
+    ptr int ascView = #order[0];
+    checkInt(@(ageView + @(ascView + 0)), 50, "tallest age first");
+
+    //  Reversing an empty or single-element array must not go out of bounds.
+    int one[1] = {1};
+    reverseIndices(#one[0], 0);
+    reverseIndices(#one[0], 1);
+    checkInt(one[0], 1, "single element reversal is a no-op");
+    eof: pass;
+}
+
+function private checkTwoOrders():void {
+    testGroup("two orders for one array");
+
+    //  One struct array sorted by two fields in turn, without interference -- the
+    //  main advantage of indirect sorting over sorting the struct itself.
+    string names[3] = {"charlie", "alice", "bob"};
+    int ages[3] = {30, 25, 35};
+
+    int byAge[3] = {0};
+    int byName[3] = {0};
+    fillIdentity(#byAge[0], 3);
+    fillIdentity(#byName[0], 3);
+    sortIndicesByKey(#byAge[0], #ages[0], 3);
+    sortIndicesByString(#byName[0], #names[0], 3);
+
+    checkString(render(#byAge[0], 3), "1 0 2", "order by age");
+    checkString(render(#byName[0], 3), "1 2 0", "order by name");
+
+    //  Both permutations refer to the same data, and both are valid.
+    ptr string nameView = #names[0];
+    ptr int ageOrder = #byAge[0];
+    ptr int nameOrder = #byName[0];
+    checkString(@(nameView + @(ageOrder + 0)), "alice", "youngest is alice");
+    checkString(@(nameView + @(nameOrder + 0)), "alice", "alphabetically first is alice");
+    eof: pass;
+}
+
+function main():void {
+    checkBasic();
+    checkStability();
+    checkMergePath();
+    checkOtherKeys();
+    checkDescending();
+    checkTwoOrders();
+    testFinish();
+    eof: pass;
+}

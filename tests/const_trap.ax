@@ -1,0 +1,36 @@
+//  const_trap.ax — constant expressions that are certain to trap.
+//
+//  Compiled by `tests/check_const_trap.cmake` with `acvm check`, never run: five of
+//  these lines trap unconditionally, and the point of the test is that the compiler
+//  says so *before* the program runs.
+//
+//  They sit inside `if (argCount() == 999)`, which is never true. That is
+//  deliberate, and it is why these are warnings and not errors: a constant
+//  expression still lives in some branch, and
+//
+//      if (mode == Fast) { return 1 / 0; }
+//
+//  is a legitimate way to write "not supported in this mode". Rejecting the
+//  program would be wrong; compiling it and trapping at the first call would be
+//  worse. Reporting the position at compile time is the useful middle.
+//
+//  The lines marked `safe` must NOT warn -- a compiler that flags `2147483646 + 1`
+//  would train people to ignore the diagnostic.
+
+function main():void {
+    if (argCount() == 999) {
+        int a = 1 / 0;                    // warn: zero divisor
+        int b = 7 % 0;                    // warn: zero divisor
+        int c = 2147483647 + 1;           // warn: overflow
+        int d = 100000 * 100000;          // warn: overflow
+        int e = 1 << 40;                  // warn: shift out of range
+
+        int f = 2147483646 + 1;           // safe: exactly fits
+        int g = 10 / 2;                   // safe
+        int h = 1 << 30;                  // safe: still positive
+        int i = -2147483647 / 2;          // safe
+        int j = 46341 * 46340;            // safe: product fits
+    }
+    print("ok\n");
+    eof: pass;
+}

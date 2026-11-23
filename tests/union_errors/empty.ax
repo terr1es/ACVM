@@ -1,0 +1,4 @@
+//  An empty union has no size.
+union Nothing { };
+
+function main():void { pass; eof: pass; }

@@ -1,0 +1,201 @@
+//  union_check.ax -- unions (members sharing one storage slot).
+//
+//  A union means "different views of the same memory": writing one member and
+//  reading another is a **reinterpretation of those bytes**, not an error. Two
+//  kinds of check follow:
+//
+//    * layout must match C exactly (size, alignment, every member offset 0). A
+//      mismatch shows up at a native boundary as "the value read back is wrong"
+//      rather than as an error, so only asserting the numbers guards it;
+//    * bit reinterpretation must yield the real bytes, cross-checked against known
+//      IEEE-754 bit patterns.
+
+function import (return:(test));
+
+//===--- layout -------------------------------------------------------------===//
+
+//  Largest member is double (8), align 8 -> 8 / 8
+union TwoWays {
+    int i;
+    double d;
+};
+
+//  Largest member is 8 bytes, but 1- and 4-byte members exist -> align to the widest
+union Mixed {
+    unsigned int8 b;
+    int i;
+    int64 wide;
+};
+
+//  Largest member is 12 bytes (int[3]), align 4 -> 12 / 4
+union WithArray {
+    int[3] triple;
+    int single;
+};
+
+//  A union inside a struct: the struct size and offsets depend on the union size
+struct Tagged {
+    int kind;
+    TwoWays payload;
+};
+
+//  A small union for bit reinterpretation
+union union32 {
+    float f;
+    unsigned int u;
+};
+
+union unionbytes {
+    float f;
+    unsigned int8[4] b;
+};
+
+union unionsigned {
+    int i;
+    unsigned int u;
+};
+
+//===--- layout checks ------------------------------------------------------===//
+
+function checkLayout():void {
+    testGroup("layout");
+
+    checkInt(sizeof(TwoWays), 8, "TwoWays is the size of its largest member");
+    checkInt(alignof(TwoWays), 8, "TwoWays takes its widest member's alignment");
+
+    checkInt(sizeof(Mixed), 8, "Mixed is sized by int64, not by the byte member");
+    checkInt(alignof(Mixed), 8, "Mixed aligns to int64");
+
+    checkInt(sizeof(WithArray), 12, "WithArray is the size of int[3]");
+    checkInt(alignof(WithArray), 4, "WithArray aligns to int");
+
+    //  Inside a struct: kind takes 4, the union aligns to 8 -> payload at offset 8, total 16
+    checkInt(sizeof(Tagged), 16, "a struct containing a union pads to the union's alignment");
+}
+
+//===--- members share one storage slot -------------------------------------===//
+
+function checkSharing():void {
+    testGroup("sharing");
+
+    TwoWays v;
+    v.i = 42;
+    checkInt(v.i, 42, "writing a member reads back through the same member");
+
+    v.d = 1.0;
+    checkNear(v.d, 1.0, 0.0, "writing the other member takes over the storage");
+
+    //  Writing i overwrites d's bytes: 1.0's bit pattern, overwritten by 42, is no longer 1.0
+    v.d = 1.0;
+    v.i = 42;
+    check(v.d != 1.0, "writing int clobbers the double view");
+
+    //  and reading i still yields the 42 just written
+    checkInt(v.i, 42, "the int view survives its own write");
+}
+
+//===--- bit reinterpretation, cross-checked against known IEEE-754 patterns --===//
+
+function checkReinterpret():void {
+    testGroup("reinterpret");
+
+    TwoWays v;
+
+    //  1.0 is 0x3FF0000000000000: low 32 bits 0, high 32 bits 0x3FF00000
+    v.d = 1.0;
+    checkInt64(v.i as int64, 0i64, "the low half of double 1.0 is zero");
+
+    //  A 32-bit union: float and unsigned int viewed through each other
+    union32 narrow;
+    narrow.f = 1.0;                     // 0x3F800000
+    checkInt64(narrow.u as int64, 1065353216i64, "float 1.0 reads as 0x3F800000");
+
+    narrow.u = 0x40490FDBu32;           // the single-precision bits of pi
+    checkNear(narrow.f as double, 3.1415927410125732, 0.0000001,
+              "the float view sees the pi bit pattern");
+
+    //  Byte-by-byte view (only a 1-byte member shows bytes; char is a 2-byte UTF-16 unit)
+    unionbytes bytes;
+    bytes.f = 1.0;                      // little endian: 00 00 80 3F
+    checkInt64(bytes.b[0] as int64, 0i64, "little-endian byte 0 of 1.0f is 0x00");
+    checkInt64(bytes.b[1] as int64, 0i64, "little-endian byte 1 of 1.0f is 0x00");
+    checkInt64(bytes.b[2] as int64, 128i64, "little-endian byte 2 of 1.0f is 0x80");
+    checkInt64(bytes.b[3] as int64, 63i64, "little-endian byte 3 of 1.0f is 0x3F");
+
+    //  Signed and unsigned views
+    unionsigned s;
+    s.u = 0xFFFFFFFFu32;
+    checkInt64(s.i as int64, -1i64, "0xFFFFFFFF reads as -1 through the signed view");
+}
+
+//===--- initialisation -----------------------------------------------------===//
+
+function checkInitialisation():void {
+    testGroup("init");
+
+    //  `{x}` initialises the first member -- the C rule
+    TwoWays first = {7};
+    checkInt(first.i, 7, "a brace initialiser fills the first member");
+
+    //  `{0}` is the cheapest way to say "all bytes zero"
+    TwoWays zeroed = {0};
+    checkInt(zeroed.i, 0, "{0} zeroes the first member");
+    checkNear(zeroed.d, 0.0, 0.0, "{0} leaves every view at zero");
+}
+
+//===--- arguments, returns, pointers ---------------------------------------===//
+
+function takeByValue(TwoWays v):int {
+    return v.i;
+}
+
+function makeFromInt(int n):TwoWays {
+    TwoWays v;
+    v.i = n;
+    return v;
+}
+
+function checkPassing():void {
+    testGroup("passing");
+
+    TwoWays a;
+    a.i = 77;
+    checkInt(takeByValue(a), 77, "a union passes by value");
+
+    TwoWays b = makeFromInt(99);
+    checkInt(b.i, 99, "a union returns by value");
+
+    ptr TwoWays p = #a;
+    checkInt(p->i, 77, "'->' reaches a member through a pointer to a union");
+    p->i = 5;
+    checkInt(a.i, 5, "writing through the pointer reaches the union");
+}
+
+//===--- nesting and combining with structs ---------------------------------===//
+
+function checkNesting():void {
+    testGroup("nesting");
+
+    Tagged t;
+    t.kind = 1;
+    t.payload.d = 2.5;
+    checkInt(t.kind, 1, "the tag beside the union is untouched");
+    checkNear(t.payload.d, 2.5, 0.0, "the nested union keeps its value");
+
+    Tagged copy = t;
+    checkNear(copy.payload.d, 2.5, 0.0, "copying the struct copies the union bytes");
+    checkInt(copy.kind, 1, "the copy keeps the tag");
+}
+
+//===--- main flow ----------------------------------------------------------===//
+
+function main():void {
+    checkLayout();
+    checkSharing();
+    checkReinterpret();
+    checkInitialisation();
+    checkPassing();
+    checkNesting();
+    testFinish();
+    eof: pass;
+}

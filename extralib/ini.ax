@@ -1,0 +1,484 @@
+//  ini.ax -- reading and writing INI (and `.properties`-style sectioned key/value files).
+//
+//      function import (return:(ini));
+//
+//      Doc d = docNew(0);
+//      ptr Value root = iniParse(#d, "[server]\nhost=localhost\nport=8080\n");
+//      print(valStrOf(valPath(root, "server.host"), "?"));     // localhost
+//      valSet(#d, valGet(root, "server"), "port", valString(#d, "9090"));
+//      print(iniWrite(#d, root));
+//      docFree(#d);
+//
+//  ── shape ────────────────────────────────────────────────────────────────
+//
+//  The root is an object: section name -> an object of that section's keys, and every
+//  value is a string (INI has no types: 8080 in `port=8080` is text). **Keys outside
+//  any section** live in the section named "": the only representation that keeps "the
+//  file has such a key", and they are written back before the first `[section]`.
+//
+//  ── three things kept verbatim ───────────────────────────────────────────
+//
+//  1. **order of keys and sections**: Value objects are ordered, so writes follow it.
+//  2. **whitespace inside a value**: `a =  b ` has the value `b ` -- one space after the
+//     '=' removed, the interior kept. Trailing spaces go separately: invisible in editors.
+//  3. **whether quotes are needed**: parsing records `kFlagQuoted`, and a write quotes
+//     a value that needs it (edge spaces, a leading quote, `;` or `#` inside) and
+//     leaves the rest bare, so `host=localhost` does not become `host="localhost"`.
+//
+//  ── comments ─────────────────────────────────────────────────────────────
+//
+//  Comments (`;` and `#`) are dropped while parsing and never generated on write. Keeping
+//  one across an edit needs a side structure of "position + text", a parameter on every
+//  API, while the dominant use is read -> edit -> write. Saying so beats losing them.
+//
+//  ── strictness ───────────────────────────────────────────────────────────
+//
+//  A repeated key: **the later one wins** (as in most INI code), no error. A repeated
+//  section name merges into one node. A missing `]` or unquoted newline errors with a line.
+//
+//  depends: value
+
+module "ini" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(value));
+
+//===--- parsing ---------------------------------------------------------===//
+
+struct IniReader {
+    ptr unsigned int8 bytes;
+    int length;
+    int pos;
+    int line;
+    ptr Doc doc;
+};
+
+function private iniByteAt(ptr IniReader r, int at):int {
+    if (at < 0 || at >= r->length) {
+        return -1;
+    }
+    return @(r->bytes + at) as int;
+    eof: pass;
+}
+
+function private iniFail(ptr IniReader r, string message):ptr Value {
+    return docFail(r->doc, message + " (line " + itoa(r->line, 10) + ")", r->pos);
+    eof: pass;
+}
+
+//  End of the current line, or `length` at end of input.
+function private iniLineEnd(ptr IniReader r):int {
+    int i = r->pos;
+    while (i < r->length) {
+        int b = @(r->bytes + i) as int;
+        if (b == 10 || b == 13) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return i;
+    eof: pass;
+}
+
+//  Moves past the newline at `at` (which may be CRLF) and bumps the line counter.
+function private iniNextLine(ptr IniReader r, int at):void {
+    int i = at;
+    if (i < r->length && @(r->bytes + i) as int == 13) {
+        i = i + 1;
+    }
+    if (i < r->length && @(r->bytes + i) as int == 10) {
+        i = i + 1;
+    }
+    r->pos = i;
+    r->line = r->line + 1;
+    eof: pass;
+}
+
+function private iniIsSpace(int b):bool {
+    return b == 32 || b == 9;
+    eof: pass;
+}
+
+//  Reads one logical line into the arena, trimmed at both ends. Returns "" for a
+//  blank or comment line, and sets `*isComment` so the caller can skip it without
+//  re-inspecting the bytes.
+function private iniLineText(ptr IniReader r, ptr bool isComment):string {
+    int end = iniLineEnd(r);
+    int from = r->pos;
+    while (from < end && iniIsSpace(@(r->bytes + from) as int)) {
+        from = from + 1;
+    }
+    int first = -1;
+    if (from < end) {
+        first = @(r->bytes + from) as int;
+    }
+    if (first == 59 || first == 35) {
+        @isComment = true;
+    } else {
+        @isComment = false;
+    }
+    int stop = end;
+    while (stop > from && iniIsSpace(@(r->bytes + stop - 1) as int)) {
+        stop = stop - 1;
+    }
+    string text = "";
+    if (stop > from) {
+        text = arenaString(#r->doc->arena, (r->bytes + from) as ptr int8, stop - from);
+    }
+    iniNextLine(r, end);
+    return text;
+    eof: pass;
+}
+
+//  Splits a `section` header: the text between '[' and ']'.
+function private iniSectionName(ptr IniReader r, string line):string {
+    string trimmed = trim(line);
+    if (trimmed.length < 2) {
+        iniFail(r, "empty section header");
+        return "";
+    }
+    if (!startsWith(trimmed, "[")) {
+        iniFail(r, "expected '['");
+        return "";
+    }
+    if (endsWith(trimmed, "]")) {
+        return substring(trimmed, 1, trimmed.length - 1);
+    }
+    // `[section] ; comment` is legal in several dialects: cut at the ']'.
+    int close = indexOf(trimmed, "]");
+    if (close < 0) {
+        iniFail(r, "unterminated section header");
+        return "";
+    }
+    return substring(trimmed, 1, close);
+    eof: pass;
+}
+
+//  The unquoted value of `text` when it is wrapped in matching quotes, else the
+//  text itself. `*quoted` reports which happened, for the write-back style flag.
+function private iniUnquote(string text, ptr bool quoted):string {
+    @quoted = false;
+    if (text.length >= 2) {
+        int first = strByteAt(text, 0);
+        int last = strByteAt(text, text.length - 1);
+        if ((first == 34 && last == 34) || (first == 39 && last == 39)) {
+            @quoted = true;
+            return substring(text, 1, text.length - 1);
+        }
+    }
+    return text;
+    eof: pass;
+}
+
+//  Parses INI text. Returns null and records a message on failure.
+function iniParse(ptr Doc doc, string text):ptr Value {
+    IniReader reader;
+    reader.bytes = strBytesOf(text) as ptr unsigned int8;
+    reader.length = text.length;
+    reader.pos = 0;
+    reader.line = 1;
+    reader.doc = doc;
+
+    ptr Value root = valObject(doc);
+    if (root == null) {
+        return null;
+    }
+    // Keys seen before the first header live in the "" section, so the file
+    // round-trips through a structure that has a place for them.
+    ptr Value section = valSetObject(doc, root, "");
+    if (section == null) {
+        return null;
+    }
+    bool inHeader = false;
+
+    while (reader.pos < reader.length) {
+        bool isComment = false;
+        string line = iniLineText(#reader, #isComment);
+        if (isComment || line.length == 0) {
+            continue;
+        }
+        if (strByteAt(line, 0) == 91) {
+            string name = iniSectionName(#reader, line);
+            if (docFailed(doc)) {
+                return null;
+            }
+            ptr Value existing = valGet(root, name);
+            if (existing != null && existing->kind == kValObject) {
+                section = existing;
+            } else {
+                // Attach first, then take the address inside the parent: a node
+                // built before `valSet` is copied, and writes to it go nowhere.
+                section = valSetObject(doc, root, name);
+                if (section == null) {
+                    return null;
+                }
+            }
+            inHeader = true;
+            continue;
+        }
+        int eq = indexOf(line, "=");
+        if (eq < 0) {
+            // A line without '=' is not a comment and not a section: it is a
+            // mistake worth reporting, because silently ignoring it hides a
+            // typo in a key name.
+            docFail(doc, "expected 'key=value' (line " + itoa(reader.line - 1, 10) + ")",
+                    reader.pos);
+            return null;
+        }
+        string key = trim(substring(line, 0, eq));
+        if (key.length == 0) {
+            docFail(doc, "empty key (line " + itoa(reader.line - 1, 10) + ")", reader.pos);
+            return null;
+        }
+        bool quoted = false;
+        string value = iniUnquote(trim(substring(line, eq + 1, line.length)), #quoted);
+        ptr Value node = valString(doc, value);
+        if (node == null) {
+            return null;
+        }
+        if (quoted) {
+            node->flags = kFlagQuoted;
+        }
+        valSet(doc, section, key, node);
+    }
+
+    // Drop the "" section when the file had no bare keys: an empty section would
+    // otherwise be written back as a stray `[]` header.
+    if (!inHeader && valCount(section) == 0) {
+        valRemove(root, "");
+    }
+    doc->root = root;
+    return root;
+    eof: pass;
+}
+
+//===--- serialising -----------------------------------------------------===//
+
+//  True when `text` must be quoted to survive a round trip: leading or trailing
+//  space, a comment marker anywhere, or a quote at either end.
+function private iniNeedsQuote(string text):bool {
+    if (text.length == 0) {
+        return false;
+    }
+    int first = strByteAt(text, 0);
+    int last = strByteAt(text, text.length - 1);
+    if (first == 32 || first == 9 || last == 32 || last == 9) {
+        return true;
+    }
+    if (first == 34 || first == 39) {
+        return true;
+    }
+    int i = 0;
+    while (i < text.length) {
+        int c = strByteAt(text, i);
+        if (c == 59 || c == 35) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+    eof: pass;
+}
+
+function private iniWriteValue(ptr StrBuf b, ptr Value v):void {
+    // INI has no types: everything is written as the text the value carries.
+    string text = valText(v);
+    bool quote = v != null && v->flags == kFlagQuoted;
+    if (!quote) {
+        quote = iniNeedsQuote(text);
+    }
+    if (quote) {
+        sbPutByte(b, 34);
+        sbPut(b, text);
+        sbPutByte(b, 34);
+    } else {
+        sbPut(b, text);
+    }
+    eof: pass;
+}
+
+//  Writes a document as INI. The "" section (bare keys) is emitted first, then
+//  every other section in the order it appears in the tree.
+function iniWrite(ptr Doc doc, ptr Value root):string {
+    StrBuf b;
+    sbInit(#b, 256);
+    if (root == null || root->kind != kValObject) {
+        return sbFinishInto(doc, #b);
+    }
+
+    ptr Value bare = valGet(root, "");
+    if (bare != null && bare->kind == kValObject) {
+        int i = 0;
+        while (i < bare->count) {
+            sbPut(#b, bare->keys[i]);
+            sbPutByte(#b, 61);
+            iniWriteValue(#b, bare->items + i);
+            sbPutByte(#b, 10);
+            i = i + 1;
+        }
+    }
+
+    int s = 0;
+    while (s < root->count) {
+        string name = root->keys[s];
+        ptr Value section = root->items + s;
+        s = s + 1;
+        if (name.length == 0 || section->kind != kValObject) {
+            continue;
+        }
+        if (bare != null && bare->count > 0) {
+            sbPutByte(#b, 10);
+        }
+        sbPutByte(#b, 91);
+        sbPut(#b, name);
+        sbPut(#b, "]\n");
+        int i = 0;
+        while (i < section->count) {
+            sbPut(#b, section->keys[i]);
+            sbPutByte(#b, 61);
+            iniWriteValue(#b, section->items + i);
+            sbPutByte(#b, 10);
+            i = i + 1;
+        }
+    }
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+//===--- convenience access ----------------------------------------------===//
+
+//  The section object for `name`, creating it when `create` is true.
+function iniSection(ptr Doc doc, ptr Value root, string name, bool create):ptr Value {
+    ptr Value section = valGet(root, name);
+    if (section != null && section->kind == kValObject) {
+        return section;
+    }
+    if (!create) {
+        return null;
+    }
+    return valSetObject(doc, root, name);
+    eof: pass;
+}
+
+//  `iniGetString(root, "server", "host", "localhost")` -- the everyday read.
+function iniGetString(ptr Value root, string section, string key, string fallback):string {
+    ptr Value s = valGet(root, section);
+    if (s == null) {
+        return fallback;
+    }
+    return valStrOf(valGet(s, key), fallback);
+    eof: pass;
+}
+
+function iniGetInt(ptr Value root, string section, string key, int fallback):int {
+    string text = iniGetString(root, section, key, "");
+    if (text.length == 0) {
+        return fallback;
+    }
+    int64 value = 0i64;
+    int used = txtParseInt64(strBytesOf(text), text.length, #value);
+    if (used == 0) {
+        return fallback;
+    }
+    return value as int;
+    eof: pass;
+}
+
+function iniGetBool(ptr Value root, string section, string key, bool fallback):bool {
+    string text = toLower(trim(iniGetString(root, section, key, "")));
+    if (text == "true" || text == "yes" || text == "on" || text == "1") {
+        return true;
+    }
+    if (text == "false" || text == "no" || text == "off" || text == "0") {
+        return false;
+    }
+    return fallback;
+    eof: pass;
+}
+
+function iniSetString(ptr Doc doc, ptr Value root, string section, string key, string value):bool {
+    ptr Value s = iniSection(doc, root, section, true);
+    if (s == null) {
+        return false;
+    }
+    return valSet(doc, s, key, valString(doc, value));
+    eof: pass;
+}
+
+function iniSetInt(ptr Doc doc, ptr Value root, string section, string key, int value):bool {
+    return iniSetString(doc, root, section, key, itoa(value, 10));
+    eof: pass;
+}
+
+function iniSetBool(ptr Doc doc, ptr Value root, string section, string key, bool value):bool {
+    return iniSetString(doc, root, section, key, value ? "true" : "false");
+    eof: pass;
+}
+
+function iniHas(ptr Value root, string section, string key):bool {
+    ptr Value s = valGet(root, section);
+    if (s == null) {
+        return false;
+    }
+    return valGet(s, key) != null;
+    eof: pass;
+}
+
+function iniRemove(ptr Value root, string section, string key):bool {
+    ptr Value s = valGet(root, section);
+    if (s == null) {
+        return false;
+    }
+    return valRemove(s, key);
+    eof: pass;
+}
+
+function iniRemoveSection(ptr Value root, string section):bool {
+    return valRemove(root, section);
+    eof: pass;
+}
+
+function iniSectionCount(ptr Value root):int {
+    int total = 0;
+    int i = 0;
+    while (i < valCount(root)) {
+        string name = valKeyAt(root, i);
+        if (name.length != 0) {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+    eof: pass;
+}
+
+function iniSectionAt(ptr Value root, int index):string {
+    int seen = 0;
+    int i = 0;
+    while (i < valCount(root)) {
+        string name = valKeyAt(root, i);
+        if (name.length != 0) {
+            if (seen == index) {
+                return name;
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+    eof: pass;
+}
+
+//  Reads `path` and parses it. The error convention is `value.ax`'s: null means
+//  failure, `docError` says why (including "cannot open" for the file itself).
+function iniParseFile(ptr Doc doc, string path):ptr Value {
+    string text = docReadFile(doc, path);
+    if (docFailed(doc)) {
+        return null;
+    }
+    return iniParse(doc, text);
+    eof: pass;
+}

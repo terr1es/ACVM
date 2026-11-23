@@ -1,0 +1,30 @@
+// A `process` runs as its own preemptive execution flow; `event` fires on the
+// rising edge of its trigger condition, evaluated at safe points.
+global int counter = 0;
+global int done = 0;
+
+function process worker():void {
+    while (true) {
+        counter = counter + 1;
+        if (counter >= 6) {
+            return;
+        }
+        yield();
+    }
+    eof: pass;
+}
+
+function event onThree()(counter == 3):void {
+    print("[event: counter reached 3] ");
+    eof: pass;
+}
+
+function main():void {
+    loop (20) {
+        yield();
+    }
+    print("counter=");
+    print(counter);
+    print("\n");
+    eof: pass;
+}

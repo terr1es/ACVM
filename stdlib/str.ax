@@ -1,0 +1,547 @@
+//  str.ax — splitting, joining and replacing text, plus UTF-8 aware length and slicing.
+//
+//      function import (return:(str));
+//
+//      SplitList parts = makeSplit("a,b,c", ",");
+//      print(splitCount(#parts));            // 3
+//      print(splitAt(#parts, 1));            // b
+//      splitFree(#parts);
+//
+//      print(replaceAll("a-b-c", "-", "+")); // a+b+c
+//      print(utf8CharCount("a中b"));          // 3, not 5
+//
+//  ── what this module fills in ─────────────────────────────────────────────
+//
+//  Spec §8.6 lists `split` / `replace` as "postponed because `vector T` is not implemented".
+//  `vec.ax` supplies the container, so both are possible now -- this module provides them.
+//
+//  Before this, reading one CSV line meant hand-writing an `indexOf` loop and adding the
+//  relative offset back to an absolute position each step. Forget that and the search origin
+//  never moves: an infinite loop on one delimiter. I made that mistake once, hence `findFrom`.
+//
+//  ── two semantics you must know ───────────────────────────────────────────
+//
+//  1. **`length` counts bytes; `substring` slices bytes.** `"a中b".length` is 5, not 3, so
+//     character work goes through `Utf8*`, which finds boundaries by UTF-8 leading byte.
+//
+//  2. **`s[i]` does not work.** It indexes UTF-16 code units while the storage is UTF-8
+//     bytes, so `"hello"[0]` gives mojibake. This module never uses
+//     it: everything goes through `substring` / `indexOf` and the byte view in `strbyte`.
+//
+//  ── arena ────────────────────────────────────────────────────────────────
+//
+//  `makeSplit` and `replaceAll` allocate. Called repeatedly in a long loop they need an
+//  enclosing `arena_scope`, or the arena grows without end (16 MB per process, no reclaim).
+//
+//  `SplitList` elements come from `alloc` (not the arena) and must be freed with `splitFree`.
+//  Why not a stack buffer: `SplitList` returns by value, so a Vec pointing into an array
+//  inside its own struct would dangle after the return. Hence it allocates at construction.
+
+module "str" version "0.1.0";
+
+function import (return:(vec));
+function import (return:(strbyte));
+
+// ─── splitting ─────────────────────────────────────────────────────────────
+
+/// One split result. Elements are `string` (16-byte descriptors), stored bytewise by `vec`.
+struct SplitList {
+    Vec items;
+};
+
+//  Returns the absolute offset of the first `sub` at or after `from`, or -1.
+//
+//  `indexOf` only searches from the start, so "search from offset" must slice; a slice
+//  returns **offsets relative to itself**, which must be added back to `from` to become
+//  absolute. Every search here goes through this function so that sum exists in one place.
+function private findFrom(string text, string sub, int from):int {
+    if (sub.length == 0) {
+        return -1;          // an empty pattern matches anywhere, so there is no answer
+    }
+    if (from < 0 || from >= text.length) {
+        return -1;
+    }
+    int relative = indexOf(text[from .. text.length], sub);
+    if (relative < 0) {
+        return -1;
+    }
+    return from + relative;
+    eof: pass;
+}
+
+//  Splits `text` on every occurrence of `sep`.
+//
+//  The semantics match most languages; two edge cases are worth remembering:
+//
+//    makeSplit("a,b,c", ",")   → ["a", "b", "c"]      3 items
+//    makeSplit("a,b,", ",")    → ["a", "b", ""]       3 items (trailing empty kept)
+//    makeSplit(",a", ",")      → ["", "a"]            2 items (leading empty kept)
+//    makeSplit("", ",")        → [""]                 1 item (empty string is not an empty list)
+//    makeSplit("abc", "")      → ["abc"]              1 item (empty separator does not split)
+//
+//  The caller must `splitFree`.
+function makeSplit(string text, string sep):SplitList {
+    SplitList result;
+    //  Start with a rough capacity so not every append reallocs. A CSV line is ~10 fields.
+    result.items = makeVecHeap(8, sizeof(string));
+
+    //  Empty separator: the whole string is one item. Splitting per character looks "more
+    //  reasonable" but would hide a caller bug -- passing "" -- behind a plausible result.
+    if (sep.length == 0) {
+        vecPushStr(#result.items, text);
+        return result;
+    }
+
+    int start = 0;
+    while (true) {
+        int cut = findFrom(text, sep, start);
+        string piece = "";
+        if (cut < 0) {
+            piece = text[start .. text.length];
+        } else {
+            piece = text[start .. cut];
+        }
+        vecPushStr(#result.items, piece);
+        if (cut < 0) {
+            break;
+        }
+        start = cut + sep.length;
+    }
+    return result;
+    eof: pass;
+}
+
+//  Number of fields in a split result. O(1).
+//
+//  `parts` must be a live `SplitList`; it is read only, so the count is safe to
+//  call inside the usual `for i in 0..splitCount(#parts)` loop.
+function splitCount(ptr SplitList parts):int {
+    return parts->items.count;
+    eof: pass;
+}
+
+//  Returns element `index`, or "" when out of range.
+function splitAt(ptr SplitList parts, int index):string {
+    return vecGetStr(#parts->items, index);
+    eof: pass;
+}
+
+//  Releases the element storage. Safe to call on a list that was never filled.
+function splitFree(ptr SplitList parts):void {
+    vecFree(#parts->items);
+    eof: pass;
+}
+
+// ─── joining ───────────────────────────────────────────────────────────────
+
+//  Joins `count` elements of `items` with `sep` between them.
+//
+//  The parameter is a bare array, not a `SplitList`, so it takes `makeSplit`'s result
+//  (passing `#parts->items...` by hand is awkward, see below) and any hand-written array:
+//
+//      string words[3] = {"a", "b", "c"};
+//      print(join(#words[0], 3, "-"));        // a-b-c
+//
+//  Joining N pieces is O(N²) copying: every `+` copies the whole old string. Tens of
+//  pieces are fine; thousands should sum the length, `alloc` one buffer and `makeString` once.
+//  ─── linear string building ───────────────────────────────────────────────
+//
+//  `a + b` allocates a fresh arena block and copies both operands, so assembling
+//  an n byte result from k pieces costs O(n*k) bytes of allocation and O(n^2) bytes
+//  of copying. At a few thousand pieces that exhausts the 16 MB arena outright --
+//  `join` on 2000 ten byte items used to fail with
+//  "arena exhausted while concatenating a string".
+//
+//  These three helpers copy into one buffer sized up front instead: one `alloc`,
+//  one `makeString`, O(n) copying. The buffer is `ptr int8` because `memcpy` and
+//  pointer arithmetic both work in bytes there; `makeString` takes the `ptr char`
+//  view of the same memory.
+//
+//  Allocation failure traps rather than returning a short string: the functions
+//  below return `string`, which has no error channel, and a silently truncated
+//  result is worse than a diagnostic (AX01-E01 covers failures a caller can
+//  handle; this one it cannot).
+
+struct StrBuilder {
+    ptr int8 buffer;
+    int length;
+    int capacity;
+};
+
+//  Prepares `b` to receive exactly `capacity` bytes. `capacity <= 0` leaves the
+//  builder empty and valid, so callers can finish immediately and get "".
+function private builderInit(ptr StrBuilder b, int capacity):void {
+    b->length = 0;
+    b->capacity = capacity;
+    b->buffer = 0 as ptr int8;
+    if (capacity > 0) {
+        b->buffer = alloc(capacity) as ptr int8;
+        if (b->buffer == 0 as ptr int8) {
+            trap();
+        }
+    }
+    eof: pass;
+}
+
+//  Appends `s` at the current end, if it fits. A source longer than the space
+//  left is truncated rather than overrunning the buffer; callers size the buffer
+//  from the same lengths they pass in, so a truncation means a miscount.
+function private builderAppend(ptr StrBuilder b, string s):void {
+    if (s.length <= 0 || b->buffer == 0 as ptr int8) {
+        return;
+    }
+    int room = b->capacity - b->length;
+    if (room <= 0) {
+        return;
+    }
+    int take = s.length < room ? s.length : room;
+    memcpy(b->buffer + b->length, strBytesOf(s), take);
+    b->length = b->length + take;
+    eof: pass;
+}
+
+//  Produces the string and releases the scratch buffer. `makeString` copies, so
+//  the buffer is freed immediately; the result lives in the arena like any other
+//  string.
+function private builderFinish(ptr StrBuilder b):string {
+    if (b->length <= 0) {
+        if (b->buffer != 0 as ptr int8) {
+            free(b->buffer);
+            b->buffer = 0 as ptr int8;
+        }
+        return "";
+    }
+    string out = makeString(b->buffer as ptr char, b->length);
+    if (b->buffer != 0 as ptr int8) {
+        free(b->buffer);
+        b->buffer = 0 as ptr int8;
+    }
+    return out;
+    eof: pass;
+}
+
+//  Concatenates `count` items separated by `sep`, in one pass.
+//
+//  `count` is an element count; `count <= 0` yields "". A single item is
+//  returned as-is, with no copy.
+//  The result needs `sum(len) + sep.length * (count - 1)` bytes, so very large
+//  joins are limited by the 16 MB arena -- but linearly, not quadratically.
+function join(ptr string items, int count, string sep):string {
+    if (count <= 0) {
+        return "";
+    }
+    if (count == 1) {
+        return @items;
+    }
+    int total = sep.length * (count - 1);
+    for i in 0..count {
+        string item = @(items + i);
+        total = total + item.length;
+    }
+    StrBuilder b;
+    builderInit(#b, total);
+    for i in 0..count {
+        if (i > 0) {
+            builderAppend(#b, sep);
+        }
+        string item = @(items + i);
+        builderAppend(#b, item);
+    }
+    return builderFinish(#b);
+    eof: pass;
+}
+
+//  The `SplitList` version of `join`. It exists so the internal layout of `SplitList.items`
+//  is not something callers unpack -- `vecAt` returns a pointer, and the cast stays inside.
+//  Concatenates the fields of a split result with `sep`. Same single-pass builder
+//  as `join`, so the cost is linear in the total byte count.
+function joinList(ptr SplitList parts, string sep):string {
+    int count = parts->items.count;
+    if (count <= 0) {
+        return "";
+    }
+    if (count == 1) {
+        return splitAt(parts, 0);
+    }
+    int total = sep.length * (count - 1);
+    for i in 0..count {
+        total = total + splitAt(parts, i).length;
+    }
+    StrBuilder b;
+    builderInit(#b, total);
+    for i in 0..count {
+        if (i > 0) {
+            builderAppend(#b, sep);
+        }
+        builderAppend(#b, splitAt(parts, i));
+    }
+    return builderFinish(#b);
+    eof: pass;
+}
+
+// ─── replace and repeat ────────────────────────────────────────────────────
+
+//  Replaces the first occurrence of `from` with `to`. An empty `from` is a no-op.
+function replace(string text, string from, string to):string {
+    int at = findFrom(text, from, 0);
+    if (at < 0) {
+        return text;
+    }
+    return text[0..at] + to + text[at + from.length .. text.length];
+    eof: pass;
+}
+
+//  Replaces every non-overlapping occurrence. An empty `from` is a no-op.
+//
+//  Non-overlapping means: replacing "aa" in "aa" with "b" yields "b" and cannot loop by
+//  matching the result again -- the cursor always moves past the replaced piece.
+//  Replaces every non-overlapping occurrence of `from` with `to`.
+//
+//  An empty `from` returns `text` unchanged: matching an empty pattern everywhere
+//  has no useful meaning. Non-overlapping means "aaa" with from "aa" replaces once.
+//
+//  Counts the occurrences first (`countOf`, same scan) so the output can be sized
+//  exactly, then copies once: linear instead of re-concatenating per match.
+function replaceAll(string text, string from, string to):string {
+    if (from.length == 0) {
+        return text;
+    }
+    int hits = countOf(text, from);
+    if (hits <= 0) {
+        return text;
+    }
+    StrBuilder b;
+    builderInit(#b, text.length + hits * (to.length - from.length));
+    int start = 0;
+    while (true) {
+        int at = findFrom(text, from, start);
+        if (at < 0) {
+            builderAppend(#b, text[start .. text.length]);
+            break;
+        }
+        builderAppend(#b, text[start..at]);
+        builderAppend(#b, to);
+        start = at + from.length;
+    }
+    return builderFinish(#b);
+    eof: pass;
+}
+
+//  Repeats `s` `times` times. `times <= 0` gives "".
+//  `s` repeated `times` times, copied in one pass.
+//
+//  `times <= 0` and an empty `s` both yield "". The old loop concatenated and so
+//  allocated a fresh copy per iteration: O(n^2) bytes and an arena blow-up at a
+//  few thousand repeats. This needs `s.length * times` bytes, once.
+function repeat(string s, int times):string {
+    if (times <= 0 || s.length <= 0) {
+        return "";
+    }
+    StrBuilder b;
+    builderInit(#b, s.length * times);
+    for i in 0..times {
+        builderAppend(#b, s);
+    }
+    return builderFinish(#b);
+    eof: pass;
+}
+
+//  Number of non-overlapping occurrences of `sub`. Empty `sub` is 0.
+function countOf(string text, string sub):int {
+    if (sub.length == 0) {
+        return 0;
+    }
+    int found = 0;
+    int start = 0;
+    while (true) {
+        int at = findFrom(text, sub, start);
+        if (at < 0) {
+            break;
+        }
+        found = found + 1;
+        start = at + sub.length;
+    }
+    return found;
+    eof: pass;
+}
+
+// ─── UTF-8: by character, not by byte ──────────────────────────────────────
+//
+//  An Axiom string is UTF-8 bytes and `length` is a byte count. One CJK character is 3
+//  bytes, so `"中文".length` is 6 -- column widths, truncation and slicing all go wrong.
+//
+//  These functions count boundaries by the UTF-8 rules: a **non-continuation byte** (top
+//  two bits not 10) starts a character. The test needs only a bit mask, not a full decode.
+
+//  Continuation test: top two bits are 10, i.e. (b & 0xC0) == 0x80.
+function private isContinuation(int byte):bool {
+    return (byte & 192) == 128;
+    eof: pass;
+}
+
+//  Number of characters (code points), not bytes.
+//
+//    utf8CharCount("hello")   → 5
+//    utf8CharCount("a中b")    → 3
+//    utf8CharCount("é")       → 1 (two bytes)
+function utf8CharCount(string s):int {
+    int count = 0;
+    for (int i = 0; i < s.length; i++) {
+        if (!isContinuation(strByteAt(s, i))) {
+            count = count + 1;
+        }
+    }
+    return count;
+    eof: pass;
+}
+
+//  Byte offset of the `charIndex`-th character. Clamps to `[0, s.length]`, so it
+//  can be fed straight into a slice.
+//
+//    utf8ByteOffset("a中b", 2) → 4    (the third character 'b' starts at byte 4)
+function utf8ByteOffset(string s, int charIndex):int {
+    if (charIndex <= 0) {
+        return 0;
+    }
+    int seen = 0;
+    for (int i = 0; i < s.length; i++) {
+        if (!isContinuation(strByteAt(s, i))) {
+            if (seen == charIndex) {
+                return i;
+            }
+            seen = seen + 1;
+        }
+    }
+    return s.length;
+    eof: pass;
+}
+
+//  Slices by characters: `utf8Slice("a中b", 1, 2)` is `"中"`.
+//
+//  Out-of-range indices clamp to the ends, matching Python's slicing habit; never traps.
+function utf8Slice(string s, int fromChar, int toChar):string {
+    if (s.length == 0) {
+        return "";
+    }
+    int fromByte = utf8ByteOffset(s, fromChar);
+    int toByte = utf8ByteOffset(s, toChar);
+    if (toByte <= fromByte) {
+        return "";
+    }
+    return s[fromByte..toByte];
+    eof: pass;
+}
+
+//  True when every byte is below 0x80, i.e. the string is plain ASCII.
+//  Useful as a fast path: ASCII text can be sliced by bytes without thinking.
+function utf8IsAscii(string s):bool {
+    for (int i = 0; i < s.length; i++) {
+        if (strByteAt(s, i) >= 128) {
+            return false;
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+//  Column width as a terminal would show it: ASCII counts 1, every other
+//  character counts 2.
+//
+//  **This is an approximation.** True display width depends on East Asian Width and on
+//  combining characters (emoji and accents are 0 or 2); a full version needs a Unicode table.
+//  This does "ASCII 1, other 2" -- fine for CJK+Latin, too wide for emoji, not for alignment.
+function utf8DisplayWidth(string s):int {
+    int width = 0;
+    for (int i = 0; i < s.length; i++) {
+        int b = strByteAt(s, i);
+        if (isContinuation(b)) {
+            continue;       // a continuation byte takes no column of its own
+        }
+        if (b < 128) {
+            width = width + 1;
+        } else {
+            width = width + 2;
+        }
+    }
+    return width;
+    eof: pass;
+}
+
+// ─── prefix/suffix and padding ─────────────────────────────────────────────
+
+//  Returns `text` with `prefix` removed, or `text` unchanged when it does not start with it.
+//  One less chance to get it wrong than hand-written `startsWith` plus a slice.
+function trimPrefix(string text, string prefix):string {
+    if (prefix.length == 0 || text.length < prefix.length) {
+        return text;
+    }
+    if (text[0..prefix.length] != prefix) {
+        return text;
+    }
+    return text[prefix.length .. text.length];
+    eof: pass;
+}
+
+//  Returns `text` with `suffix` removed, or `text` unchanged when it does not end with it.
+function trimSuffix(string text, string suffix):string {
+    if (suffix.length == 0 || text.length < suffix.length) {
+        return text;
+    }
+    if (text[text.length - suffix.length .. text.length] != suffix) {
+        return text;
+    }
+    return text[0 .. text.length - suffix.length];
+    eof: pass;
+}
+
+//  If `text` starts with `prefix`, returns the part after it; otherwise returns `fallback`.
+//  For parsing `key=value` lines: more direct than startsWith plus a slice.
+function afterPrefix(string text, string prefix, string fallback):string {
+    if (prefix.length == 0 || text.length < prefix.length) {
+        return fallback;
+    }
+    if (text[0..prefix.length] != prefix) {
+        return fallback;
+    }
+    return text[prefix.length .. text.length];
+    eof: pass;
+}
+
+//  Collapses runs of `ch` in `text` to one. An empty `ch` is returned unchanged.
+//
+//  Output is never longer than input (collapsing only deletes), so the buffer is allocated
+//  once at `text.length` and filled by `memcpy`. The old version did `out = out + piece` per
+//  piece: O(n^2) and arena-hungry -- the same class of problem as `join` / `repeat`.
+//
+//  The leading piece is **preserved exactly**: copy `text[0..ch.length]` unconditionally then
+//  scan from `ch.length`, so multi-character `ch` boundaries match the old code byte for byte.
+function collapseRuns(string text, string ch):string {
+    if (ch.length == 0 || text.length == 0) {
+        return text;
+    }
+    if (ch.length > text.length) {
+        return text;
+    }
+    StrBuilder b;
+    builderInit(#b, text.length);
+    string head = text[0..ch.length];
+    builderAppend(#b, head);
+    //  Whether the tail written so far ends with `ch` -- equals the old comparison on `out`.
+    bool tailIsCh = head == ch;
+    int i = ch.length;
+    while (i < text.length) {
+        if (i + ch.length <= text.length && text[i .. i + ch.length] == ch) {
+            if (!tailIsCh) {
+                builderAppend(#b, ch);
+                tailIsCh = true;
+            }
+            i = i + ch.length;
+        } else {
+            builderAppend(#b, text[i .. i + 1]);
+            tailIsCh = false;
+            i = i + 1;
+        }
+    }
+    return builderFinish(#b);
+    eof: pass;
+}

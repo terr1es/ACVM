@@ -1,0 +1,324 @@
+//  hmac.ax — HMAC-SHA256, constant-time comparison, and hex/base64url helpers.
+//
+//      function import (return:(hmac));
+//
+//      string tag = hmacSha256Hex("secret", "message");
+//      if (hmacVerify("secret", body, signatureFromHeader)) {
+//          // the request is authentic
+//      }
+//
+//  ── why this is in the official library ───────────────────────────────────
+//
+//  HMAC itself is twenty lines, and that is exactly the problem: it is twenty
+//  lines that are easy to get subtly wrong (pad the key to the block size, XOR
+//  with ipad first, hash, XOR with opad, hash again) and whose only symptom is a
+//  tag that never matches. Worse, the *comparison* is where real implementations
+//  break: writing `computed == expected` compares bytes with an early exit, which
+//  leaks how many leading bytes were right through the response time.
+//
+//  So the contract here is verify-in-one-call:
+//
+//      hmacVerify(key, message, expectedTag)   // constant time, tag as bytes or hex
+//
+//  A third-party JWT or webhook library that builds on this inherits the correct
+//  comparison instead of rediscovering it. That is the reason this module exists
+//  rather than being left to each library.
+//
+//  ── scope ─────────────────────────────────────────────────────────────────
+//
+//  SHA-256 only. It is what every current webhook, JWT HS256 and AWS SigV4 uses,
+//  and `sha256.ax` already has the hash. SHA-1 for legacy services and SHA-512 for
+//  the few that use it are deliberately absent: shipping a weak default is worse
+//  than requiring an explicit choice.
+//
+//  Not here either: JWT (a protocol -- build it from `hmac` and `base64Url*`),
+//  PBKDF2 / bcrypt / argon2 (password hashing is a different problem with its own
+//  parameters and cost rules), TLS.
+
+//  depends: sha256, codec, value
+
+module "hmac" version "0.1.0";
+
+function import (return:(sha256));
+function import (return:(codec));
+function import (return:(value));
+
+//  HMAC block size for SHA-256, in bytes.
+comptime int kHmacBlockSize = 64;
+
+//===--- HMAC -------------------------------------------------------------===//
+
+//  Writes the 32-byte tag of `message` under `key` into `out`.
+//
+//  The two passes are spelled out rather than built with a helper struct: the
+//  intermediate state is two 64-byte blocks and a 32-byte digest, all small enough
+//  for the stack, and keeping it flat makes the RFC 2104 structure visible.
+function hmacSha256Bytes(string key, string message, ptr unsigned int8 out):void {
+    unsigned int8 keyBlock[64] = {};
+
+    // A key longer than the block size is hashed first; a shorter one is padded
+    // with zeros. Either way it becomes exactly 64 bytes.
+    ptr unsigned int8 keyBytes = strBytesOf(key) as ptr unsigned int8;
+    int keyLength = key.length;
+    unsigned int8 keyDigest[32] = {};
+    if (keyLength > kHmacBlockSize) {
+        sha256(keyBytes, keyLength, #keyDigest[0]);
+        keyBytes = #keyDigest[0];
+        keyLength = 32;
+    }
+    // Pointer views keep the byte arithmetic free of the signed/unsigned index
+    // mixing the type checker rejects on `array + int`.
+    ptr unsigned int8 blockBytes = #keyBlock[0];
+    int i = 0;
+    while (i < kHmacBlockSize) {
+        int byte = 0;
+        if (i < keyLength) {
+            byte = @(keyBytes + i) as int;
+        }
+        @(blockBytes + i) = byte as unsigned int8;
+        i = i + 1;
+    }
+
+    // One buffer holds `K' xor pad || payload` for both passes, so the message is
+    // copied twice but never truncated and no pass needs a second allocation.
+    ptr unsigned int8 joined = alloc(kHmacBlockSize + message.length + 8) as ptr unsigned int8;
+    if (joined == null) {
+        // A `void` function cannot report failure. A zeroed tag never verifies, so
+        // the caller's `hmacVerify` rejects -- failing closed, not open.
+        i = 0;
+        while (i < 32) {
+            @(out + i) = 0u8;
+            i = i + 1;
+        }
+        return;
+    }
+
+    // inner = H(K' xor ipad || message)
+    i = 0;
+    while (i < kHmacBlockSize) {
+        @(joined + i) = ((@(blockBytes + i) as int) ^ 0x36) as unsigned int8;
+        i = i + 1;
+    }
+    if (message.length > 0) {
+        memcpy((joined + kHmacBlockSize) as ptr void, strBytesOf(message) as ptr void,
+               message.length);
+    }
+    unsigned int8 innerDigest[32] = {};
+    sha256(joined, kHmacBlockSize + message.length, #innerDigest[0]);
+
+    // outer = H(K' xor opad || inner)
+    i = 0;
+    while (i < kHmacBlockSize) {
+        @(joined + i) = ((@(blockBytes + i) as int) ^ 0x5c) as unsigned int8;
+        i = i + 1;
+    }
+    memcpy((joined + kHmacBlockSize) as ptr void, #innerDigest[0] as ptr void, 32);
+    sha256(joined, kHmacBlockSize + 32, out);
+    free(joined as ptr void);
+    eof: pass;
+}
+
+//  The tag as 64 lowercase hex characters. This is the form most webhooks put in
+//  a header (`X-Hub-Signature-256: sha256=…` sent separately).
+function hmacSha256Hex(string key, string message):string {
+    unsigned int8 tag[32] = {};
+    hmacSha256Bytes(key, message, #tag[0]);
+    return shaHexBytes(#tag[0], 32);
+    eof: pass;
+}
+
+//  Re-exported so a caller of `hmac` does not have to import `sha256` for the one
+//  hex conversion it needs.
+function shaHexBytes(ptr unsigned int8 bytes, int count):string {
+    string digits = "0123456789abcdef";
+    ptr int8 buffer = alloc(count * 2 + 1) as ptr int8;
+    if (buffer == null) {
+        return "";
+    }
+    int i = 0;
+    while (i < count) {
+        int value = @(bytes + i) as int;
+        @((buffer + i * 2) as ptr unsigned int8) = strByteAt(digits, value >> 4) as unsigned int8;
+        @((buffer + i * 2 + 1) as ptr unsigned int8) = strByteAt(digits, value & 15) as unsigned int8;
+        i = i + 1;
+    }
+    string result = makeString(buffer as ptr char, count * 2);
+    free(buffer as ptr void);
+    return result;
+    eof: pass;
+}
+
+//===--- constant-time comparison -----------------------------------------===//
+
+//  Equal in time independent of *where* two strings differ.
+//
+//  `a == b` on strings shorts-circuits at the first differing byte, so how long it
+//  takes tells an attacker how many leading bytes they guessed correctly. That is
+//  enough to recover a MAC byte by byte instead of by brute force. The fix is to
+//  always look at every byte and accumulate the difference:
+//
+//      diff = diff | (a[i] ^ b[i])
+//
+//  The length check can still return early: a tag of the wrong length is not a
+//  secret (the expected length is public), and comparing different lengths
+//  byte-by-byte would read past the end of one of them.
+function secureEquals(string a, string b):bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    int diff = 0;
+    int i = 0;
+    while (i < a.length) {
+        diff = diff | (strByteAt(a, i) ^ strByteAt(b, i));
+        i = i + 1;
+    }
+    return diff == 0;
+    eof: pass;
+}
+
+//===--- verification -----------------------------------------------------===//
+
+//  True when `message` carries the tag `expected` under `key`.
+//
+//  `expected` may be given three ways, because that is what real services send:
+//
+//      64 hex characters            "5d41402a…"           (hex, any case)
+//      "sha256=<64 hex>"            GitHub's header
+//      the raw 32 bytes            a binary signature
+//
+//  The comparison is always constant time. Nothing about the caller's input is
+//  trusted: a wrong length, a malformed hex string or an empty signature all
+//  return false rather than trapping.
+function hmacVerify(string key, string message, string expected):bool {
+    unsigned int8 tag[32] = {};
+    hmacSha256Bytes(key, message, #tag[0]);
+
+    if (expected.length == 0) {
+        return false;
+    }
+
+    ptr unsigned int8 tagBytes = #tag[0];
+    int i = 0;
+
+    // Raw 32-byte form.
+    if (expected.length == 32) {
+        ptr unsigned int8 raw = strBytesOf(expected) as ptr unsigned int8;
+        int diff = 0;
+        i = 0;
+        while (i < 32) {
+            diff = diff | ((@(raw + i) as int) ^ (@(tagBytes + i) as int));
+            i = i + 1;
+        }
+        // A 32-character hex tag is a legal thing to send, so both readings are
+        // tried only when the raw comparison fails and the text looks like hex.
+        if (diff == 0) {
+            return true;
+        }
+    }
+
+    string text = expected;
+    // Strip the `sha256=` prefix GitHub and Stripe use, case-insensitively.
+    if (text.length > 7) {
+        if (toLower(text[0 .. 7]) == "sha256=") {
+            text = text[7 .. text.length];
+        } else if (toLower(text[0 .. 5]) == "sha1=") {
+            return false;      // a SHA-1 tag cannot match a SHA-256 one
+        }
+    }
+    if (text.length != 64) {
+        return false;
+    }
+
+    // Compare hex without converting: same constant-time discipline, and it
+    // tolerates either case.
+    int textDiff = 0;
+    i = 0;
+    while (i < 32) {
+        int high = strByteAt(text, i * 2);
+        int low = strByteAt(text, i * 2 + 1);
+        int value = (hexDigitValue(high) << 4) | hexDigitValue(low);
+        textDiff = textDiff | (value ^ (@(tagBytes + i) as int));
+        i = i + 1;
+    }
+    return textDiff == 0;
+    eof: pass;
+}
+
+//  Hex digit value, or 0 for a non-digit. Returning 0 rather than -1 keeps the
+//  loop above branch-free; a malformed tag then compares unequal on some byte
+//  instead of failing early, which is exactly what constant time requires.
+function private hexDigitValue(int c):int {
+    if (c >= 48 && c <= 57) {
+        return c - 48;
+    }
+    if (c >= 97 && c <= 102) {
+        return c - 87;
+    }
+    if (c >= 65 && c <= 70) {
+        return c - 55;
+    }
+    return 0;
+    eof: pass;
+}
+
+//===--- base64url --------------------------------------------------------===//
+
+//  RFC 4648 §5: `-` and `_` instead of `+` and `/`, and no `=` padding. JWT, JWS
+//  and most URL-safe token formats use this alphabet.
+function base64UrlEncode(string data):string {
+    string standard = base64Encode(data);
+    // Replace and strip in one pass: padding is at most two bytes.
+    int end = standard.length;
+    while (end > 0 && strByteAt(standard, end - 1) == 61) {
+        end = end - 1;
+    }
+    ptr int8 buffer = alloc(end + 1) as ptr int8;
+    if (buffer == null) {
+        return "";
+    }
+    int i = 0;
+    while (i < end) {
+        int c = strByteAt(standard, i);
+        if (c == 43) {
+            c = 45;      // '+' -> '-'
+        } else if (c == 47) {
+            c = 95;      // '/' -> '_'
+        }
+        @((buffer + i) as ptr unsigned int8) = c as unsigned int8;
+        i = i + 1;
+    }
+    string result = makeString(buffer as ptr char, end);
+    free(buffer as ptr void);
+    return result;
+    eof: pass;
+}
+
+//  Accepts unpadded input as well as padded, and both alphabets: a token that
+//  arrives URL-decoded may still carry `+` and `/`.
+function base64UrlDecode(string encoded):string {
+    ptr int8 buffer = alloc(encoded.length + 8) as ptr int8;
+    if (buffer == null) {
+        return "";
+    }
+    int i = 0;
+    while (i < encoded.length) {
+        int c = strByteAt(encoded, i);
+        if (c == 45) {
+            c = 43;
+        } else if (c == 95) {
+            c = 47;
+        }
+        @((buffer + i) as ptr unsigned int8) = c as unsigned int8;
+        i = i + 1;
+    }
+    // `base64Decode` expects padding to a multiple of four.
+    int at = encoded.length;
+    while (at % 4 != 0) {
+        @((buffer + at) as ptr unsigned int8) = 61u8;      // '='
+        at = at + 1;
+    }
+    string standard = makeString(buffer as ptr char, at);
+    free(buffer as ptr void);
+    return base64Decode(standard);
+    eof: pass;
+}

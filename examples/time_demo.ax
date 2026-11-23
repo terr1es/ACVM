@@ -1,0 +1,135 @@
+//  time_demo.ax — both halves of the time library: four clock reads plus a full calendar.
+//
+//  This example is split in two on purpose:
+//
+//    The first half is plain Axiom (no time.dll): take a known timestamp, split it into
+//    calendar fields, format, parse, add and subtract. The result is fully determined.
+//
+//    The second half uses real clocks: wall time, elapsed time, zone offset. Its output
+//    changes every run, so it only asserts invariants (no going back, slept at least N ms).
+//
+//  That split is the design: compute in Axiom where you can, ask the OS only to read clocks.
+//
+//  Run:  acvm run examples/time_demo.ax
+
+function import (return:(time));
+
+//  ─── first half: plain Axiom, deterministic ───────────────────────────────
+
+function private deterministic():void {
+    print("1. calendar maths, no library needed\n");
+
+    //  A fixed timestamp: 2023-11-14T22:13:20Z.
+    int64 stamp = 1700000000000i64;
+    DateTime t = timeToCivil(stamp);
+    print("   timestamp "); print(stamp); print("\n");
+    print("   as date   "); print(timeFormat(t)); print("\n");
+    print("   as iso    "); print(timeFormatIso(t)); print("\n");
+    print("   weekday   "); print(timeWeekdayAbbr(timeDayOfWeek(t)));
+    print(" (ISO "); print(timeDayOfWeek(t)); print(")\n");
+    print("   day of yr "); print(timeDayOfYear(t)); print(" of ");
+    print(timeIsLeapYear(t.year) ? 366 : 365); print("\n");
+
+    //  The split-out fields are plain integers, free to use in arithmetic.
+    print("   month name "); print(timeMonthName(t.month));
+    print("  days in month "); print(timeDaysInMonth(t.year, t.month)); print("\n");
+
+    //  Assembling them back must land on the same millisecond.
+    print("   round trip "); print(timeFromCivil(t) == stamp); print("\n");
+
+    //  ─── formatting and parsing ──────────────────────────────────────────
+    print("\n2. formatting\n");
+    DateTime sample = {2026, 11, 22, 0, 7, 18, 45};
+    print("   "); print(timeFormatDate(sample)); print("\n");
+    print("   "); print(timeFormatTime(sample)); print("\n");
+    print("   "); print(timeFormat(sample)); print("\n");
+    print("   "); print(timeFormatMs(sample)); print("\n");
+    print("   "); print(timeFormatIsoMs(sample)); print("   <- store this one\n");
+
+    print("\n3. parsing, strict on purpose\n");
+    bool ok = false;
+    int64 parsed = timeParseIso("2026-11-22T00:07:18.045Z", #ok, 0i64);
+    print("   parsed ok="); print(ok);
+    print(" -> "); print(parsed); print("\n");
+    //  A time carrying an offset is converted to the equivalent UTC instant.
+    int64 offset = timeParseIso("2026-11-22T08:07:18+08:00", #ok, 0i64);
+    print("   +08:00 same instant as Z? ");
+    print(offset == timeParseIso("2026-11-22T00:07:18Z", #ok, 0i64)); print("\n");
+    //  Ambiguous or malformed input is rejected outright, never guessed.
+    int64 rejected = timeParseIso("2026/11/22", #ok, -1i64);
+    print("   '2026/11/22' accepted? "); print(ok);
+    print("  value="); print(rejected); print("\n");
+
+    //  ─── arithmetic ──────────────────────────────────────────────────────
+    print("\n4. arithmetic\n");
+    int64 base = timeFromCivil(timeToCivil(1700000000000i64));
+    print("   +1 day  "); print(timeFormatIso(timeToCivil(timeAddDays(base, 1)))); print("\n");
+    print("   -1 day  "); print(timeFormatIso(timeToCivil(timeAddDays(base, -1)))); print("\n");
+    print("   +90 min "); print(timeFormatIso(timeToCivil(timeAddMinutes(base, 90)))); print("\n");
+
+    //  Month-end rollover: an out-of-range field carries, so month lengths need no test.
+    DateTime endOfMonth = {2024, 1, 31, 12, 0, 0, 0};
+    int64 nextDay = timeAddDays(timeFromCivil(endOfMonth), 1);
+    print("   Jan 31 +1d "); print(timeFormatIso(timeToCivil(nextDay))); print("\n");
+    eof: pass;
+}
+
+//  ─── second half: real clocks, different every run ───────────────────────
+
+function private liveClocks():void {
+    print("\n5. reading the clock\n");
+
+    //  Wall clock: time for humans. It is the only reading that may be displayed.
+    int64 nowMs = timeNowMs();
+    DateTime now = timeToCivil(nowMs);
+    print("   now (UTC)   "); print(timeFormat(now)); print("\n");
+
+    //  Local time needs the zone offset, and the offset depends on the instant (DST).
+    print("   now (local) "); print(timeFormat(timeToCivilLocal(nowMs)));
+    print("  offset "); print(timeLocalOffsetString(nowMs)); print("\n");
+
+    print("   weekday     "); print(timeWeekdayAbbr(timeDayOfWeek(now)));
+    print("  day "); print(timeDayOfYear(now)); print("\n");
+
+    //  ─── monotonic clock: good only for subtraction ───────────────────────
+    //
+    //  The wall clock can jump backwards when synced or reset, so timing with it can
+    //  yield a negative duration. The monotonic clock only rises, the only right tool.
+    print("\n6. measuring elapsed time\n");
+
+    int64 start = timeMonotonicNs();
+    //  Do some work: sum 200k squares so the elapsed time cannot be 0.
+    int64 total = 0i64;
+    for (int i = 1; i <= 200000; i++) {
+        total = total + i as int64 * i as int64;
+    }
+    int64 elapsed = timeElapsedMs(start, timeMonotonicNs());
+    print("   sum of squares 1..200000 = "); print(total); print("\n");
+    print("   took "); print(elapsed); print(" ms\n");
+
+    //  sleep: guarantees "at least" this long; the OS rounds up.
+    int64 sleepStart = timeMonotonicNs();
+    timeSleepMs(20);
+    print("   slept "); print(timeElapsedMs(sleepStart, timeMonotonicNs()));
+    print(" ms after asking for 20\n");
+
+    //  The monotonic property: repeated reads never go backwards.
+    bool neverBackwards = true;
+    int64 previous = timeMonotonicNs();
+    for (int i = 0; i < 500; i++) {
+        int64 current = timeMonotonicNs();
+        if (current < previous) {
+            neverBackwards = false;
+        }
+        previous = current;
+    }
+    print("   monotonic over 500 reads: "); print(neverBackwards); print("\n");
+    eof: pass;
+}
+
+function main():void {
+    deterministic();
+    liveClocks();
+    print("\ndone\n");
+    eof: pass;
+}

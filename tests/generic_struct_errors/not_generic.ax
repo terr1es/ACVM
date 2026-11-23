@@ -1,0 +1,3 @@
+//  Arguments given to a type that is not generic.
+struct Plain { int x; };
+function main():void { Plain<int> p; eof: pass; }

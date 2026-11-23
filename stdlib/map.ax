@@ -1,0 +1,783 @@
+//  map.ax — ASTL's ordered maps: five key/value combinations.
+//
+//      function import (return:(map));
+//
+//      int keys[32] = {0};
+//      int values[32] = {0};
+//      MapIntInt m = makeMapIntInt(#keys[0], #values[0], 32);
+//      mapIntPut(#m, 42, 100);
+//      int found = 0;
+//      if (mapIntGet(#m, 42, #found)) { print(found); }     // 100
+//
+//      // the most typical shape: a config table
+//      string ckeys[16];
+//      string cvalues[16];
+//      MapStrStr config = makeMapStrStr(#ckeys[0], #cvalues[0], 16);
+//      mapStrPut(#config, "host", "localhost");
+//      mapStrPut(#config, "port", "8080");
+//
+//  | type | key | value | constructor | ops |
+//  |---|---|---|---|---|
+//  | `MapIntInt`    | `int`    | `int`    | `makeMapIntInt`    | `MapInt*`   |
+//  | `MapIntStr`    | `int`    | `string` | `makeMapIntStr`    | `MapInt*`   |
+//  | `MapInt64Int`  | `int64`  | `int`    | `makeMapInt64Int`  | `MapInt64*` |
+//  | `MapStrInt`    | `string` | `int`    | `makeMapStrInt`    | `MapStr*`   |
+//  | `MapStrStr`    | `string` | `string` | `makeMapStrStr`    | `MapStr*`   |
+//
+//  **Operations under one prefix are overloads, told apart by the first parameter's type.**
+//  `mapIntPut` works on both `MapIntInt` and `MapIntStr`, and the map decides whether the
+//  value is an `int` or a `string`; pass the wrong one and no overload matches. Only the
+//  constructor and `Free` name the type (`makeMapIntStr`, `mapIntStrFree`): no argument yet.
+//
+//  The five combinations still copy their binary search and growth logic instead of sharing
+//  it. What removes the duplication is not generic **functions** (those exist, see
+//  generic **structs**: `mapIntPut` takes `ptr MapIntInt` while
+//  `mapStrPut` takes `ptr MapStrInt`, and only `function mapPut<K, V>(ptr Map<K, V> m, ...)`
+//  is one function. `Map<K, V>` is not implemented yet, so the five copies stay.
+//
+//  Long file; in exchange each combination reads on its own, with no abstraction to learn.
+//
+//  ── why parallel arrays and not an Entry struct ───────────────────────────
+//
+//  Because `algorithm`'s `lowerBound` / `binarySearch` only accept contiguous arrays of
+//  `ptr int`. With parallel arrays (keys one column, values another) the keys go straight
+//  into them and the search is native. Packed as `struct Entry { int key; int value; }`,
+//  the library binary search could not be used at all -- it would be hand-written.
+//
+//  The price: insert and erase touch two places (keys and values each need a `memmove`), and
+//  the two Vecs may grow at different moments -- the one subtle spot here: **make room on
+//  both sides before touching either**, or one side succeeds and the arrays go out of step.
+//
+//  ── relation to set.ax ────────────────────────────────────────────────────
+//
+//  A Set is a Map special case (keys, no values). The modules are independent because their
+//  semantics differ -- no "value" concept, and a dummy would only hurt the API. Both sit on
+//  `vec.ax` and share the same capacity management and shifting.
+
+module "map" version "0.1.0";
+
+function import (return:(vec));
+function import (return:(algorithm));
+function import (return:(strbyte));
+
+// ─── int → int ─────────────────────────────────────────────────────────────
+
+struct MapIntInt {
+    Vec keys;       // ascending, elemSize = sizeof(int)
+    Vec values;     // same index as keys, elemSize = sizeof(int)
+};
+
+//  Binds a map to two caller-owned `int` buffers of equal capacity.
+//  Creates an `int -> int` ordered map over the caller's `keys` / `values`
+//  arrays, each able to hold `capacity` elements before allocating.
+//
+//  `capacity` is an element count per column, not bytes. It is a starting size
+//  only: the map grows on demand, and once it does, `keys` / `values` stop being
+//  updated (the backing store moves to the heap).
+//  Iteration order is ascending by key, never insertion order.
+function makeMapIntInt(ptr int keys, ptr int values, int capacity):MapIntInt {
+    MapIntInt m = {makeVec(keys, capacity), makeVec(values, capacity)};
+    return m;
+    eof: pass;
+}
+
+//  Releases both columns if the map owns them, then zeroes the structure.
+//  A caller-provided pair of buffers is left alone. Safe to call twice.
+function mapIntIntFree(ptr MapIntInt m):void {
+    vecFree(#m->keys);
+    vecFree(#m->values);
+    eof: pass;
+}
+
+//  Ensures both columns can hold one more element. Returns false when either
+//  cannot grow, in which case neither has grown past the point of no return:
+//  callers must not touch the arrays after a false.
+function private mapIntIntReserve(ptr MapIntInt m):bool {
+    const int needed = m->keys.count + 1;
+    if (!vecReserve(#m->keys, needed)) {
+        return false;
+    }
+    // keys may now be on a fresh heap block; values must follow or the two
+    // columns would have different capacities and the insert below could fail
+    // halfway, leaving a key with no value.
+    return vecReserve(#m->values, needed);
+    eof: pass;
+}
+
+//  Inserts or overwrites. Returns false only when the map is full and could not
+//  grow.
+//  Inserts or overwrites `key` in a `MapIntInt`. Returns true on success, false
+//  only when a column could not be grown.
+//  O(n) worst case: a new key shifts every larger key and its value up by one.
+function mapIntPut(ptr MapIntInt m, int key, int value):bool {
+    const int at = lowerBound(m->keys.data as ptr int, m->keys.count, key);
+    const bool present = at < m->keys.count && @(m->keys.data as ptr int + at) == key;
+    if (present) {
+        vecSetInt(#m->values, at, value);
+        return true;
+    }
+    if (!mapIntIntReserve(m)) {
+        return false;
+    }
+    int keySlot = key;
+    int valueSlot = value;
+    if (!vecInsert(#m->keys, at, #keySlot as ptr char)) {
+        return false;
+    }
+    if (!vecInsert(#m->values, at, #valueSlot as ptr char)) {
+        // The key landed but the value did not: roll the key back so the two
+        // columns stay aligned. This can only happen if vecInsert fails after
+        // Reserve succeeded, which the current Vec never does -- but leaving the
+        // half-done state would corrupt every later lookup.
+        vecRemove(#m->keys, at);
+        return false;
+    }
+    return true;
+    eof: pass;
+}
+
+//  Copies the value for `key` into `out` and returns true, or returns false when
+//  the key is absent (leaving `out` untouched).
+//  Looks up `key` in a `MapIntInt`. Returns true and writes `*out` on a hit;
+//  false on a miss, leaving `*out` untouched (check the return value, not `out`).
+function mapIntGet(ptr MapIntInt m, int key, ptr int out):bool {
+    if (m->keys.count <= 0) {
+        return false;
+    }
+    const int at = binarySearch(m->keys.data as ptr int, m->keys.count, key);
+    if (at < 0) {
+        return false;
+    }
+    if (out != 0 as ptr int) {
+        @out = @(m->values.data as ptr int + at);
+    }
+    return true;
+    eof: pass;
+}
+
+//  True when `key` is present in a `MapIntInt`. O(log n) plus the shift-free
+//  lookup, cheaper than `mapIntGet` when the value is not needed.
+function mapIntHas(ptr MapIntInt m, int key):bool {
+    if (m->keys.count <= 0) {
+        return false;
+    }
+    return binarySearch(m->keys.data as ptr int, m->keys.count, key) >= 0;
+    eof: pass;
+}
+
+//  Removes `key`. Returns false when it was absent.
+//  Removes `key` from a `MapIntInt`. Returns false when it was not present.
+//  O(n) worst case: the gap is closed by shifting larger entries down.
+function mapIntRemove(ptr MapIntInt m, int key):bool {
+    const int at = lowerBound(m->keys.data as ptr int, m->keys.count, key);
+    if (at >= m->keys.count) {
+        return false;
+    }
+    if (@(m->keys.data as ptr int + at) != key) {
+        return false;
+    }
+    const bool removedKey = vecRemove(#m->keys, at);
+    const bool removedValue = vecRemove(#m->values, at);
+    return removedKey && removedValue;
+    eof: pass;
+}
+
+//  Number of entries in a `MapIntInt`. O(1).
+function mapIntCount(ptr MapIntInt m):int {
+    return m->keys.count;
+    eof: pass;
+}
+
+//  Key at `index` in ascending order, so index 0 is the smallest key.
+//  Returns 0 when out of range; check the count first when that matters.
+//  Key at `index` in ascending order, for a `MapIntInt`. Index 0 is the smallest
+//  key. Out-of-range yields 0 with no diagnostic -- iterate below `mapIntCount`.
+function mapIntKeyAt(ptr MapIntInt m, int index):int {
+    return vecGetInt(#m->keys, index);
+    eof: pass;
+}
+
+//  Value paired with the key at `index`, in ascending key order, for a
+//  `MapIntInt`. Out-of-range yields 0.
+function mapIntValueAt(ptr MapIntInt m, int index):int {
+    return vecGetInt(#m->values, index);
+    eof: pass;
+}
+
+// ─── string → int ──────────────────────────────────────────────────────────
+//
+//  The key stores a **copy of the string descriptor** (16 bytes), not the character memory.
+//  See the SetStr note in set.ax: the string must outlive the map, or the key dangles.
+
+struct MapStrInt {
+    Vec keys;       // ascending (strCompare order), elemSize = sizeof(string)
+    Vec values;     // same index as keys, elemSize = sizeof(int)
+};
+
+//  Creates a `string -> int` ordered map over the caller's `keys` / `values`
+//  arrays, `capacity` elements each as a starting size.
+//
+//  Keys are descriptor copies, not text: the map does not own the characters, so a
+//  key that came from an `arena_scope` dangles after that scope ends (AX01-M02).
+//  Iteration order is ascending by `strCompare`, i.e. byte-wise, never insertion.
+function makeMapStrInt(ptr string keys, ptr int values, int capacity):MapStrInt {
+    MapStrInt m = {makeVec(keys as ptr char, capacity, sizeof(string)), makeVec(values, capacity)};
+    return m;
+    eof: pass;
+}
+
+//  Releases both columns; key text is not freed. Safe to call twice.
+function mapStrIntFree(ptr MapStrInt m):void {
+    vecFree(#m->keys);
+    vecFree(#m->values);
+    eof: pass;
+}
+
+function private mapStrIntLowerBound(ptr MapStrInt m, string key):int {
+    int low = 0;
+    int high = m->keys.count;
+    while (low < high) {
+        const int mid = low + (high - low) / 2;
+        string here = @(m->keys.data as ptr string + mid);
+        if (strCompare(here, key) < 0) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+    eof: pass;
+}
+
+function private mapStrIntReserve(ptr MapStrInt m):bool {
+    const int needed = m->keys.count + 1;
+    if (!vecReserve(#m->keys, needed)) {
+        return false;
+    }
+    return vecReserve(#m->values, needed);
+    eof: pass;
+}
+
+//  Inserts or overwrites a `string` key in a `MapStrInt`. Returns true on success.
+//  O(n) worst case for the shift, plus O(log n) content comparisons.
+function mapStrPut(ptr MapStrInt m, string key, int value):bool {
+    const int at = mapStrIntLowerBound(m, key);
+    const bool present = at < m->keys.count &&
+        strCompare(@(m->keys.data as ptr string + at), key) == 0;
+    if (present) {
+        vecSetInt(#m->values, at, value);
+        return true;
+    }
+    if (!mapStrIntReserve(m)) {
+        return false;
+    }
+    string keySlot = key;
+    int valueSlot = value;
+    if (!vecInsert(#m->keys, at, #keySlot as ptr char)) {
+        return false;
+    }
+    if (!vecInsert(#m->values, at, #valueSlot as ptr char)) {
+        vecRemove(#m->keys, at);
+        return false;
+    }
+    return true;
+    eof: pass;
+}
+
+//  Looks up a `string` key in a `MapStrInt`. Returns true and writes `*out` on a
+//  hit; false on a miss with `*out` untouched.
+function mapStrGet(ptr MapStrInt m, string key, ptr int out):bool {
+    const int at = mapStrIntLowerBound(m, key);
+    if (at >= m->keys.count) {
+        return false;
+    }
+    if (strCompare(@(m->keys.data as ptr string + at), key) != 0) {
+        return false;
+    }
+    if (out != 0 as ptr int) {
+        @out = @(m->values.data as ptr int + at);
+    }
+    return true;
+    eof: pass;
+}
+
+//  True when the `string` key is present in a `MapStrInt`.
+function mapStrHas(ptr MapStrInt m, string key):bool {
+    return mapStrGet(m, key, 0 as ptr int);
+    eof: pass;
+}
+
+//  Removes a `string` key from a `MapStrInt`. Returns false when absent. O(n).
+function mapStrRemove(ptr MapStrInt m, string key):bool {
+    const int at = mapStrIntLowerBound(m, key);
+    if (at >= m->keys.count) {
+        return false;
+    }
+    if (strCompare(@(m->keys.data as ptr string + at), key) != 0) {
+        return false;
+    }
+    const bool removedKey = vecRemove(#m->keys, at);
+    const bool removedValue = vecRemove(#m->values, at);
+    return removedKey && removedValue;
+    eof: pass;
+}
+
+//  Number of entries. O(1).
+function mapStrCount(ptr MapStrInt m):int {
+    return m->keys.count;
+    eof: pass;
+}
+
+//  Key at `index` in ascending order. Returns "" when out of range, which is also
+//  a key a map can hold -- check the count first.
+//  Key at `index` in ascending (byte-wise) order. Out-of-range yields "".
+function mapStrKeyAt(ptr MapStrInt m, int index):string {
+    ptr char slot = vecAt(#m->keys, index);
+    if (slot == 0 as ptr char) {
+        return "";
+    }
+    return @(slot as ptr string);
+    eof: pass;
+}
+
+//  Value paired with the key at `index`, in ascending key order. Out-of-range
+//  yields 0.
+function mapStrValueAt(ptr MapStrInt m, int index):int {
+    return vecGetInt(#m->values, index);
+    eof: pass;
+}
+
+// ─── string → string ───────────────────────────────────────────────────────
+//
+//  **This is the most typical map shape**: config tables, name -> path, error code ->
+//  description. Before this, none was possible: all four maps had `int` values.
+//
+//  Keys and values both store a **copy of the descriptor** (16 bytes each) and own no
+//  character memory -- see "the string must outlive the map" below.
+//
+//  The operations share names with `MapStrInt` (`mapStrPut` / `mapStrGet` / ...) and are
+//  told apart by the first parameter. Callers need not learn two names: in
+//  `mapStrGet(#m, "k", #out)` whether `out` is `string` or `int` follows from the map itself.
+
+struct MapStrStr {
+    Vec keys;       // ascending (strCompare order), elemSize = sizeof(string)
+    Vec values;     // same index as keys, elemSize = sizeof(string)
+};
+
+//  Creates a `string -> string` ordered map over the caller's arrays.
+//
+//  Both columns are descriptor copies, so neither keys nor values are owned: keep
+//  the text alive for the map's lifetime (AX01-M02).
+//  Iteration order is ascending by key, byte-wise.
+function makeMapStrStr(ptr string keys, ptr string values, int capacity):MapStrStr {
+    MapStrStr m = {makeVec(keys as ptr char, capacity, sizeof(string)),
+                   makeVec(values as ptr char, capacity, sizeof(string))};
+    return m;
+    eof: pass;
+}
+
+//  Releases both columns. Neither key nor value text is freed.
+//  Safe to call twice.
+function mapStrStrFree(ptr MapStrStr m):void {
+    vecFree(#m->keys);
+    vecFree(#m->values);
+    eof: pass;
+}
+
+function private mapStrStrLowerBound(ptr MapStrStr m, string key):int {
+    int low = 0;
+    int high = m->keys.count;
+    while (low < high) {
+        const int mid = low + (high - low) / 2;
+        string here = @(m->keys.data as ptr string + mid);
+        if (strCompare(here, key) < 0) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+    eof: pass;
+}
+
+//  **Both sides need room before either is touched.** One side succeeding and the other
+//  failing leaves the arrays permanently misaligned: every later lookup reads a stranger.
+function private mapStrStrReserve(ptr MapStrStr m):bool {
+    const int needed = m->keys.count + 1;
+    if (!vecReserve(#m->keys, needed)) {
+        return false;
+    }
+    return vecReserve(#m->values, needed);
+    eof: pass;
+}
+
+//  Inserts or overwrites a `string` key in a `MapStrStr`. Returns true on success.
+//  The value is a descriptor copy, so it must outlive the map.
+function mapStrPut(ptr MapStrStr m, string key, string value):bool {
+    const int at = mapStrStrLowerBound(m, key);
+    const bool present = at < m->keys.count &&
+        strCompare(@(m->keys.data as ptr string + at), key) == 0;
+    if (present) {
+        vecSetStr(#m->values, at, value);
+        return true;
+    }
+    if (!mapStrStrReserve(m)) {
+        return false;
+    }
+    string keySlot = key;
+    string valueSlot = value;
+    if (!vecInsert(#m->keys, at, #keySlot as ptr char)) {
+        return false;
+    }
+    if (!vecInsert(#m->values, at, #valueSlot as ptr char)) {
+        vecRemove(#m->keys, at);        // roll back; do not leave a key with no value
+        return false;
+    }
+    return true;
+    eof: pass;
+}
+
+//  `out` may be null, in which case it only queries -- that is `mapStrHas`.
+//  Looks up a `string` key in a `MapStrStr`, writing a descriptor to `*out` on a
+//  hit. Returns false on a miss with `*out` untouched.
+function mapStrGet(ptr MapStrStr m, string key, ptr string out):bool {
+    const int at = mapStrStrLowerBound(m, key);
+    if (at >= m->keys.count) {
+        return false;
+    }
+    if (strCompare(@(m->keys.data as ptr string + at), key) != 0) {
+        return false;
+    }
+    if (out != 0 as ptr string) {
+        @out = @(m->values.data as ptr string + at);
+    }
+    return true;
+    eof: pass;
+}
+
+//  Distinguishes "no such key" from "key present with value" only when the
+//  caller supplies `out`. A stored "" is a legal value.
+//  True when the `string` key is present in a `MapStrStr`.
+function mapStrHas(ptr MapStrStr m, string key):bool {
+    return mapStrGet(m, key, 0 as ptr string);
+    eof: pass;
+}
+
+//  Removes a `string` key from a `MapStrStr`. Returns false when absent. O(n).
+function mapStrRemove(ptr MapStrStr m, string key):bool {
+    const int at = mapStrStrLowerBound(m, key);
+    if (at >= m->keys.count) {
+        return false;
+    }
+    if (strCompare(@(m->keys.data as ptr string + at), key) != 0) {
+        return false;
+    }
+    const bool removedKey = vecRemove(#m->keys, at);
+    const bool removedValue = vecRemove(#m->values, at);
+    return removedKey && removedValue;
+    eof: pass;
+}
+
+//  Number of entries. O(1).
+function mapStrCount(ptr MapStrStr m):int {
+    return m->keys.count;
+    eof: pass;
+}
+
+//  Key at `index` in ascending order. Out-of-range yields "".
+function mapStrKeyAt(ptr MapStrStr m, int index):string {
+    return vecGetStr(#m->keys, index);
+    eof: pass;
+}
+
+//  Value at `index`, in ascending key order. Out-of-range yields "".
+function mapStrValueAt(ptr MapStrStr m, int index):string {
+    return vecGetStr(#m->values, index);
+    eof: pass;
+}
+
+// ─── int → string ──────────────────────────────────────────────────────────
+//
+//  Error code -> description, ID -> name. Keys are `int`; values are descriptor copies.
+//
+//  The key side uses `lowerBound` / `binarySearch` (`int` arrays go straight in); the value
+//  side uses `vecGetStr` / `vecSetStr` -- the same string handling as `MapStrStr`.
+//
+//  The operations share names with `MapIntInt` and are told apart by the first parameter;
+//  in `mapIntGet(#m, 404, #msg)` `msg` is a `string`, and passing an `int` fails to compile.
+
+struct MapIntStr {
+    Vec keys;       // ascending, elemSize = sizeof(int)
+    Vec values;     // same index as keys, elemSize = sizeof(string)
+};
+
+//  Binds a map to a caller-owned `int` key buffer and `string` value buffer of
+//  equal capacity.
+//  Creates an `int -> string` ordered map over the caller's arrays.
+//
+//  Values are descriptor copies, so the text must outlive the map (AX01-M02);
+//  keys are plain ints and need no lifetime.  Iteration is ascending by key.
+function makeMapIntStr(ptr int keys, ptr string values, int capacity):MapIntStr {
+    MapIntStr m = {makeVec(keys, capacity),
+                   makeVec(values as ptr char, capacity, sizeof(string))};
+    return m;
+    eof: pass;
+}
+
+//  Releases both columns. Value text is not freed. Safe to call twice.
+function mapIntStrFree(ptr MapIntStr m):void {
+    vecFree(#m->keys);
+    vecFree(#m->values);
+    eof: pass;
+}
+
+//  Room on both sides first, then touch either -- see the reasoning at mapStrStrReserve.
+function private mapIntStrReserve(ptr MapIntStr m):bool {
+    const int needed = m->keys.count + 1;
+    if (!vecReserve(#m->keys, needed)) {
+        return false;
+    }
+    return vecReserve(#m->values, needed);
+    eof: pass;
+}
+
+//  Inserts or overwrites an `int` key in a `MapIntStr`. Returns true on success.
+//  O(n) worst case for the shift.
+function mapIntPut(ptr MapIntStr m, int key, string value):bool {
+    const int at = lowerBound(m->keys.data as ptr int, m->keys.count, key);
+    const bool present = at < m->keys.count && @(m->keys.data as ptr int + at) == key;
+    if (present) {
+        vecSetStr(#m->values, at, value);
+        return true;
+    }
+    if (!mapIntStrReserve(m)) {
+        return false;
+    }
+    int keySlot = key;
+    string valueSlot = value;
+    if (!vecInsert(#m->keys, at, #keySlot as ptr char)) {
+        return false;
+    }
+    if (!vecInsert(#m->values, at, #valueSlot as ptr char)) {
+        vecRemove(#m->keys, at);        // roll back, keep the two columns aligned
+        return false;
+    }
+    return true;
+    eof: pass;
+}
+
+//  Copies the value into `out` and returns true, or false when absent (leaving
+//  `out` untouched). `out` may be null to test for presence only.
+//  Looks up an `int` key in a `MapIntStr`, writing a descriptor to `*out` on a
+//  hit. Returns false on a miss with `*out` untouched.
+function mapIntGet(ptr MapIntStr m, int key, ptr string out):bool {
+    if (m->keys.count <= 0) {
+        return false;
+    }
+    const int at = binarySearch(m->keys.data as ptr int, m->keys.count, key);
+    if (at < 0) {
+        return false;
+    }
+    if (out != 0 as ptr string) {
+        @out = vecGetStr(#m->values, at);
+    }
+    return true;
+    eof: pass;
+}
+
+//  True when the `int` key is present in a `MapIntStr`.
+function mapIntHas(ptr MapIntStr m, int key):bool {
+    if (m->keys.count <= 0) {
+        return false;
+    }
+    return binarySearch(m->keys.data as ptr int, m->keys.count, key) >= 0;
+    eof: pass;
+}
+
+//  Removes an `int` key from a `MapIntStr`. Returns false when absent. O(n).
+function mapIntRemove(ptr MapIntStr m, int key):bool {
+    const int at = lowerBound(m->keys.data as ptr int, m->keys.count, key);
+    if (at >= m->keys.count) {
+        return false;
+    }
+    if (@(m->keys.data as ptr int + at) != key) {
+        return false;
+    }
+    const bool removedKey = vecRemove(#m->keys, at);
+    const bool removedValue = vecRemove(#m->values, at);
+    return removedKey && removedValue;
+    eof: pass;
+}
+
+//  Number of entries. O(1).
+function mapIntCount(ptr MapIntStr m):int {
+    return m->keys.count;
+    eof: pass;
+}
+
+//  Key at `index` in ascending order. Out-of-range yields 0.
+function mapIntKeyAt(ptr MapIntStr m, int index):int {
+    return vecGetInt(#m->keys, index);
+    eof: pass;
+}
+
+//  Value at `index`, in ascending key order. Out-of-range yields "".
+function mapIntValueAt(ptr MapIntStr m, int index):string {
+    return vecGetStr(#m->values, index);
+    eof: pass;
+}
+
+// ─── int64 → int ───────────────────────────────────────────────────────────
+//
+//  Timestamp -> count, large ID -> index.
+//
+//  **The binary search is hand-written, not `lowerBound64`.** That function exists only in
+//  `algorithm.axd` (the C build), with no Axiom fallback in `algorithm.ax` -- using it would
+//  make the map require the dll, and a base container should not. Twenty lines for zero deps.
+//
+//  Key access also goes through `ptr int64` directly: `vec.ax` has only the `int` helpers
+//  (`vecGetInt` etc.), no `int64` version (size 8, not 4 -- mixing reads half a value).
+
+struct MapInt64Int {
+    Vec keys;       // ascending, elemSize = sizeof(int64)
+    Vec values;     // same index as keys, elemSize = sizeof(int)
+};
+
+//  Binds a map to a caller-owned `int64` key buffer and `int` value buffer of
+//  equal capacity.
+//  Creates an `int64 -> int` ordered map over the caller's arrays.
+//
+//  Exists because `int32` keys cannot hold a 64 bit id; lookup uses the native
+//  `lowerBound64` / `binarySearch64`. Iteration is ascending by key.
+function makeMapInt64Int(ptr int64 keys, ptr int values, int capacity):MapInt64Int {
+    MapInt64Int m = {makeVec(keys as ptr char, capacity, sizeof(int64)),
+                     makeVec(values, capacity)};
+    return m;
+    eof: pass;
+}
+
+//  Releases both columns. Safe to call twice.
+function mapInt64IntFree(ptr MapInt64Int m):void {
+    vecFree(#m->keys);
+    vecFree(#m->values);
+    eof: pass;
+}
+
+function private mapInt64LowerBound(ptr MapInt64Int m, int64 key):int {
+    int low = 0;
+    int high = m->keys.count;
+    while (low < high) {
+        const int mid = low + (high - low) / 2;
+        const int64 here = @(m->keys.data as ptr int64 + mid);
+        if (here < key) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+    eof: pass;
+}
+
+//  Key at `index`, or 0 when out of range.
+function private mapInt64KeyRaw(ptr MapInt64Int m, int index):int64 {
+    ptr char slot = vecAt(#m->keys, index);
+    if (slot == 0 as ptr char) {
+        return 0;
+    }
+    return @(slot as ptr int64);
+    eof: pass;
+}
+
+//  Room on both sides first, then touch either -- see the reasoning at mapStrStrReserve.
+function private mapInt64IntReserve(ptr MapInt64Int m):bool {
+    const int needed = m->keys.count + 1;
+    if (!vecReserve(#m->keys, needed)) {
+        return false;
+    }
+    return vecReserve(#m->values, needed);
+    eof: pass;
+}
+
+//  Inserts or overwrites an `int64` key. Returns true on success.
+//  O(n) worst case for the shift, with native 64 bit comparisons.
+function mapInt64Put(ptr MapInt64Int m, int64 key, int value):bool {
+    const int at = mapInt64LowerBound(m, key);
+    const bool present = at < m->keys.count && mapInt64KeyRaw(m, at) == key;
+    if (present) {
+        vecSetInt(#m->values, at, value);
+        return true;
+    }
+    if (!mapInt64IntReserve(m)) {
+        return false;
+    }
+    int64 keySlot = key;
+    int valueSlot = value;
+    if (!vecInsert(#m->keys, at, #keySlot as ptr char)) {
+        return false;
+    }
+    if (!vecInsert(#m->values, at, #valueSlot as ptr char)) {
+        vecRemove(#m->keys, at);        // roll back, keep the two columns aligned
+        return false;
+    }
+    return true;
+    eof: pass;
+}
+
+//  Copies the value into `out` and returns true, or false when absent. `out` may
+//  be null to test for presence only.
+//  Looks up an `int64` key. Returns true and writes `*out` on a hit; false on a
+//  miss with `*out` untouched.
+function mapInt64Get(ptr MapInt64Int m, int64 key, ptr int out):bool {
+    const int at = mapInt64LowerBound(m, key);
+    if (at >= m->keys.count) {
+        return false;
+    }
+    if (mapInt64KeyRaw(m, at) != key) {
+        return false;
+    }
+    if (out != 0 as ptr int) {
+        @out = vecGetInt(#m->values, at);
+    }
+    return true;
+    eof: pass;
+}
+
+//  True when the `int64` key is present.
+function mapInt64Has(ptr MapInt64Int m, int64 key):bool {
+    return mapInt64Get(m, key, 0 as ptr int);
+    eof: pass;
+}
+
+//  Removes an `int64` key. Returns false when absent. O(n).
+function mapInt64Remove(ptr MapInt64Int m, int64 key):bool {
+    const int at = mapInt64LowerBound(m, key);
+    if (at >= m->keys.count) {
+        return false;
+    }
+    if (mapInt64KeyRaw(m, at) != key) {
+        return false;
+    }
+    const bool removedKey = vecRemove(#m->keys, at);
+    const bool removedValue = vecRemove(#m->values, at);
+    return removedKey && removedValue;
+    eof: pass;
+}
+
+//  Number of entries. O(1).
+function mapInt64Count(ptr MapInt64Int m):int {
+    return m->keys.count;
+    eof: pass;
+}
+
+//  Key at `index` in ascending order. Out-of-range yields 0i64.
+function mapInt64KeyAt(ptr MapInt64Int m, int index):int64 {
+    return mapInt64KeyRaw(m, index);
+    eof: pass;
+}
+
+//  Value at `index`, in ascending key order. Out-of-range yields 0.
+function mapInt64ValueAt(ptr MapInt64Int m, int index):int {
+    return vecGetInt(#m->values, index);
+    eof: pass;
+}

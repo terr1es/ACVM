@@ -1,0 +1,8 @@
+//  An unnamed first parameter is the receiver, and the receiver can only be
+//  self / ptr self.
+struct S {
+    int n;
+    function get(int):int { return 1; }
+};
+
+function main():void { pass; eof: pass; }

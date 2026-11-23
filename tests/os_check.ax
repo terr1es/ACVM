@@ -1,0 +1,494 @@
+//  os_check.ax — the system library.
+//
+//  One rule shapes every assertion here: **nothing is compared against a value
+//  from this particular machine.** No hard-coded paths, no expected user name, no
+//  assumed platform. What is asserted is the contract -- non-empty, mutually
+//  consistent, round-trips to itself -- so the same file passes on a CI container,
+//  a developer's Windows box and a Mac.
+//
+//  Where the platform genuinely differs (separator, path list separator), the test
+//  derives the expectation from `isWindows()` rather than from the build host.
+//
+//  Run:  acvm run tests/os_check.ax
+//
+//  Not covered: `exitProcess`, because a test that exits cannot report anything
+//  afterwards. It is exercised by hand (and by nothing else, which is a gap worth
+//  remembering if it ever breaks).
+
+function import (return:(os));
+function import (return:(test));
+function import (return:(io));
+function import (return:(str));
+function import (return:(codec));
+
+//  Replaces both separators with one, so two paths can be compared without caring
+//  which platform built which. Used only by the chdir assertion.
+function private killSeparators(string path):string {
+    string out = replaceAll(path, "\\", "/");
+    return out;
+    eof: pass;
+}
+
+// ─── platform identity ────────────────────────────────────────────────────
+
+function private checkPlatform():void {
+    testGroup("platform");
+
+    string name = platformName();
+    //  One of the five names, never the empty string: an unknown platform reports
+    //  "unknown" rather than nothing, so a caller can print it unconditionally.
+    bool known = name == "windows" || name == "linux" || name == "macos" ||
+                 name == "freebsd" || name == "unknown";
+    check(known, "platformName is one of the five names");
+    check(name.length > 0, "platformName is never empty");
+
+    string arch = archName();
+    bool knownArch = arch == "x86" || arch == "x86_64" || arch == "arm" ||
+                     arch == "arm64" || arch == "unknown";
+    check(knownArch, "archName is one of the five names");
+
+    //  The id and the name must agree. This is the only assertion that ties the
+    //  native constant to the Axiom mapping, and it is what would catch a
+    //  renumbering.
+    checkInt(platformId() >= 0 && platformId() <= 4 ? 1 : 0, 1, "platformId in range");
+    check(platformId() == 0 ? name == "unknown" : name != "unknown", "id and name agree");
+
+    //  The separator has to match the platform, not the build host.
+    if (isWindows()) {
+        checkString(pathSeparator(), "\\", "windows separator");
+        checkString(pathListSeparator(), ";", "windows path list separator");
+    } else {
+        checkString(pathSeparator(), "/", "posix separator");
+        checkString(pathListSeparator(), ":", "posix path list separator");
+    }
+    eof: pass;
+}
+
+function private checkMachine():void {
+    testGroup("machine information");
+
+    check(cpuCount() >= 1, "at least one processor");
+    check(pageSize() >= 1024, "page size is a plausible number");
+    check(physicalMemoryBytes() > 0, "memory total is positive");
+    //  64 MB floor: catches a units mistake (reporting KB or MB instead of bytes).
+    check(physicalMemoryBytes() > 64 * 1024 * 1024, "memory looks like bytes");
+    check(processId() > 0, "process id is positive");
+    check(hostName().length > 0, "host name is non-empty");
+    check(userName().length > 0, "user name is non-empty");
+    eof: pass;
+}
+
+// ─── directories ──────────────────────────────────────────────────────────
+
+//  A directory this test can write into and clean up. The temp directory is the
+//  only safe choice: writing next to the executable would leave debris in the
+//  build tree, and writing into the home directory would leave debris in the
+//  user's life.
+function private scratchDir():string {
+    return pathJoin(tempDir(), "axiom_os_check");
+    eof: pass;
+}
+
+function private ensureScratch():bool {
+    string dir = scratchDir();
+    if (isDirectory(dir)) {
+        return true;
+    }
+    return makeDir(dir) == 0;
+    eof: pass;
+}
+
+function private checkDirectories():void {
+    testGroup("well-known directories");
+
+    string tmp = tempDir();
+    string home = homeDir();
+    check(tmp.length > 0, "temp directory is non-empty");
+    check(home.length > 0, "home directory is non-empty");
+    //  No trailing separator: `pathJoin` adds one when it is missing, so a path
+    //  that already ends with one produces a doubled separator.
+    check(trimSuffix(tmp, "/") == tmp || tmp == "/", "temp dir has no trailing slash");
+    check(trimSuffix(tmp, "\\") == tmp, "temp dir has no trailing backslash");
+    check(trimSuffix(home, "/") == home || home == "/", "home dir has no trailing slash");
+    check(isDirectory(tmp), "temp directory exists");
+    check(isDirectory(home), "home directory exists");
+
+    //  configDir must end with the application name and must not be empty when the
+    //  platform provides the base directory.
+    string config = configDir("axiom_os_check_app");
+    check(config.length > 0, "configDir is non-empty");
+    checkString(pathBase(config), "axiom_os_check_app", "configDir ends with the app name");
+    checkString(configDir(""), "", "configDir of '' is ''");
+
+    //  Native separators: on Windows no '/' should survive.
+    if (isWindows()) {
+        checkInt(indexOf(config, "/"), -1, "configDir uses native separators");
+    }
+    eof: pass;
+}
+
+function private checkWorkingDirectory():void {
+    testGroup("working directory");
+
+    string start = cwd();
+    check(start.length > 0, "cwd is non-empty");
+    check(isDirectory(start), "cwd exists");
+
+    //  Changing to a directory that does not exist must fail and must leave the
+    //  working directory alone -- a failed chdir that half-succeeded would be far
+    //  worse than a plain failure.
+    checkInt(setCurrentDir(pathJoin(start, "no_such_dir_axiom")), -1, "chdir to missing fails");
+    checkString(cwd(), start, "failed chdir leaves cwd unchanged");
+
+    //  A round trip through a real directory.
+    //
+    //  The path is compared by its **directory name**, not by the joined string:
+    //  `cwd()` reports whatever separators the operating system uses (backslashes
+    //  on Windows) while `pathJoin` always builds with '/'. Both are correct and
+    //  they are not equal, which is exactly the trap `toNativePath` exists for.
+    if (ensureScratch()) {
+        string scratch = scratchDir();
+        checkInt(setCurrentDir(scratch), 0, "chdir to scratch");
+        checkString(pathBase(cwd()), "axiom_os_check", "cwd follows chdir");
+        checkString(killSeparators(cwd()), killSeparators(scratch), "cwd matches apart from separators");
+        checkInt(setCurrentDir(start), 0, "chdir back");
+        checkString(cwd(), start, "cwd restored exactly");
+    } else {
+        fail("could not create the scratch directory for the chdir round trip");
+    }
+    eof: pass;
+}
+
+function private checkExecutablePath():void {
+    testGroup("executable path");
+
+    string exe = exePath();
+    check(exe.length > 0, "exePath is non-empty");
+    check(fileExists(exe), "the executable path exists");
+    check(pathDir(exe).length > 0, "the executable has a directory");
+    //  The point of exePath: it locates the binary regardless of the working
+    //  directory, so it must not be relative.
+    check(isDirectory(pathDir(exe)), "the executable's directory exists");
+    eof: pass;
+}
+
+// ─── environment ──────────────────────────────────────────────────────────
+
+function private checkEnvironment():void {
+    testGroup("environment get/set/unset");
+
+    const string name = "AXIOM_OS_CHECK_VAR";
+
+    //  Start from a known state: a previous failed run may have left it behind.
+    envUnset(name);
+    check(!envHas(name), "variable starts unset");
+    checkString(env(name), "", "unset variable reads as empty");
+
+    checkInt(envSet(name, "hello world"), 0, "set succeeds");
+    check(envHas(name), "has after set");
+    checkString(env(name), "hello world", "value round-trips");
+
+    //  Overwrite.
+    checkInt(envSet(name, "second"), 0, "overwrite succeeds");
+    checkString(env(name), "second", "overwritten value");
+
+    //  An empty value is *present*, which is the whole reason `envHas` exists:
+    //  `env` returns "" for both "unset" and "set to empty".
+    checkInt(envSet(name, ""), 0, "set to empty succeeds");
+    check(envHas(name), "empty value still counts as present");
+    checkString(env(name), "", "empty value reads as empty");
+
+    //  Unset reports whether there was anything to remove.
+    checkInt(envUnset(name), 0, "unset succeeds");
+    check(!envHas(name), "gone after unset");
+    checkInt(envUnset(name), -1, "unset twice reports nothing to remove");
+
+    //  A value containing '=' must survive: it is legal in the value half and is
+    //  what catches a split that uses the last '=' instead of the first.
+    checkInt(envSet(name, "a=b=c"), 0, "set value containing equals");
+    checkString(env(name), "a=b=c", "value with equals round-trips");
+    envUnset(name);
+
+    //  A very long value: the wrapper uses a 4 KB buffer, so this checks that a
+    //  value does not get silently truncated. 3 KB stays under the wrapper's limit
+    //  and far over any single-field expectation.
+    string longValue = repeat("x", 3000);
+    checkInt(envSet(name, longValue), 0, "set long value");
+    string readBack = env(name);
+    checkInt(readBack.length, 3000, "long value is not truncated");
+    check(readBack == longValue, "long value matches byte for byte");
+    envUnset(name);
+    eof: pass;
+}
+
+function private checkEnvironmentList():void {
+    testGroup("environment enumeration");
+
+    int count = envCount();
+    //  Any process has at least PATH/HOME/TEMP; a count of 0 means the walk is
+    //  broken, which is exactly the bug an earlier flat-buffer design had.
+    check(count > 0, "envCount is positive");
+    check(count > 5, "a real environment has more than a handful of variables");
+
+    //  In-range entries are non-empty and contain '='; out-of-range is "".
+    if (count > 0) {
+        check(envEntryAt(0).length > 0, "first entry is non-empty");
+        checkContains(envEntryAt(0), "=", "first entry has an equals sign");
+    }
+    checkString(envEntryAt(count), "", "past the end is empty");
+    checkString(envEntryAt(count + 100), "", "far past the end is empty");
+    checkString(envEntryAt(-1), "", "negative index is empty");
+
+    //  A variable this program set must appear in the enumeration, with its name
+    //  and value splittable. This is the assertion that would catch the
+    //  one-byte-per-element packing bug: the entry would come back interleaved
+    //  with NULs and no longer match.
+    const string name = "AXIOM_OS_CHECK_LISTED";
+    envSet(name, "value with spaces");
+    bool found = false;
+    bool splitOk = false;
+    int total = envCount();
+    for (int i = 0; i < total; i++) {
+        string entry = envEntryAt(i);
+        if (envEntryName(entry) == name) {
+            found = true;
+            splitOk = envEntryValue(entry) == "value with spaces";
+        }
+    }
+    check(found, "a variable set at run time appears in the enumeration");
+    check(splitOk, "its name and value split correctly");
+    envUnset(name);
+
+    //  Splitting edge cases.
+    checkString(envEntryName("A=B=C"), "A", "name splits on the first equals");
+    checkString(envEntryValue("A=B=C"), "B=C", "value keeps the later equals");
+    checkString(envEntryName("NOEQUALS"), "NOEQUALS", "no equals: name is the whole entry");
+    checkString(envEntryValue("NOEQUALS"), "", "no equals: value is empty");
+    checkString(envEntryName("EMPTY="), "EMPTY", "trailing equals: name");
+    checkString(envEntryValue("EMPTY="), "", "trailing equals: empty value");
+    eof: pass;
+}
+
+function private checkPathEntries():void {
+    testGroup("PATH splitting");
+
+    //  The separator check that matters: a Windows PATH contains "C:\...", so
+    //  splitting on ':' would cut every entry at the drive letter and produce
+    //  fragments like "C" and "\Program Files\...".
+    SplitList parts = pathEntries();
+    int count = splitCount(#parts);
+    check(count > 0, "PATH has at least one entry");
+    if (count > 0) {
+        check(splitAt(#parts, 0).length > 0, "first PATH entry is non-empty");
+
+        //  The real invariant: no entry was cut at a colon. On Windows a PATH
+        //  entry is "C://dir" -- splitting on ':' would turn that into a fragment
+        //  "C" and a fragment "\dir". Testing "the first entry has a drive letter"
+        //  would fail on a machine whose PATH starts with something else, which is
+        //  what this test used to do; counting separators is the honest check.
+        if (isWindows()) {
+            int withColon = 0;
+            for (int i = 0; i < count; i++) {
+                if (indexOf(splitAt(#parts, i), ":") >= 0) {
+                    withColon = withColon + 1;
+                }
+            }
+            //  At least one entry must look like a drive path, or the split cut
+            //  every one of them at the colon.
+            check(withColon > 0, "at least one Windows PATH entry keeps its drive letter");
+
+            //  And entries must be far fewer than the character count, i.e. the
+            //  split did not happen at every colon.
+            int joined = env("PATH").length;
+            check(count < joined, "PATH was not split at every character");
+        }
+    }
+    splitFree(#parts);
+    eof: pass;
+}
+
+// ─── file operations ──────────────────────────────────────────────────────
+
+function private checkFileSize():void {
+    testGroup("fileSizeBytes");
+
+    if (!ensureScratch()) {
+        fail("cannot create scratch directory");
+        return;
+    }
+    string path = pathJoin(scratchDir(), "size.txt");
+    writeTextFile(path, "0123456789");
+    checkInt64(fileSizeBytes(path), 10, "size of a 10 byte file");
+
+    //  A directory has no file size, and neither does a missing path: both are -1
+    //  rather than 0, because 0 is a real answer for an empty file.
+    checkInt64(fileSizeBytes(scratchDir()), -1, "directory has no size");
+    checkInt64(fileSizeBytes(pathJoin(scratchDir(), "missing.txt")), -1, "missing file is -1");
+
+    writeTextFile(path, "");
+    checkInt64(fileSizeBytes(path), 0, "empty file is 0, not -1");
+    removeFile(path);
+    eof: pass;
+}
+
+function private checkCopy():void {
+    testGroup("copyFile");
+
+    if (!ensureScratch()) {
+        fail("cannot create scratch directory");
+        return;
+    }
+    string from = pathJoin(scratchDir(), "from.bin");
+    string to = pathJoin(scratchDir(), "to.bin");
+
+    //  Binary content: every byte value, including NUL and the ones that a
+    //  text-mode copy would translate. This is what catches "opened in text mode".
+    ptr int8 raw = alloc(256) as ptr int8;
+    for (int i = 0; i < 256; i++) {
+        int value = i;
+        if (value > 127) {
+            value = value - 128 - 128;      // wrap to a signed byte
+        }
+        @(raw + i) = value as int8;
+    }
+    string payload = makeString(raw as ptr char, 256);
+    free(raw);
+
+    writeTextFile(from, payload);
+    checkInt(copyFile(from, to), 0, "copy succeeds");
+    checkInt64(fileSizeBytes(to), 256, "copy has the same size");
+
+    char readBack[512];
+    int bytes = readTextFile(to, #readBack[0], 512);
+    checkInt(bytes, 256, "copy reads back the same byte count");
+    check(makeString(#readBack[0], bytes) == payload, "copy is byte for byte identical");
+
+    //  Overwrite: copying onto an existing longer file must truncate, not append.
+    writeTextFile(to, "a much longer pre-existing content that must disappear");
+    checkInt(copyFile(from, to), 0, "copy over an existing file");
+    checkInt64(fileSizeBytes(to), 256, "overwritten file has the source size");
+
+    checkInt(copyFile(pathJoin(scratchDir(), "missing.bin"), to), -1, "copy of a missing file fails");
+
+    removeFile(from);
+    removeFile(to);
+    eof: pass;
+}
+
+function private checkDiskFree():void {
+    testGroup("diskFreeBytes");
+
+    if (!ensureScratch()) {
+        fail("cannot create scratch directory");
+        return;
+    }
+    //  Any writable volume has some free space. The floor is 1 MB rather than 1
+    //  byte so a units mistake shows up.
+    check(diskFreeBytes(tempDir()) > 1024 * 1024, "free space is positive and in bytes");
+    checkInt64(diskFreeBytes(pathJoin(tempDir(), "no_such_path_axiom")), -1,
+               "unknown path reports -1");
+    eof: pass;
+}
+
+// ─── running commands ─────────────────────────────────────────────────────
+
+function private checkRunCommand():void {
+    testGroup("runCommand");
+
+    //  Exit codes are the contract. Anything else (the exact text, the shell) is
+    //  the platform's business, so only the numbers are asserted.
+    checkInt(runCommand("exit 0"), 0, "exit 0 is reported as 0");
+    checkInt(runCommand("exit 3"), 3, "exit 3 is reported as 3");
+    //  A command that does not exist makes the shell exit non-zero. Its exact code
+    //  differs (1 on cmd.exe, 127 on sh), so the assertion is "not zero".
+    check(runCommand("no_such_command_axiom_xyz") != 0, "a missing command reports failure");
+
+    //  Its output goes to the program's own output, which this test cannot see.
+    //  `runCapture` below covers that side.
+    eof: pass;
+}
+
+function private checkRunCapture():void {
+    testGroup("runCapture");
+
+    string out = runCapture("echo axiom-os-check");
+    checkContains(out, "axiom-os-check", "captured output contains the word");
+    //  The trailing newline is part of the output; a capture that stripped it
+    //  would be lying about the bytes.
+    check(trimSuffix(out, "\n") != out || trimSuffix(out, "\r\n") != out, "output keeps its newline");
+
+    //  Exit code travels separately, so "produced nothing" and "failed" differ.
+    char buffer[256];
+    int code[1] = {-1};
+    int bytes = runCaptureInto("exit 7", #buffer[0], 256, #code[0], 1);
+    //  No output but a valid run: 0 bytes, exit code 7.
+    checkInt(bytes, 0, "a silent command produces 0 bytes");
+    checkInt(code[0], 7, "its exit code is still reported");
+
+    //  A buffer too small for the output is -1, not a truncated answer.
+    char tiny[4];
+    int overflowCode[1] = {-1};
+    int truncated = runCaptureInto("echo this output is definitely longer than four bytes",
+                                   #tiny[0], 4, #overflowCode[0], 1);
+    checkInt(truncated, -1, "output larger than the buffer is an error");
+    eof: pass;
+}
+
+// ─── path normalisation ───────────────────────────────────────────────────
+
+function private checkNativePath():void {
+    testGroup("toNativePath");
+
+    if (isWindows()) {
+        checkString(toNativePath("a/b/c"), "a\\b\\c", "windows converts slashes");
+        checkString(toNativePath("C:\\x/y"), "C:\\x\\y", "mixed separators normalise");
+    } else {
+        checkString(toNativePath("a/b/c"), "a/b/c", "posix leaves slashes alone");
+        checkString(toNativePath("C:\\x/y"), "C:\\x/y", "posix does not touch backslashes");
+    }
+    checkString(toNativePath(""), "", "empty stays empty");
+    eof: pass;
+}
+
+// ─── cleanup ──────────────────────────────────────────────────────────────
+
+function private cleanScratch():void {
+    string dir = scratchDir();
+    if (!isDirectory(dir)) {
+        return;
+    }
+    //  The test removes its own files as it goes; this clears anything a failed
+    //  run left behind, one level deep, then the directory itself.
+    char names[4096];
+    int count = listDir(dir, #names[0], 4096);
+    if (count > 0) {
+        for (int i = 0; i < count; i++) {
+            string entry = dirEntryAt(#names[0], 4096, i);
+            if (entry.length > 0) {
+                removeFile(pathJoin(dir, entry));
+            }
+        }
+    }
+    removeDir(dir);
+    eof: pass;
+}
+
+function main():void {
+    checkPlatform();
+    checkMachine();
+    checkDirectories();
+    checkWorkingDirectory();
+    checkExecutablePath();
+    checkEnvironment();
+    checkEnvironmentList();
+    checkPathEntries();
+    checkFileSize();
+    checkCopy();
+    checkDiskFree();
+    checkRunCommand();
+    checkRunCapture();
+    checkNativePath();
+    cleanScratch();
+    testFinish();
+    eof: pass;
+}

@@ -1,0 +1,112 @@
+//  fmt_check.ax — ftoaFixed: fixed-point decimal output.
+//
+//  Each assertion below pins down a case that a lazy implementation gets wrong:
+//
+//    9.999    the carry must reach the integer part, not just the fraction
+//    100.0    ftoa gives "1e+02", here it must be "100.00"
+//    0.1+0.2  the float noise has to be rounded off
+//    -0.001   must not print "-0.00"
+//
+//  Run:  acvm run tests/fmt_check.ax
+
+function import (return:(io));
+function import (return:(test));
+
+function private checkBasic():void {
+    testGroup("ftoaFixed basic");
+
+    checkString(ftoaFixed(3.14159265, 2), "3.14", "pi to 2");
+    checkString(ftoaFixed(2.0, 2), "2.00", "integer value gets decimals");
+    checkString(ftoaFixed(0.5, 1), "0.5", "one decimal");
+    checkString(ftoaFixed(1.5, 4), "1.5000", "pad to more decimals than present");
+    checkString(ftoaFixed(1234567.891, 3), "1234567.891", "large integer part");
+    checkString(ftoaFixed(0.0, 2), "0.00", "zero");
+    eof: pass;
+}
+
+function private checkCarry():void {
+    testGroup("ftoaFixed carry");
+
+    //  The carry must reach the integer part, turning 9 into 10 and 99 into 100.
+    checkString(ftoaFixed(9.999, 2), "10.00", "carry into units");
+    checkString(ftoaFixed(99.995, 2), "100.00", "carry into tens");
+    checkString(ftoaFixed(0.999, 2), "1.00", "carry from below one");
+
+    //  A value just short of the carry must not be pushed over it.
+    checkString(ftoaFixed(9.994, 2), "9.99", "just below carry");
+    eof: pass;
+}
+
+function private checkRounding():void {
+    testGroup("ftoaFixed rounding");
+
+    //  Noise: in a double 0.1+0.2 is 0.30000000000000004, so 2 decimals give 0.30.
+    checkString(ftoaFixed(0.1 + 0.2, 2), "0.30", "float noise is dropped");
+
+    //  Away from zero, not banker's rounding: 0.5 up, -0.5 down.
+    checkString(ftoaFixed(2.5, 0), "3", "half rounds away from zero");
+    checkString(ftoaFixed(-2.5, 0), "-3", "negative half rounds away from zero");
+    checkString(ftoaFixed(2.4, 0), "2", "below half");
+    checkString(ftoaFixed(-2.4, 0), "-2", "negative below half");
+
+    //  Consistent with C / Python / Java: 1.005 is 1.00499… as a double, so the
+    //  result is 1.00. That is a property of double, not a defect in the
+    //  implementation; returning 1.01 would disagree with every mainstream
+    //  language.
+    checkString(ftoaFixed(1.005, 2), "1.00", "1.005 follows the double value");
+    eof: pass;
+}
+
+function private checkNegativeAndZero():void {
+    testGroup("ftoaFixed sign");
+
+    checkString(ftoaFixed(-12.345, 2), "-12.35", "negative");
+    checkString(ftoaFixed(-0.5, 0), "-1", "negative with zero decimals");
+
+    //  Negative zero: when the value is too small to show at two decimals, no
+    //  minus sign.
+    checkString(ftoaFixed(-0.001, 2), "0.00", "negative zero drops the sign");
+    checkString(ftoaFixed(-0.0, 2), "0.00", "literal negative zero");
+
+    //  A genuinely negative value must keep its sign, even with a zero integer
+    //  part.
+    checkString(ftoaFixed(-0.5, 1), "-0.5", "small negative keeps sign");
+    eof: pass;
+}
+
+function private checkClamping():void {
+    testGroup("ftoaFixed decimals clamping");
+
+    //  A negative decimal count is treated as 0, not a crash or strange output.
+    checkString(ftoaFixed(3.7, 0), "4", "zero decimals rounds");
+    checkString(ftoaFixed(3.7, -5), "4", "negative decimals clamps to zero");
+
+    //  More than 15 decimals is meaningless (a double carries 15-17 significant
+    //  digits), so it clamps to 15.
+    string long15 = ftoaFixed(0.5, 99);
+    checkString(long15, "0.500000000000000", "decimals clamps to 15");
+    checkInt(long15.length, 17, "15 decimals means 17 chars for 0.5");
+    eof: pass;
+}
+
+function private checkSpecial():void {
+    testGroup("ftoaFixed non-finite");
+
+    //  Non-finite values have no fixed-point form, so they go to ftoa unchanged.
+    double zero = 0.0;
+    checkString(ftoaFixed(1.0 / zero, 2), "inf", "positive infinity");
+    checkString(ftoaFixed(-1.0 / zero, 2), "-inf", "negative infinity");
+    checkString(ftoaFixed(zero / zero, 2), "nan", "nan");
+    eof: pass;
+}
+
+function main():void {
+    checkBasic();
+    checkCarry();
+    checkRounding();
+    checkNegativeAndZero();
+    checkClamping();
+    checkSpecial();
+    testFinish();
+    eof: pass;
+}

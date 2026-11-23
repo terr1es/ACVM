@@ -1,0 +1,98 @@
+//  random_lib.ax — reproducible randomness, shuffling and hashing.
+//
+//  The state lives in a buffer you own, so a seed reproduces a sequence exactly:
+//  same seed, same deal, on every machine and on both implementations (the C
+//  library and its Axiom fallback run the same xorshift32 bit for bit).
+//
+//  Run:  acvm run examples/random_lib.ax
+
+function import (return:(algorithm));
+function import (return:(random));
+
+comptime int DECK = 52;
+
+function private dealRank(int card):int { return card % 13 + 1; }
+function private dealSuit(int card):int { return card / 13; }
+
+function main():void {
+    // ─── a die: uniform in [0, 6), rejection sampled ──────────────────────
+    unsigned int seed[1] = {20261121u32};
+    int faces[6] = {0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < 6000; i++) {
+        int face = randBelow(#seed[0], seed.length, 6);
+        @(#faces[0] + face) = @(#faces[0] + face) + 1;
+    }
+    print("6000 dice rolls, counts per face: ");
+    for (int i = 0; i < 6; i++) {
+        print(@(#faces[0] + i));
+        print(" ");
+    }
+    print("\n");
+
+    // ─── a shuffle: same seed, same deal ──────────────────────────────────
+    int deck[DECK] = {0};
+    for (int i = 0; i < DECK; i++) {
+        @(#deck[0] + i) = i;
+    }
+    unsigned int dealSeed[1] = {7u32};
+    shuffle(#deck[0], DECK, #dealSeed[0], dealSeed.length);
+
+    print("first five cards (rank/suit): ");
+    for (int i = 0; i < 5; i++) {
+        print(dealRank(@(#deck[0] + i)));
+        print("/");
+        print(dealSuit(@(#deck[0] + i)));
+        print(" ");
+    }
+    print("\n");
+
+    //  A permutation check: shuffling must not lose or duplicate a card.
+    sort(#deck[0], DECK);
+    print("still a full deck: ");
+    print(isSortedAsc(#deck[0], DECK));
+    print(" first/last: ");
+    print(@#deck[0]);
+    print("/");
+    print(@(#deck[0] + DECK - 1));
+    print("\n");
+
+    // ─── sampling without replacement, via shuffle + prefix ───────────────
+    int pool[DECK] = {0};
+    for (int i = 0; i < DECK; i++) {
+        @(#pool[0] + i) = i;
+    }
+    unsigned int pickSeed[1] = {99u32};
+    shuffle(#pool[0], DECK, #pickSeed[0], pickSeed.length);
+    sortRange(#pool[0], 0, 5);          // a sorted hand of five
+    print("five card hand: ");
+    for (int i = 0; i < 5; i++) {
+        print(@(#pool[0] + i));
+        print(" ");
+    }
+    print("\n");
+
+    // ─── hashing: a fingerprint of contents, not of address ───────────────
+    int a[5] = {1, 2, 3, 4, 5};
+    int b[5] = {1, 2, 3, 4, 5};
+    int c[5] = {1, 2, 3, 4, 6};
+    print("hash equal: ");
+    print(hashInts(#a[0], 5) == hashInts(#b[0], 5));
+    print(" hash different: ");
+    print(hashInts(#a[0], 5) != hashInts(#c[0], 5));
+    print("\n");
+
+    // ─── a seeded generator is a repeatable test fixture ──────────────────
+    unsigned int t1[1] = {42u32};
+    unsigned int t2[1] = {42u32};
+    int first[3] = {0, 0, 0};
+    int second[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++) {
+        @(#first[0] + i) = randRange(#t1[0], t1.length, 0, 1000);
+        @(#second[0] + i) = randRange(#t2[0], t2.length, 0, 1000);
+    }
+    print("same seed reproduces: ");
+    print(equalInts(#first[0], 3, #second[0], 3));
+    print("\n");
+
+    eof: pass;
+}

@@ -1,0 +1,12 @@
+// The positive case: a valid declaration changes nothing about how the file runs.
+// `version` is a soft keyword, so it stays usable as a variable name -- the line
+// below would fail to parse if the directive had reserved it globally.
+module "good" version "1.2.3";
+
+function main():void {
+    int version = 5;
+    print("value ");
+    print(version);
+    print("\n");
+    eof: pass;
+}

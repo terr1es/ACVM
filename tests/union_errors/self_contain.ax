@@ -1,0 +1,7 @@
+//  A union containing itself by value: the size cannot be determined.
+union Node {
+    int i;
+    Node inner;
+};
+
+function main():void { pass; eof: pass; }

@@ -1,0 +1,324 @@
+// snake.ax — snake, in characters (Axiom / ACVM)
+//
+// Play: type w / a / s / d to steer the head '@' toward food '*', one step per direction.
+//       A wall or your own body ends the game; filling the whole board wins.
+//       You can type several directions at once ("d d s"); they are consumed in order.
+//
+// Note 1: ACVM has no key or timer API, so play is turn based:
+//         read one token, take one step. The board redraws in place with ANSI escapes;
+//         without them, set ANSI to 0 and it degrades to a scrolling version.
+//
+// Note 2: interface text is ASCII by default. The reason: acvm does not set the console
+//         code page on Windows, so cmd (page 936) reads UTF-8 output as mojibake.
+//         For the Chinese UI: run chcp 65001 first, then change ZH below to 1.
+
+comptime int WIDTH = 28;
+comptime int HEIGHT = 16;
+comptime int MAXLEN = WIDTH * HEIGHT;
+
+comptime int ANSI = 1;                  // 1 = redraw in place, 0 = scroll down each step
+comptime int ZH = 0;                    // 1 = Chinese UI (needs chcp 65001)
+comptime int SEED = 7919;               // seed for the food sequence (must be < 65536)
+comptime int FOOD_SCORE = 10;
+
+struct Cell {
+    int x;
+    int y;
+};
+
+global Cell snake[MAXLEN];
+global int length = 0;
+global int dirX = 1;
+global int dirY = 0;
+global int foodX = 0;
+global int foodY = 0;
+global int score = 0;
+global int rng = 1;
+global int over = 0;                    // 0 playing / 1 crashed / 2 cleared / 3 quit
+global string notice = "";
+global string cause = "";               // cause of death, used in the final message
+
+// Bilingual UI: ZH=0 gives English, ZH=1 gives Chinese. ASCII terminals never mangle it.
+function t(string cn, string en):string {
+    if (ZH != 0) {
+        return cn;
+    }
+    return en;
+    eof: pass;
+}
+
+// ---------------------------------------------------------------------------
+// Random: no rand or time API, so a small LCG (these constants stay inside int32)
+// ---------------------------------------------------------------------------
+function nextRand():int {
+    rng = (rng * 25173 + 13849) % 65536;
+    return rng;
+    eof: pass;
+}
+
+function isSnake(int x, int y):bool {
+    for i in 0..length {
+        if (snake[i].x == x && snake[i].y == y) {
+            return true;
+        }
+    }
+    return false;
+    eof: pass;
+}
+
+function spawnFood():void {
+    // Try random spots first, then a linear scan, so an empty cell is found while one exists
+    for attempt in 0..256 {
+        int x = nextRand() % WIDTH;
+        int y = nextRand() % HEIGHT;
+        if (!isSnake(x, y)) {
+            foodX = x;
+            foodY = y;
+            return;
+        }
+    }
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            if (!isSnake(x, y)) {
+                foodX = x;
+                foodY = y;
+                return;
+            }
+        }
+    }
+    foodX = -1;
+    foodY = -1;
+    eof: pass;
+}
+
+function resetGame():void {
+    length = 3;
+    dirX = 1;
+    dirY = 0;
+    score = 0;
+    over = 0;
+    notice = "";
+    cause = "";
+    rng = SEED;
+
+    int cx = WIDTH / 2;
+    int cy = HEIGHT / 2;
+    for i in 0..length {
+        snake[i].x = cx - i;
+        snake[i].y = cy;
+    }
+    spawnFood();
+    eof: pass;
+}
+
+// ---------------------------------------------------------------------------
+// Drawing: head '@', body 'o', food '*', empty ' '
+// ---------------------------------------------------------------------------
+function cellChar(int x, int y):char {
+    if (x == snake[0].x && y == snake[0].y) {
+        return '@';
+    }
+    if (x == foodX && y == foodY) {
+        return '*';
+    }
+    for i in 1..length {
+        if (snake[i].x == x && snake[i].y == y) {
+            return 'o';
+        }
+    }
+    return ' ';
+    eof: pass;
+}
+
+function draw():void {
+    if (ANSI != 0) {
+        print("\x1b[2J\x1b[H");
+    }
+    print(t("  字符贪吃蛇  --  Axiom / ACVM\n", "  SNAKE  --  Axiom / ACVM\n"));
+    print(t("  w/a/s/d 各走一步（可以连写多个方向），q 退出\n",
+            "  w/a/s/d = one step (chain them), q = quit\n"));
+
+    print("  +");
+    for i in 0..WIDTH {
+        print("-");
+    }
+    print("+\n");
+
+    for y in 0..HEIGHT {
+        string row = "  |";
+        for x in 0..WIDTH {
+            row = row + cellChar(x, y);
+        }
+        row = row + "|\n";
+        print(row);
+    }
+
+    print("  +");
+    for i in 0..WIDTH {
+        print("-");
+    }
+    print("+\n");
+
+    print(t("  得分 ", "  score "));
+    print(score);
+    print(t("    长度 ", "    length "));
+    print(length);
+    print("/");
+    print(MAXLEN);
+    print(t("    w/a/s/d 移动   q 退出\n", "    w/a/s/d move   q quit\n"));
+
+    print("  ");
+    if (notice.length > 0) {
+        print(notice);
+    } else {
+        print(t("吃掉 '*'，撞墙或咬到自己就结束", "eat '*'; a wall or your own body ends it"));
+    }
+    print("\n");
+    eof: pass;
+}
+
+// ---------------------------------------------------------------------------
+// One frame of logic: move one cell in the current direction
+// ---------------------------------------------------------------------------
+function step():void {
+    notice = "";
+
+    int hx = snake[0].x + dirX;
+    int hy = snake[0].y + dirY;
+
+    if (hx < 0 || hy < 0 || hx >= WIDTH || hy >= HEIGHT) {
+        over = 1;
+        cause = t("撞到了墙", "hit the wall");
+        return;
+    }
+
+    bool ate = (hx == foodX && hy == foodY);
+
+    // Biting itself: the tail is the exception — without food it vacates, so that is legal
+    for i in 0..length {
+        if (snake[i].x == hx && snake[i].y == hy) {
+            bool isTail = (i == length - 1);
+            if (ate || !isTail) {
+                over = 1;
+                cause = t("咬到了自己", "bit its own body");
+                return;
+            }
+        }
+    }
+
+    int newLen = length;
+    if (ate && length < MAXLEN) {
+        newLen = length + 1;
+    }
+
+    // Shift the body one cell back (copy from tail toward head so nothing is overwritten)
+    for (int i = newLen - 1; i > 0; i = i - 1) {
+        snake[i] = snake[i - 1];
+    }
+    snake[0].x = hx;
+    snake[0].y = hy;
+    length = newLen;
+
+    if (ate) {
+        score = score + FOOD_SCORE;
+        if (length == MAXLEN) {
+            over = 2;
+            return;
+        }
+        spawnFood();
+    }
+    eof: pass;
+}
+
+// ---------------------------------------------------------------------------
+// One round: read a direction -> take a step
+// ---------------------------------------------------------------------------
+function playRound():void {
+    while (over == 0) {
+        draw();
+        print(t("  方向 > ", "  move > "));
+        string cmd = toLower(readToken());
+        if (cmd.length == 0) {          // EOF: stdin was closed
+            over = 3;
+            return;
+        }
+
+        int nx = 0;
+        int ny = 0;
+        bool known = true;
+        if (cmd == "w" || cmd == "k" || cmd == "up") {
+            ny = -1;
+        } else if (cmd == "s" || cmd == "j" || cmd == "down") {
+            ny = 1;
+        } else if (cmd == "a" || cmd == "h" || cmd == "left") {
+            nx = -1;
+        } else if (cmd == "d" || cmd == "l" || cmd == "right") {
+            nx = 1;
+        } else if (cmd == "q" || cmd == "quit" || cmd == "exit") {
+            over = 3;
+            return;
+        } else {
+            known = false;
+        }
+
+        if (!known) {
+            notice = t("看不懂这个方向，用 w/a/s/d", "unknown direction -- use w/a/s/d");
+            continue;
+        }
+        if (nx == -dirX && ny == -dirY && length > 1) {
+            notice = t("不能原地掉头", "no instant U-turn");
+            continue;
+        }
+        dirX = nx;
+        dirY = ny;
+        step();
+    }
+    eof: pass;
+}
+
+function finishMessage():void {
+    print("\n");
+    if (over == 1) {
+        print("  " + cause);
+        print(t("，游戏结束。得分 ", "; game over. score "));
+    } else if (over == 2) {
+        print(t("  整个棋盘都是你，通关！得分 ", "  the whole board is yours. score "));
+    } else {
+        print(t("  已退出。得分 ", "  bye. score "));
+    }
+    print(score);
+    print(t("  长度 ", "  length "));
+    print(length);
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    if (ANSI != 0) {
+        print("\x1b[?25l");             // hide the cursor so redraws do not flicker
+    }
+
+    resetGame();
+    bool playing = true;
+    while (playing) {
+        playRound();
+        draw();
+        finishMessage();
+
+        if (over == 1 || over == 2) {
+            print(t("  [r] 再来一局   其它键退出 > ", "  [r] play again, other key quits > "));
+            string again = toLower(readToken());
+            if (again == "r") {
+                resetGame();
+                continue;
+            }
+        }
+        playing = false;
+    }
+
+    if (ANSI != 0) {
+        print("\x1b[?25h");
+    }
+    print(t("  再见\n", "  bye\n"));
+    eof: pass;
+}

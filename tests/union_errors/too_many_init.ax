@@ -1,0 +1,8 @@
+//  A union has a single storage slot, so braces cannot carry two values.
+union Num { int i; double d; };
+
+function main():void {
+    Num n = {1, 2.0};
+    print(n.i);
+    eof: pass;
+}

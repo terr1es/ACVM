@@ -1,0 +1,9 @@
+//  Regression guard: `string` is an aggregate, but the VM marshals it along its
+//  own path (copy the text, pass a pointer plus a length), so it has to keep
+//  crossing a native boundary. A check that rejected aggregates by value across
+//  the boundary once caught `string` too, and the standard library's io would
+//  not compile at all.
+library "nowhere";
+function describe(string text, ptr char buffer, int capacity):int;
+
+function main():void { pass; eof: pass; }

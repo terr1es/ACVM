@@ -1,0 +1,197 @@
+//  methods_demo.ax — behaviour that travels with the type it belongs to.
+//
+//  A method is an ordinary function whose first parameter is the receiver and
+//  whose name is mangled to `Type.name`, so:
+//
+//    * it costs nothing at run time (no vtable, no dispatch);
+//    * it occupies no storage, so a struct with methods still crosses into a C
+//      library unchanged;
+//    * overloads, recursion and generics behave exactly as they do at file scope.
+//
+//  The receiver is written without a name, and its type is the whole mutability
+//  story: `self` is a read-only copy, `ptr self` writes to the caller's variable.
+//
+//  Run:  acvm run examples/methods_demo.ax
+
+function import (return:(io));
+
+//===--- Both receiver kinds, and a static one -----------------------------===//
+
+struct Counter {
+    int value;
+
+    //  `self`: a copy, marked const. Reading is all it can do.
+    function get(self):int {
+        return self.value;
+    }
+
+    //  `ptr self`: the caller's variable, reached through `->`.
+    function bump(ptr self):void {
+        self->value = self->value + 1;
+    }
+
+    function bumpBy(ptr self, int amount):void {
+        self->value = self->value + amount;
+    }
+
+    //  A method calling a method. Inside `ptr self` the receiver is a pointer,
+    //  so the call goes through `->` like any other pointer access.
+    function reset(ptr self):void {
+        self->bumpBy(0 - self->get());
+    }
+
+    //  No receiver: a static method, called as `Counter.startingAt(5)`. This is
+    //  how a library offers a constructor, since Axiom has no constructors.
+    function startingAt(int initial):Counter {
+        Counter c = {initial};
+        return c;
+    }
+};
+
+//===--- A type whose methods return and take the type ---------------------===//
+
+struct Vec2 {
+    double x;
+    double y;
+
+    function lengthSquared(self):double {
+        return self.x * self.x + self.y * self.y;
+    }
+
+    //  The receiver is a pointer, so the change lands in the caller.
+    function addAssign(ptr self, Vec2 other):void {
+        self->x = self->x + other.x;
+        self->y = self->y + other.y;
+    }
+
+    //  A static method taking the type by value: `Vec2.add(a, b)`.
+    function add(Vec2 a, Vec2 b):Vec2 {
+        Vec2 r = {a.x + b.x, a.y + b.y};
+        return r;
+    }
+
+    function zero():Vec2 {
+        Vec2 v = {0.0, 0.0};
+        return v;
+    }
+};
+
+//===--- Recursion and overloads ------------------------------------------===//
+
+struct Algo {
+    int unused;   //  a struct with no fields would be fine too; this just makes
+                  //  the declaration look like the others
+
+    function factorial(ptr self, int n):int {
+        if (n <= 1) {
+            return 1;
+        }
+        return n * self->factorial(n - 1);
+    }
+
+    //  Same name, different arguments: ordinary overload resolution.
+    function label(self):string {
+        return "no argument";
+    }
+
+    function label(self, int n):string {
+        return n > 0 ? "positive" : "not positive";
+    }
+};
+
+//===--- Methods on a union -----------------------------------------------===//
+
+//  A union's members share storage, so a method that writes one member makes the
+//  others show the same bytes. Nothing special is needed -- the method rules are
+//  the same as for a struct.
+union Slot {
+    unsigned int bits;
+    unsigned int8[4] bytes;
+
+    function lowByte(self):int {
+        return self.bytes[0] as int;
+    }
+
+    function setLowByte(ptr self, int value):void {
+        self->bytes[0] = value as unsigned int8;
+    }
+};
+
+function showInt(string label, int value):void {
+    print(label);
+    print(value);
+    print("\n");
+    eof: pass;
+}
+
+function showDouble(string label, double value):void {
+    print(label);
+    print(value);
+    print("\n");
+    eof: pass;
+}
+
+function showString(string label, string value):void {
+    print(label);
+    print(value);
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    //  Static method as a constructor.
+    Counter c = Counter.startingAt(5);
+    showInt("Counter.startingAt(5).get()  = ", c.get());
+
+    //  Value receiver reads, pointer receiver writes.
+    c.bump();
+    showInt("after bump()                 = ", c.get());
+
+    c.bumpBy(10);
+    showInt("after bumpBy(10)             = ", c.get());
+
+    c.reset();
+    showInt("after reset()                = ", c.get());
+
+    //  Calling through a pointer: `->` for both receiver kinds.
+    ptr Counter p = #c;
+    p->bump();
+    showInt("after p->bump()              = ", p->get());
+
+    print("\n");
+
+    //  Methods that take and return the type.
+    Vec2 a = Vec2.zero();
+    Vec2 b = Vec2.add(Vec2.zero(), Vec2.zero());
+    a.x = 3.0;
+    a.y = 4.0;
+    b.x = 1.0;
+    b.y = 2.0;
+
+    showDouble("a.lengthSquared()            = ", a.lengthSquared());
+    a.addAssign(b);
+    showDouble("a.x after addAssign(b)       = ", a.x);
+    showDouble("a.y after addAssign(b)       = ", a.y);
+    showDouble("a.lengthSquared() now        = ", a.lengthSquared());
+
+    print("\n");
+
+    //  Recursion and overloads.
+    Algo algo = {0};
+    showInt("algo.factorial(6)            = ", algo.factorial(6));
+    showString("algo.label()                 = ", algo.label());
+    showString("algo.label(1)                = ", algo.label(1));
+    showString("algo.label(-1)               = ", algo.label(-1));
+
+    print("\n");
+
+    //  A union method writes bytes; the integer view shows the same bytes.
+    Slot slot = {0};
+    slot.setLowByte(65);
+    showInt("slot.lowByte()               = ", slot.lowByte());
+    showInt("slot.bits                    = ", slot.bits as int);
+
+    //  `sizeof` counts fields only: two ints, methods notwithstanding.
+    showInt("sizeof(Counter)              = ", sizeof(Counter));
+    eof: pass;
+}

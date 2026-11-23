@@ -1,0 +1,26 @@
+// The entry file's own function, next to a library's `private` function of the
+// same name. Both must work: the program calls its own, the library calls its
+// own.
+//
+// This used to fail in two different ways depending on which was registered
+// first -- either "'helper' is private to the library" (the program could not
+// call the function it had just written) or "the call is ambiguous" (the library
+// broke because of a name it cannot see). A name that is invisible outside its
+// file must not be able to affect anything outside its file.
+//
+// Expected output:
+//     mine 7
+//     lib  1
+
+import "user_helper_lib.ax";
+
+function helper(int x):int {
+    return x + 7;
+    eof: pass;
+}
+
+function main():void {
+    print("mine "); print(helper(0)); print("\n");
+    print("lib  "); print(libHelper(1)); print("\n");
+    eof: pass;
+}

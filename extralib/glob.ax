@@ -1,0 +1,349 @@
+//  glob.ax -- path wildcards (`*.ax`, `src/**/*.ax`) and path comparison.
+//
+//      function import (return:(glob));
+//
+//      print(globMatch("*.ax", "main.ax"));            // true
+//      print(globMatch("src/**/*.ax", "src/a/b.ax"));  // true
+//      print(globMatch("src/*.ax", "src/a/b.ax"));     // false
+//
+//  ── why not a regex ──────────────────────────────────────────────────────
+//
+//  The language specification lists regex as unimplemented, and all
+//  this library needs is path matching. A correct regex engine is either a thousand-line
+//  NFA or catastrophic backtracking, and the latter plants a hanging API in a language
+//  that refuses to guess. Wildcards are deterministic, linear, and cover 99% of the need:
+//
+//      *       any run of non-separator characters
+//      ?       exactly one non-separator character
+//      **      any characters, **including separators** (only as a whole path segment)
+//      [...]   a character class, with `a-z` and `!`/`^` negation
+//      \x      escape (lets `*` match a literal star)
+//
+//  ── three semantics easy to get wrong ────────────────────────────────────
+//
+//  1. **`*` does not cross a separator**. `src/*.ax` does not match `src/a/b.ax`. That is
+//     what path and shell wildcards agree on, and the easiest thing to confuse with regex.
+//  2. **`**` crosses separators only as a whole segment**. `a/**/b` matches `a/b`,
+//     `a/x/b` and `a/x/y/b`; `**` in `a**b` is just `*` (nothing to cross there).
+//     Matching `a/b` is deliberate: `**` means "zero or more levels".
+//  3. **both `/` and `\` are separators**. Paths must work on both platforms, so nothing
+//     is normalised first: both count as separators, `**` matching included.
+//
+//  ── case ─────────────────────────────────────────────────────────────────
+//
+//  Case matters by default (`*.AX` does not match `a.ax`). `globMatchNoCase` is the
+//  insensitive variant, for user input on Windows -- explicit, not a quiet platform rule.
+
+//  depends: io
+
+module "glob" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(io));
+
+function private globIsSeparator(int c):bool {
+    return c == 47 || c == 92;
+    eof: pass;
+}
+
+//  Lowercases one byte, ASCII only: a non-ASCII byte in a path is inside a multi-byte
+//  character, and lowering it by byte would corrupt UTF-8; case folding CJK is moot anyway.
+function private globLower(int c):int {
+    if (c >= 65 && c <= 90) {
+        return c + 32;
+    }
+    return c;
+    eof: pass;
+}
+
+//===--- matching --------------------------------------------------------===//
+
+//  Matches `pattern` against `text` from `pi` / `ti`. Recursion is used only for
+//  `**`, which is what keeps this readable: a `**` tries "consume nothing" first
+//  and then "consume one byte", so the worst case is O(n*m) with no backtracking
+//  beyond that single axis.
+function private globMatchAt(string pattern, int pi, string text, int ti, bool noCase):bool {
+    while (pi < pattern.length) {
+        int pc = strByteAt(pattern, pi);
+        if (pc == 42) {           // '*'
+            // Count the run: `**` (as a whole segment) crosses separators.
+            int stars = 0;
+            int scan = pi;
+            while (scan < pattern.length && strByteAt(pattern, scan) == 42) {
+                stars = stars + 1;
+                scan = scan + 1;
+            }
+            bool crossesSeparators = stars >= 2;
+            // `**` is only "any depth" when it is a whole segment: at the start or
+            // after a separator, and followed by the end or a separator.
+            if (crossesSeparators) {
+                bool startOk = pi == 0 || globIsSeparator(strByteAt(pattern, pi - 1));
+                bool endOk = scan >= pattern.length || globIsSeparator(strByteAt(pattern, scan));
+                if (!startOk || !endOk) {
+                    crossesSeparators = false;
+                }
+            }
+            if (!crossesSeparators) {
+                // A single `*`: any run that does not include a separator.
+                while (ti <= text.length) {
+                    if (globMatchAt(pattern, scan, text, ti, noCase)) {
+                        return true;
+                    }
+                    if (ti == text.length || globIsSeparator(strByteAt(text, ti))) {
+                        break;
+                    }
+                    ti = ti + 1;
+                }
+                return false;
+            }
+            // `**`: try every position, including the one right after a
+            // separator, so `a/**/b` matches `a/b`.
+            int from = ti;
+            if (scan < pattern.length && globIsSeparator(strByteAt(pattern, scan))) {
+                // `**/x`: the separator in the pattern may consume the one in the
+                // text, which is exactly how "zero directories" matches.
+                while (true) {
+                    if (globMatchAt(pattern, scan + 1, text, from, noCase)) {
+                        return true;
+                    }
+                    if (from >= text.length) {
+                        break;
+                    }
+                    while (from < text.length && !globIsSeparator(strByteAt(text, from))) {
+                        from = from + 1;
+                    }
+                    if (from < text.length) {
+                        from = from + 1;      // step over the separator
+                    }
+                }
+                return false;
+            }
+            while (from <= text.length) {
+                if (globMatchAt(pattern, scan, text, from, noCase)) {
+                    return true;
+                }
+                if (from == text.length) {
+                    break;
+                }
+                from = from + 1;
+            }
+            return false;
+        }
+
+        if (ti >= text.length) {
+            return false;
+        }
+        int tc = strByteAt(text, ti);
+
+        if (pc == 63) {           // '?'
+            if (globIsSeparator(tc)) {
+                return false;
+            }
+            pi = pi + 1;
+            ti = ti + 1;
+            continue;
+        }
+
+        if (pc == 91) {           // '['
+            int cursor = pi + 1;
+            bool negated = false;
+            if (cursor < pattern.length) {
+                int marker = strByteAt(pattern, cursor);
+                if (marker == 33 || marker == 94) {      // '!' or '^'
+                    negated = true;
+                    cursor = cursor + 1;
+                }
+            }
+            bool matched = false;
+            int close = -1;
+            int value = noCase ? globLower(tc) : tc;
+            // A ']' as the very first item is a literal, as in POSIX.
+            if (cursor < pattern.length && strByteAt(pattern, cursor) == 93) {
+                if (value == 93) {
+                    matched = true;
+                }
+                cursor = cursor + 1;
+            }
+            while (cursor < pattern.length) {
+                int item = strByteAt(pattern, cursor);
+                if (item == 93) {
+                    close = cursor;
+                    cursor = pattern.length;
+                    continue;
+                }
+                // Range `a-z`, but a '-' right before ']' is a literal dash.
+                if (cursor + 2 < pattern.length && strByteAt(pattern, cursor + 1) == 45 &&
+                    strByteAt(pattern, cursor + 2) != 93) {
+                    int low = noCase ? globLower(item) : item;
+                    int high = strByteAt(pattern, cursor + 2);
+                    if (noCase) {
+                        high = globLower(high);
+                    }
+                    if (low > high) {
+                        int swap = low;
+                        low = high;
+                        high = swap;
+                    }
+                    if (value >= low && value <= high) {
+                        matched = true;
+                    }
+                    cursor = cursor + 3;
+                    continue;
+                }
+                int want = noCase ? globLower(item) : item;
+                if (value == want) {
+                    matched = true;
+                }
+                cursor = cursor + 1;
+            }
+            if (close < 0) {
+                // An unterminated class matches nothing rather than aborting: a
+                // wrong pattern should not take the program down.
+                return false;
+            }
+            if (matched == negated) {
+                return false;
+            }
+            pi = close + 1;
+            ti = ti + 1;
+            continue;
+        }
+
+        if (pc == 92 && pi + 1 < pattern.length) {      // '\'
+            // Escape: the next byte is literal.
+            int literal = strByteAt(pattern, pi + 1);
+            int value = tc;
+            if (noCase) {
+                literal = globLower(literal);
+                value = globLower(value);
+            }
+            if (value != literal) {
+                return false;
+            }
+            pi = pi + 2;
+            ti = ti + 1;
+            continue;
+        }
+
+        int want = pc;
+        int have = tc;
+        if (noCase) {
+            want = globLower(want);
+            have = globLower(have);
+        }
+        if (want != have) {
+            return false;
+        }
+        pi = pi + 1;
+        ti = ti + 1;
+    }
+    return ti == text.length;
+    eof: pass;
+}
+//===--- public entry points ---------------------------------------------===//
+
+//  Case-sensitive path match. `*` and `?` stop at a separator, `**` does not.
+function globMatch(string pattern, string text):bool {
+    return globMatchAt(pattern, 0, text, 0, false);
+    eof: pass;
+}
+
+//  Case-insensitive variant, for user-typed paths on Windows. Explicit rather than
+//  automatic, so behaviour does not change with the host platform.
+function globMatchNoCase(string pattern, string text):bool {
+    return globMatchAt(pattern, 0, text, 0, true);
+    eof: pass;
+}
+
+//  Matches a bare file name: `globMatchName("*.ax", "src/main.ax")` is true because
+//  only the last segment is considered. A pattern that contains a separator is
+//  matched against the whole path instead, so `src/*.ax` does not silently match
+//  any `x.ax`.
+function globMatchName(string pattern, string path):bool {
+    int i = 0;
+    while (i < pattern.length) {
+        if (globIsSeparator(strByteAt(pattern, i))) {
+            return globMatchAt(pattern, 0, path, 0, false);
+        }
+        i = i + 1;
+    }
+    return globMatchAt(pattern, 0, pathBase(path), 0, false);
+    eof: pass;
+}
+
+//===--- path helpers ----------------------------------------------------===//
+
+//  Base name, directory, extension, stem and join are *not* reimplemented here:
+//  `io` already exports `pathBase` / `pathDir` / `pathExtension` / `pathStem` /
+//  `pathJoin`, and a second copy in this file had already drifted into being
+//  redundant. `glob.ax` imports `io` and adds only `globNormalize`, which `io` does
+//  not have.
+
+//  Normalises `./`, `../` and repeated separators in a path that is already
+//  absolute or relative without a drive letter. Returns a heap string.
+//
+//  `../` at the root is dropped rather than kept: `a/../../b` -> `../b` is the
+//  honest answer, so it is kept as written instead of being clamped. Callers that
+//  need clamping should resolve against a base first.
+function globNormalize(string path):string {
+    string parts[128] = {};
+    int count = 0;
+    int i = 0;
+    bool absolute = path.length > 0 && globIsSeparator(strByteAt(path, 0));
+    while (i <= path.length) {
+        bool atEnd = i == path.length;
+        if (atEnd || globIsSeparator(strByteAt(path, i))) {
+            i = i + 1;
+            continue;
+        }
+        int start = i;
+        while (i < path.length && !globIsSeparator(strByteAt(path, i))) {
+            i = i + 1;
+        }
+        string part = path[start .. i];
+        if (part == "." || part.length == 0) {
+            continue;
+        }
+        if (part == "..") {
+            if (count > 0 && parts[count - 1] != "..") {
+                count = count - 1;
+            } else if (!absolute) {
+                if (count < 128) {
+                    parts[count] = part;
+                    count = count + 1;
+                }
+            }
+            continue;
+        }
+        if (count < 128) {
+            parts[count] = part;
+            count = count + 1;
+        }
+    }
+    StrBuf b = {null, 0, 0};
+    sbInit(#b, 64);
+    if (absolute) {
+        sbPutByte(#b, 47);
+    }
+    int k = 0;
+    while (k < count) {
+        if (k > 0) {
+            sbPutByte(#b, 47);
+        }
+        sbPut(#b, parts[k]);
+        k = k + 1;
+    }
+    if (b.length == 0) {
+        sbPut(#b, absolute ? "/" : ".");
+    }
+    // Normalise returns a heap string because it has no Doc; the caller frees it
+    // with `globFree` (a plain `free` on the byte buffer would also work, but the
+    // pair keeps the contract obvious).
+    string result = makeString(b.data as ptr char, b.length);
+    sbFree(#b);
+    return result;
+    eof: pass;
+}

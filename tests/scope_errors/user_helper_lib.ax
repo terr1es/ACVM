@@ -1,0 +1,12 @@
+// A library whose private helper has the same name as a function the entry file
+// defines. Each file must resolve `helper` to its own.
+
+function private helper(int x):int {
+    return x;
+    eof: pass;
+}
+
+function libHelper(int x):int {
+    return helper(x);
+    eof: pass;
+}

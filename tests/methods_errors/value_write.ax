@@ -1,0 +1,8 @@
+//  A value receiver is a copy, so writing it never reaches the caller -> that has
+//  to be an error, not a silent no-op.
+struct S {
+    int n;
+    function bad(self):void { self.n = 5; }
+};
+
+function main():void { S s = {0}; s.bad(); eof: pass; }

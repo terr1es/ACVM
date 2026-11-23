@@ -1,0 +1,260 @@
+//  time_check.ax — the time library.
+//
+//  Two halves, tested differently.
+//
+//  The calendar maths, formatting and parsing are pure Axiom and deterministic, so
+//  every result is compared against a known value. These are the tests that matter:
+//  an off-by-one in day numbering breaks every date silently.
+//
+//  The four clock reads cannot be asserted exactly -- the test cannot know what time
+//  it is. They are checked by invariant instead: a value is in a plausible range, a
+//  monotonic reading never goes backwards, a sleep of N milliseconds takes at least
+//  N milliseconds.
+//
+//  Run:  acvm run tests/time_check.ax
+
+function import (return:(time));
+
+//  Checks that `ms` converts to the expected calendar date and back again.
+function private checkDate(int64 ms, int year, int month, int day, int hour,
+                           int minute, int second):void {
+    DateTime t = timeToCivil(ms);
+    print("  "); print(timeFormat(t));
+    print(" expected=");
+    print(year); print("-"); print(month); print("-"); print(day);
+    print(" "); print(hour); print(":"); print(minute); print(":"); print(second);
+    bool same = t.year == year && t.month == month && t.day == day &&
+                t.hour == hour && t.minute == minute && t.second == second;
+    print(" match="); print(same);
+    //  The inverse must land on the same millisecond, including the sub-second part.
+    print(" roundtrip="); print(timeFromCivil(t) == ms);
+    print("\n");
+    eof: pass;
+}
+
+function private checkParse(string text, bool expectedOk, int64 expectedMs):void {
+    bool ok = false;
+    int64 ms = timeParseIso(text, #ok, -1i64);
+    print("  ["); print(text); print("] ok="); print(ok);
+    bool good = ok == expectedOk && (!expectedOk || ms == expectedMs);
+    print(" value="); print(ms);
+    print(" pass="); print(good);
+    print("\n");
+    eof: pass;
+}
+
+function private checkConversions():void {
+    print("epoch boundaries\n");
+    checkDate(0i64, 1970, 1, 1, 0, 0, 0);
+    checkDate(-1i64, 1969, 12, 31, 23, 59, 59);
+    checkDate(1000i64, 1970, 1, 1, 0, 0, 1);
+    checkDate(86400000i64, 1970, 1, 2, 0, 0, 0);
+
+    print("known instants\n");
+    checkDate(1700000000000i64, 2023, 11, 14, 22, 13, 20);
+    checkDate(1699920000000i64, 2023, 11, 14, 0, 0, 0);
+
+    print("leap day and century rules\n");
+    checkDate(1709164800000i64, 2024, 2, 29, 0, 0, 0);
+    //  1900 is not a leap year (divisible by 100, not by 400): 1900-03-01.
+    print("  1900 leap: "); print(timeIsLeapYear(1900));
+    print("  2000 leap: "); print(timeIsLeapYear(2000));
+    print("  2024 leap: "); print(timeIsLeapYear(2024));
+    print("  2023 leap: "); print(timeIsLeapYear(2023));
+    print("\n");
+
+    print("month lengths\n");
+    for (int m = 1; m <= 12; m++) {
+        print("  "); print(m); print(":"); print(timeDaysInMonth(2024, m));
+    }
+    print("\n  feb 2023: "); print(timeDaysInMonth(2023, 2));
+    print(" feb 2024: "); print(timeDaysInMonth(2024, 2));
+    print(" month 0: "); print(timeDaysInMonth(2024, 0));
+    print(" month 13: "); print(timeDaysInMonth(2024, 13));
+    print("\n");
+
+    print("weekday and day of year\n");
+    //  1970-01-01 was a Thursday, so ISO weekday 4.
+    DateTime epoch = timeToCivil(0i64);
+    print("  1970-01-01 iso-dow="); print(timeDayOfWeek(epoch));
+    print(" ("); print(timeWeekdayAbbr(timeDayOfWeek(epoch))); print(")");
+    print(" doy="); print(timeDayOfYear(epoch));
+    print("\n");
+    DateTime sample = timeToCivil(1700000000000i64);       // 2023-11-14
+    print("  2023-11-14 iso-dow="); print(timeDayOfWeek(sample));
+    print(" doy="); print(timeDayOfYear(sample));
+    print("\n");
+    //  Last day of a leap year and a common year.
+    DateTime leapEnd = timeToCivil(timeFromCivil(makeDateTime(2024, 12, 31, 0, 0, 0, 0)));
+    DateTime commonEnd = timeToCivil(timeFromCivil(makeDateTime(2023, 12, 31, 0, 0, 0, 0)));
+    print("  2024-12-31 doy="); print(timeDayOfYear(leapEnd));
+    print("  2023-12-31 doy="); print(timeDayOfYear(commonEnd));
+    print("\n");
+
+    print("month names\n");
+    print("  "); print(timeMonthName(1)); print(" / "); print(timeMonthAbbr(1));
+    print("  "); print(timeMonthName(12)); print(" / "); print(timeMonthAbbr(12));
+    print("  invalid: ["); print(timeMonthName(13)); print("] [");
+    print(timeMonthAbbr(0)); print("]\n");
+    eof: pass;
+}
+
+//  Builds a DateTime value. Exists so the checks above read as one line each.
+function private makeDateTime(int year, int month, int day, int hour, int minute,
+                              int second, int millis):DateTime {
+    DateTime t = {year, month, day, hour, minute, second, millis};
+    return t;
+    eof: pass;
+}
+
+function private checkFormatting():void {
+    DateTime t = makeDateTime(2026, 11, 22, 0, 7, 18, 45);
+    print("formatting\n");
+    print("  date: "); print(timeFormatDate(t)); print("\n");
+    print("  time: "); print(timeFormatTime(t)); print("\n");
+    print("  full: "); print(timeFormat(t)); print("\n");
+    print("  ms:   "); print(timeFormatMs(t)); print("\n");
+    print("  iso:  "); print(timeFormatIso(t)); print("\n");
+    print("  isoms:"); print(timeFormatIsoMs(t)); print("\n");
+
+    //  Zero padding matters: these must be fixed width so they sort as text.
+    DateTime small = makeDateTime(5, 1, 2, 3, 4, 5, 6);
+    print("  padded: "); print(timeFormatIsoMs(small)); print("\n");
+    print("  widths: "); print(timeFormatDate(small).length);
+    print(" "); print(timeFormatTime(small).length);
+    print("\n");
+    eof: pass;
+}
+
+function private checkParsing():void {
+    print("parse, valid\n");
+    checkParse("2023-11-14", true, 1699920000000i64);
+    checkParse("2023-11-14T22:13:20Z", true, 1700000000000i64);
+    checkParse("2023-11-14T22:13:20", true, 1700000000000i64);
+    checkParse("2023-11-14T22:13:20.045Z", true, 1700000000045i64);
+    checkParse("2023-11-14T22:13:20.5Z", true, 1700000000500i64);
+    //  Offset is converted to the equivalent UTC instant.
+    checkParse("2023-11-14T22:13:20+08:00", true, 1699971200000i64);
+    checkParse("2023-11-14T00:00:00-05:00", true, 1699938000000i64);
+
+    print("parse, rejected\n");
+    checkParse("garbage", false, 0i64);
+    checkParse("2023-13-01", false, 0i64);            // month out of range
+    checkParse("2023-02-30", false, 0i64);            // February has no 30th
+    checkParse("2023-11-14T25:00:00Z", false, 0i64);  // hour out of range
+    checkParse("2023-11-14T22:13", false, 0i64);      // incomplete
+    checkParse("23-11-14", false, 0i64);              // short year
+    checkParse("2023/11/14", false, 0i64);            // wrong separator
+    checkParse("2023-11-14 22:13:20", false, 0i64);   // space instead of T
+    checkParse("2023-11-14T22:13:20.", false, 0i64);  // dot with no digits
+    checkParse("2023-11-14T22:13:20ZZ", false, 0i64); // trailing junk
+
+    print("parse then format\n");
+    bool ok = false;
+    int64 ms = timeParseIso("2026-11-22T00:07:18.045Z", #ok, 0i64);
+    print("  ok="); print(ok);
+    print(" back="); print(timeFormatIsoMs(timeToCivil(ms))); print("\n");
+    eof: pass;
+}
+
+function private checkArithmetic():void {
+    print("arithmetic\n");
+    int64 base = 1700000000000i64;      // 2023-11-14T22:13:20Z
+    print("  +1 day: "); print(timeFormatIso(timeToCivil(timeAddDays(base, 1)))); print("\n");
+    print("  -1 day: "); print(timeFormatIso(timeToCivil(timeAddDays(base, -1)))); print("\n");
+    print("  +1 hour: "); print(timeFormatIso(timeToCivil(timeAddHours(base, 1)))); print("\n");
+    print("  +1 min: "); print(timeFormatIso(timeToCivil(timeAddMinutes(base, 1)))); print("\n");
+    print("  +1 sec: "); print(timeFormatIso(timeToCivil(timeAddSeconds(base, 1)))); print("\n");
+    print("  +1 ms: "); print(timeFormatIsoMs(timeToCivil(timeAddMs(base, 1)))); print("\n");
+
+    //  Crossing a month boundary by adding a day, rather than by bumping the field.
+    DateTime nov30 = makeDateTime(2023, 11, 30, 12, 0, 0, 0);
+    int64 dec1 = timeAddDays(timeFromCivil(nov30), 1);
+    print("  2023-11-30 +1d: "); print(timeFormatIso(timeToCivil(dec1))); print("\n");
+
+    //  Field carry: day 32 of January is 1 February.
+    DateTime carried = makeDateTime(2023, 1, 32, 0, 0, 0, 0);
+    print("  Jan 32 carries to: "); print(timeFormatIso(timeToCivil(timeFromCivil(carried))));
+    print("\n");
+
+    //  Elapsed helper clamps a non-positive delta to zero.
+    print("  elapsed(100, 50)="); print(timeElapsedMs(100i64, 50i64));
+    print(" elapsed(0, 5000000)="); print(timeElapsedMs(0i64, 5000000i64));
+    print("\n");
+
+    print("validation\n");
+    print("  valid: "); print(timeValid(makeDateTime(2024, 2, 29, 23, 59, 59, 999)));
+    print(" bad month: "); print(timeValid(makeDateTime(2024, 13, 1, 0, 0, 0, 0)));
+    print(" bad day: "); print(timeValid(makeDateTime(2023, 2, 29, 0, 0, 0, 0)));
+    print(" bad hour: "); print(timeValid(makeDateTime(2024, 1, 1, 24, 0, 0, 0)));
+    print(" bad millis: "); print(timeValid(makeDateTime(2024, 1, 1, 0, 0, 0, 1000)));
+    print("\n");
+    eof: pass;
+}
+
+function private checkClocks():void {
+    print("clocks\n");
+
+    //  Wall clock: only the range and self-consistency can be asserted.
+    //  Anything after 2020-01-01 and before 2100 keeps this from silently
+    //  accepting a value in the wrong unit (seconds instead of milliseconds).
+    int64 now = timeNowMs();
+    print("  now="); print(now);
+    print(" plausible="); print(now > 1577836800000i64 && now < 4102444800000i64);
+    print("\n");
+    print("  formatted="); print(timeFormat(timeToCivil(now))); print("\n");
+
+    //  Monotonic clock: must never go backwards, even across many readings.
+    bool monotonic = true;
+    int64 previous = timeMonotonicNs();
+    for (int i = 0; i < 1000; i++) {
+        int64 current = timeMonotonicNs();
+        if (current < previous) {
+            monotonic = false;
+        }
+        previous = current;
+    }
+    print("  monotonic over 1000 reads="); print(monotonic); print("\n");
+
+    //  Sleep: a lower bound is all that can be asserted. It may oversleep.
+    int64 start = timeMonotonicNs();
+    timeSleepMs(30);
+    int64 slept = timeElapsedMs(start, timeMonotonicNs());
+    print("  slept ms="); print(slept); print(" at_least_30="); print(slept >= 30);
+    print("\n");
+
+    //  A zero or negative sleep must return immediately rather than block.
+    int64 zeroStart = timeMonotonicNs();
+    timeSleepMs(0);
+    timeSleepMs(-100);
+    print("  zero/negative sleep ms="); print(timeElapsedMs(zeroStart, timeMonotonicNs()));
+    print(" (should be small)\n");
+
+    //  Timezone offset is platform-dependent, so only its range is checked.
+    //  Real offsets stay within -12:00..+14:00.
+    int64 offset = timeLocalOffsetMin(now);
+    print("  local offset="); print(offset); print(" min (");
+    print(timeLocalOffsetString(now)); print(")");
+    print(" in_range="); print(offset >= -720i64 && offset <= 840i64);
+    print("\n");
+
+    //  Local conversion must differ from UTC by exactly the offset.
+    DateTime utc = timeToCivil(now);
+    DateTime local = timeToCivilLocal(now);
+    int64 utcBack = timeFromCivil(utc);
+    int64 localBack = timeFromCivil(local);
+    print("  local-vs-utc minutes="); print((localBack - utcBack) / 60000i64);
+    print(" equals offset="); print((localBack - utcBack) / 60000i64 == offset);
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    checkConversions();
+    checkFormatting();
+    checkParsing();
+    checkArithmetic();
+    checkClocks();
+    print("done\n");
+    eof: pass;
+}

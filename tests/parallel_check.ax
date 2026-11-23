@@ -1,0 +1,187 @@
+//  parallel_check.ax -- real parallel computation.
+//
+//  The point of this test is **cross-checking**: the same data run single-threaded and
+//  run in parallel must agree value for value. Parallelism may change only **speed**,
+//  never the result -- a difference is a bug, not "parallel is like that".
+//
+//  So every function is exercised at three thread counts: 1 (forced serial), 0 (all
+//  cores), and one value in between. All three must agree with each other.
+
+function import (return:(parallel));
+function import (return:(os));
+function import (return:(test));
+function import (return:(algorithm));
+
+comptime int N = 300000;
+
+//  Reproducible fill: the same seed gives both paths identical data.
+function private fillLcg(ptr int data, int count, unsigned int seed):void {
+    unsigned int state = seed;
+    for (int i = 0; i < count; i++) {
+        state = state * 1664525u32 + 1013904223u32;
+        @(data + i) = ((state >> 16) as int) % 10000;
+    }
+    eof: pass;
+}
+
+function private checkCpuCount():void {
+    testGroup("cpu");
+    int cpus = cpuCount();
+    //  This machine has at least one core, or nothing would run at all.
+    check(cpus >= 1, "cpuCount is at least 1");
+    print("[note] cpus=" + itoa(cpus, 10) + "\n");
+    eof: pass;
+}
+
+function private checkReductions():void {
+    testGroup("reductions");
+
+    int data[N] = {0};
+    fillLcg(#data[0], N, 12345u32);
+
+    //  Sum: all three thread counts must agree.
+    int64 sumOne = parallelSumInt(#data[0], N, 1);
+    int64 sumAll = parallelSumInt(#data[0], N, 0);
+    int64 sumFour = parallelSumInt(#data[0], N, 4);
+    checkInt64(sumAll, sumOne, "sum: all cores match single");
+    checkInt64(sumFour, sumOne, "sum: four threads match single");
+
+    //  Against a single-threaded reference: a naive accumulation over the same array.
+    int64 reference = 0;
+    for (int i = 0; i < N; i++) {
+        reference = reference + (@(#data[0] + i) as int64);
+    }
+    checkInt64(sumOne, reference, "sum: matches a plain loop");
+
+    //  Extremes.
+    int maxOne = parallelMaxInt(#data[0], N, 1);
+    int maxAll = parallelMaxInt(#data[0], N, 0);
+    int minOne = parallelMinInt(#data[0], N, 1);
+    int minAll = parallelMinInt(#data[0], N, 0);
+    checkInt(maxAll, maxOne, "max: all cores match single");
+    checkInt(minAll, minOne, "min: all cores match single");
+
+    //  Cross-checked against the single-threaded algorithm implementation: separate code.
+    int maxIndex = maxIndex(#data[0], N);
+    int minIndexAt = minIndex(#data[0], N);
+    checkInt(maxOne, @(#data[0] + maxIndex), "max matches algorithm.maxIndex");
+    checkInt(minOne, @(#data[0] + minIndexAt), "min matches algorithm.minIndex");
+
+    //  Counting.
+    int target = @(#data[0] + 0);
+    int64 countOne = parallelCountInt(#data[0], N, target, 1);
+    int64 countAll = parallelCountInt(#data[0], N, target, 0);
+    checkInt64(countAll, countOne, "count: all cores match single");
+    checkInt64(countOne, countInt(#data[0], N, target) as int64, "count matches algorithm.countInt");
+    eof: pass;
+}
+
+function private checkSorting():void {
+    testGroup("sorting");
+
+    //  Two identical copies: one through the serial algorithm sort, one in parallel.
+    int serial[N] = {0};
+    int par[N] = {0};
+    fillLcg(#serial[0], N, 777u32);
+    for (int i = 0; i < N; i++) {
+        @(#par[0] + i) = @(#serial[0] + i);
+    }
+
+    sort(#serial[0], N);
+    int used = parallelSortInt(#par[0], N, 0);
+
+    check(used >= 1, "sort reported a thread count");
+    check(isSortedAsc(#par[0], N), "parallel result is ascending");
+
+    //  Value-by-value equality -- this is the whole of sorting correctness.
+    check(equalInts(#par[0], N, #serial[0], N), "parallel sort equals serial sort");
+
+    print("[note] threads used=" + itoa(used, 10) + "\n");
+
+    //  Forced serial must agree too; it runs parallel's own code path, not algorithm's.
+    int single[N] = {0};
+    fillLcg(#single[0], N, 777u32);
+    parallelSortInt(#single[0], N, 1);
+    check(equalInts(#single[0], N, #serial[0], N), "single-thread parallel path equals serial");
+
+    //  Degenerate sizes: 0 and 1 element must not crash.
+    parallelSortInt(0 as ptr int, 0, 0);
+    check(true, "empty array does not crash");
+    int one[1] = {42};
+    parallelSortInt(#one[0], 1, 0);
+    checkInt(@#one[0], 42, "single element unchanged");
+
+    //  Sorted input and all-equal input: chunked merging fails most easily on these.
+    int ordered[N] = {0};
+    for (int i = 0; i < N; i++) {
+        @(#ordered[0] + i) = i;
+    }
+    parallelSortInt(#ordered[0], N, 0);
+    check(isSortedAsc(#ordered[0], N), "already-sorted input stays sorted");
+    checkInt(@#ordered[0], 0, "already-sorted first element");
+    checkInt(@(#ordered[0] + N - 1), N - 1, "already-sorted last element");
+
+    int flat[N] = {0};
+    parallelFillInt(#flat[0], N, 9);
+    parallelSortInt(#flat[0], N, 0);
+    checkInt(@#flat[0], 9, "all-equal first element");
+    checkInt(@(#flat[0] + N - 1), 9, "all-equal last element");
+    eof: pass;
+}
+
+function private checkFill():void {
+    testGroup("fill");
+
+    int data[N] = {0};
+    checkInt(parallelFillInt(#data[0], N, -5), N, "fill returns the count");
+    checkInt(@#data[0], -5, "fill wrote the first element");
+    checkInt(@(#data[0] + N - 1), -5, "fill wrote the last element");
+    checkInt64(parallelSumInt(#data[0], N, 1), -5 * N as int64, "fill covers every element");
+    eof: pass;
+}
+
+function private checkEdgeCases():void {
+    testGroup("edge cases");
+
+    //  Empty array: every function returns 0 rather than crashing.
+    checkInt64(parallelSumInt(0 as ptr int, 0, 0), 0, "sum of nothing");
+    checkInt(parallelMaxInt(0 as ptr int, 0, 0), 0, "max of nothing");
+    checkInt(parallelMinInt(0 as ptr int, 0, 0), 0, "min of nothing");
+    checkInt64(parallelCountInt(0 as ptr int, 0, 0, 0), 0, "count of nothing");
+    checkInt(parallelFillInt(0 as ptr int, 0, 0), 0, "fill of nothing");
+
+    //  Single element: chunking yields one chunk, which must not take the thread path.
+    int one[1] = {7};
+    checkInt64(parallelSumInt(#one[0], 1, 0), 7, "sum of one");
+    checkInt(parallelMaxInt(#one[0], 1, 0), 7, "max of one");
+    checkInt(parallelMinInt(#one[0], 1, 0), 7, "min of one");
+
+    //  More threads than elements: no extra thread may be created, and nothing may crash.
+    int three[3] = {3, 1, 2};
+    checkInt64(parallelSumInt(#three[0], 3, 64), 6, "sum with more threads than elements");
+    parallelSortInt(#three[0], 3, 64);
+    checkInt(@#three[0], 1, "sort clamps thread count");
+    checkInt(@(#three[0] + 2), 3, "sort still sorted with clamped threads");
+
+    //  Negative elements: sum and extremes must be right, and chunk boundaries must keep the sign.
+    int negatives[8] = {-5, -1, -9, -3, -7, -2, -8, -4};
+    checkInt64(parallelSumInt(#negatives[0], 8, 1), -39, "sum of negatives single");
+    checkInt64(parallelSumInt(#negatives[0], 8, 0), -39, "sum of negatives parallel");
+    checkInt(parallelMaxInt(#negatives[0], 8, 0), -1, "max of negatives");
+    checkInt(parallelMinInt(#negatives[0], 8, 0), -9, "min of negatives");
+
+    parallelSortInt(#negatives[0], 8, 0);
+    checkInt(@#negatives[0], -9, "sort negatives first");
+    checkInt(@(#negatives[0] + 7), -1, "sort negatives last");
+    eof: pass;
+}
+
+function main():void {
+    checkCpuCount();
+    checkReductions();
+    checkSorting();
+    checkFill();
+    checkEdgeCases();
+    testFinish();
+    eof: pass;
+}

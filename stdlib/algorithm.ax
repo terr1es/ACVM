@@ -1,0 +1,1752 @@
+//  algorithm.ax — sorting and sequence primitives for `int` arrays.
+//
+//  This module is the Axiom side of a C implementation: the algorithms live in
+//  stdlib/algorithm.c and are reached through algorithm.axd. Each native
+//  function here also has an Axiom body under the same name, so the loader can
+//  pack both into the .acvm and a program runs with or without algorithm.dll.
+//
+//  `sort` / `sortInt64` pick between TimSort, counting sort and radix in C
+//  (`timSortInts` / `timSortInts64`); `sortDouble` sorts by radix over the
+//  folded IEEE-754 bit pattern (`sortDoubleNative`). The compiler primitives
+//  `sortInts` / `sortInt64s` / `sortFloats` / `reverseInts` remain for the paths
+//  that need no shared library -- `reverse`, and the `sortDouble` fallback --
+//  but they are a median-of-three quicksort: unstable, quadratic on adversarial
+//  input, and unable to place a NaN.
+//
+//  Usage. Import the module and call the wrappers below; the primitives are
+//  implementation detail:
+//
+//      function import (return:(algorithm));    // stdlib/algorithm.ax
+//
+//      function main():void {
+//          int data[1000];
+//          ...
+//          sort(#data[0], 1000);
+//          eof: pass;
+//      }
+//
+//  The `ptr` contract: the pointer must address at least `count` elements of
+//  the matching type. The VM cannot check the length — a pointer carries no
+//  bound — so passing a count larger than the array is memory corruption, in
+//  exactly the same way `memcpy` is.
+//
+//  This file has no `main`, so `acvm check stdlib/algorithm.ax` reports "no
+//  entry point"; that is the expected result for a library module.
+//
+//  Only the public functions below are exported. Anything else added here
+//  should be `private` so it does not leak into the importing file's scope.
+
+// ─── ascending sort ────────────────────────────────────────────────────────
+
+//  Sorts `count` 32 bit integers at `data` in ascending order, in place. Stable.
+//
+//  Two engines behind one name (see algorithm.c): TimSort when the input has
+//  structure -- natural runs, minrun blocks finished with binary insertion sort,
+//  a balanced run stack, merges trimmed by binary search, O(n) on ordered input
+//  -- and an LSD radix sort when it does not. Both are stable; radix has no
+//  adversarial input, so no data shape makes this quadratic.
+//
+//  `timSortInts` is the native entry point declared in algorithm.axd. The Axiom
+//  body below is TimSort only: without algorithm.dll the sort is still correct
+//  and still stable, it just does not get radix's ~8x on unstructured input.
+module "algorithm" version "0.1.0";
+
+function sort(ptr int data, int count):void {
+    timSortInts(data, count);
+    eof: pass;
+}
+
+//  Sorts `count` 64 bit integers. Same algorithm, wider elements.
+function sortInt64(ptr int64 data, int count):void {
+    timSortInts64(data, count);
+    eof: pass;
+}
+
+//  Sorts `count` doubles in place, ascending, by radix over the folded IEEE-754
+//  bit pattern.
+//
+//  NaN used to be a silent correctness bug here: `a < b` is false in both
+//  directions for a NaN, so a comparison sort cannot place it, and the old
+//  implementation returned an array that was not sorted and said nothing. The bit
+//  pattern gives every double a definite position, so NaN now sorts after +inf
+//  and both zeroes keep their relative order.
+//
+//  `sortDoubleNative` is the C entry point; without algorithm.dll this falls back
+//  to the `sortFloats` compiler primitive, which is the quicksort and therefore
+//  still breaks on NaN. The fallback is documented rather than removed because a
+//  missing shared library should still sort ordinary doubles.
+function sortDouble(ptr double data, int count):void {
+    sortDoubleNative(data, count);
+    eof: pass;
+}
+
+// ─── sequence primitives ───────────────────────────────────────────────────
+
+//  Reverses `count` 32 bit integers at `data`, in place.
+//  ─── sortStrings ───────────────────────────────────────────────────────────
+//
+//  Axiom's `<` `<=` `>` `>=` on strings compare **contents** (the compiler emits a
+//  STR_CMP instruction), so a comparison sort works directly on `string` values with
+//  no comparator argument -- which is fortunate, because Axiom has no function
+//  pointers.
+//
+//  Why this one is pure Axiom while `sort` delegates to a native primitive: there is
+//  no `sortStrings` primitive, and adding one is not possible as things stand. A
+//  native sort would need to read the characters, but an array of `string` marshals
+//  to C as an array of 16-byte descriptors whose data pointers address **VM** memory,
+//  not host memory, and VM memory is paged rather than contiguous. Sorting by value
+//  would have to copy every string into a blob, sort that, and return a permutation
+//  for Axiom to apply -- a lot of machinery for a function that is rarely hot.
+//
+//  Measured cost on this interpreter: 20 000 strings of ~10 characters sort in
+//  ~74 ms. Almost all of it is VM instruction dispatch in the partition loop, not
+//  comparison; making the comparison allocation-free changed it by 5 ms. For the
+//  sizes this is normally used at (hundreds, low thousands) it is not noticeable.
+//
+//  Names added from here on follow AX01 (PascalCase); the older camelCase names
+//  above are kept as they were so existing call sites do not churn.
+
+//  Sorts `count` strings ascending by content.
+//
+//  Not stable: equal strings may end up in any relative order. That is impossible to
+//  observe for `string` values, which are immutable and compare only by content.
+function sortStrings(ptr string data, int count):void {
+    if (count <= 1) {
+        return;
+    }
+    sortStringsRange(data, 0, count);
+    eof: pass;
+}
+
+//  True when the first `count` strings are in ascending order. Exists so callers and
+//  tests do not each rewrite the loop; O(n).
+function isSortedStrings(ptr string data, int count):bool {
+    for (int i = 1; i < count; i++) {
+        if (@(data + i - 1) > @(data + i)) {
+            return false;
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+//  Sorts [from, to). Kept private: the public entry point is sortStrings.
+//
+//  Ranges of 12 or fewer are finished with insertion sort -- below that the recursion
+//  and partition overhead costs more than it saves. Everything else is quicksort with
+//  a median-of-three pivot, recursing into the smaller half and looping on the larger,
+//  which bounds the call depth at log2(count) regardless of the input order.
+function private sortStringsRange(ptr string data, int from, int to):void {
+    while (to - from > 12) {
+        //  Median of the first, middle and last elements. This is what keeps an
+        //  already-sorted or reversed input from degenerating to quadratic: taking
+        //  the first element as pivot would pick the worst possible one there.
+        const int middle = from + (to - from) / 2;
+        string first = @(data + from);
+        string mid = @(data + middle);
+        string last = @(data + to - 1);
+        string pivot = first;
+        if (mid > first) {
+            pivot = mid;
+        }
+        if (last < pivot) {
+            pivot = last;
+        }
+        if (mid > first && mid < last) {
+            pivot = mid;
+        }
+
+        int left = from;
+        int right = to - 1;
+        while (left <= right) {
+            while (@(data + left) < pivot) {
+                left = left + 1;
+            }
+            while (@(data + right) > pivot) {
+                right = right - 1;
+            }
+            if (left <= right) {
+                string exchange = @(data + left);
+                @(data + left) = @(data + right);
+                @(data + right) = exchange;
+                left = left + 1;
+                right = right - 1;
+            }
+        }
+
+        //  Recurse into the smaller side so the stack depth stays logarithmic.
+        if (right - from < to - left) {
+            sortStringsRange(data, from, right + 1);
+            from = left;
+        } else {
+            sortStringsRange(data, left, to);
+            to = right + 1;
+        }
+    }
+    if (to - from > 1) {
+        insertionSortStrings(data, from, to);
+    }
+    eof: pass;
+}
+
+//  Insertion sort over [from, to). Correct for any range; used for the small tails.
+function private insertionSortStrings(ptr string data, int from, int to):void {
+    for (int i = from + 1; i < to; i++) {
+        string key = @(data + i);
+        int j = i - 1;
+        bool placed = false;
+        while (j >= from && !placed) {
+            if (@(data + j) > key) {
+                @(data + j + 1) = @(data + j);
+                j = j - 1;
+            } else {
+                placed = true;
+            }
+        }
+        @(data + j + 1) = key;
+    }
+    eof: pass;
+}
+
+//  Reverses `count` integers in place. `count` is an element count.
+//  Delegates to the `reverseInts` primitive, so this is native and needs no DLL.
+function reverse(ptr int data, int count):void {
+    reverseInts(data, count);
+    eof: pass;
+}
+
+//  Sorts a sub-range `data[from .. from + count - 1]`. Convenience only: it
+//  shifts the pointer and calls `sort`, so an out of range `from` is the
+//  caller's problem in the same way a wrong `count` is.
+function sortRange(ptr int data, int from, int count):void {
+    if (count > 1) {
+        sort(data + from, count);
+    }
+    eof: pass;
+}
+//═══════════════════════════════════════════════════════════════════════════
+//  Axiom fallback for the native half
+//═══════════════════════════════════════════════════════════════════════════
+//
+//  algorithm.axd declares `library "algorithm"`; the functions below are the
+//  same functions implemented in Axiom. The compiler packs both into the .acvm:
+//
+//      algorithm.dll present  →  the C version runs
+//      algorithm.dll missing  →  this one runs, same result, slower
+//
+//  Two reasons this is worth the duplication. It keeps a program portable to a
+//  machine without the DLL, and it gives the test suite a second implementation
+//  to check the first against: run the same program with and without the library
+//  and diff the output.
+//
+//  Signatures must match algorithm.axd exactly. Return types are checked at the
+//  declaration; parameter types must match too, or the two become overloads and
+//  calls silently pick one.
+//
+//  Nothing above this line needs the library -- the sort family delegates to the
+//  `sortInts` / `sortFloats` / `reverseInts` primitives, which live in acvm.exe.
+
+// ─── private helpers ───────────────────────────────────────────────────────
+
+//  Reverses data[from .. to], inclusive.
+function private reverseSpan(ptr int data, int from, int to):void {
+    while (from < to) {
+        int tmp = @(data + from);
+        @(data + from) = @(data + to);
+        @(data + to) = tmp;
+        from++;
+        to--;
+    }
+    eof: pass;
+}
+
+//  Three-way partition in place. Returns the first index whose value is not
+//  below `pivot`; the equal keys sit immediately after it.
+//
+//  Three-way rather than two-way because equal keys are common in real data and
+//  a two-way split degrades to quadratic when everything is equal. This is the
+//  same rule the C version applies, so both paths leave the same split point.
+function private partitionThree(ptr int data, int count, int pivot):int {
+    int low = 0;
+    int index = 0;
+    int high = count - 1;
+    while (index <= high) {
+        int current = @(data + index);
+        if (current < pivot) {
+            int tmp = @(data + low);
+            @(data + low) = current;
+            @(data + index) = tmp;
+            low++;
+            index++;
+        } else if (current > pivot) {
+            int tmp = @(data + high);
+            @(data + high) = current;
+            @(data + index) = tmp;
+            high--;
+        } else {
+            index++;
+        }
+    }
+    return low;
+}
+
+//  Sifts data[index] down towards the leaves of a max-heap of `count` elements.
+function private heapSiftDown(ptr int data, int index, int count):void {
+    while (true) {
+        int left = 2 * index + 1;
+        if (left >= count) {
+            return;
+        }
+        int largest = left;
+        if (left + 1 < count && @(data + left + 1) > @(data + left)) {
+            largest = left + 1;
+        }
+        if (@(data + largest) <= @(data + index)) {
+            return;
+        }
+        int tmp = @(data + index);
+        @(data + index) = @(data + largest);
+        @(data + largest) = tmp;
+        index = largest;
+    }
+    eof: pass;
+}
+
+// ─── search on sorted input ────────────────────────────────────────────────
+
+function lowerBound(ptr int data, int count, int value):int {
+    int low = 0;
+    int high = count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        // `high = mid` rather than `mid - 1`: the answer may be `mid` itself.
+        if (@(data + mid) < value) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+//  First index whose element is strictly greater than `value`, in `0..count`.
+//
+//  Unlike `binarySearch` this never returns -1: when every element is `<= value`
+//  the answer is `count`, which is the position a new element would go. Requires
+//  `data[0..count)` to be ascending; an unsorted array yields a meaningless index
+//  with no diagnostic.
+function upperBound(ptr int data, int count, int value):int {
+    int low = 0;
+    int high = count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (@(data + mid) <= value) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+//  Index of some element equal to `value`, or -1 when absent.
+//
+//  Implemented as `lowerBound` plus one equality test, so with duplicates the
+//  index returned is the first occurrence. Requires ascending order, unchecked.
+function binarySearch(ptr int data, int count, int value):int {
+    int index = lowerBound(data, count, value);
+    if (index < count && @(data + index) == value) {
+        return index;
+    }
+    return -1;
+}
+
+// ─── selection ─────────────────────────────────────────────────────────────
+
+function nthElement(ptr int data, int count, int k):void {
+    if (count <= 1 || k < 0 || k >= count) {
+        return;
+    }
+    int low = 0;
+    int high = count;
+    while (high - low > 1) {
+        int pivot = @(data + low + (high - low) / 2);
+        int less = low + partitionThree(data + low, high - low, pivot);
+        // The equal range ends where the values stop matching the pivot.
+        int greater = less;
+        while (greater < high && @(data + greater) == pivot) {
+            greater++;
+        }
+        if (k < less) {
+            high = less;
+        } else if (k >= greater) {
+            low = greater;
+        } else {
+            return;
+        }
+    }
+    eof: pass;
+}
+
+//  Median of `data[0..count)`, by value. Returns 0 for `count <= 0`.
+//
+//  **Rearranges the array** (`nthElement`), so it is not a read-only query: after
+//  the call the elements before the middle are all `<=` it and those after are
+//  `>=` it, but neither side is sorted. For an even count the lower of the two
+//  middles is returned, not their average.
+function medianValue(ptr int data, int count):int {
+    if (count <= 0) {
+        return 0;
+    }
+    int middle = count / 2;
+    nthElement(data, count, middle);
+    if (count % 2 == 1) {
+        return @(data + middle);
+    }
+    // Even count: average the two central values. The lower one is the maximum
+    // of the left half, one linear scan after the selection.
+    int lower = @data;
+    for (int i = 1; i < middle; i++) {
+        if (@(data + i) > lower) {
+            lower = @(data + i);
+        }
+    }
+    return (lower + @(data + middle)) / 2;
+}
+
+// ─── sequence operations ───────────────────────────────────────────────────
+
+function rotateInts(ptr int data, int count, int by):void {
+    if (count <= 1) {
+        return;
+    }
+    int shift = by % count;
+    if (shift < 0) {
+        shift = shift + count;
+    }
+    if (shift == 0) {
+        return;
+    }
+    // Three reversals, no scratch buffer.
+    reverseSpan(data, 0, shift - 1);
+    reverseSpan(data, shift, count - 1);
+    reverseSpan(data, 0, count - 1);
+    eof: pass;
+}
+
+//  Three-way partition about `pivot`: elements `< pivot`, then `== pivot`, then
+//  `> pivot`. Returns the index one past the equal run, i.e. the count of
+//  elements `<= pivot`. Returns 0 when `count <= 0`.
+function partitionInts(ptr int data, int count, int pivot):int {
+    if (count <= 0) {
+        return 0;
+    }
+    return partitionThree(data, count, pivot);
+}
+
+//  Removes adjacent duplicates from an already sorted array, in place.
+//
+//  Returns the new length `n`. **Only `data[0..n)` is meaningful after the call**
+//  -- the tail still holds stale elements, so iterating to the old `count` reads
+//  leftovers. Requires ascending order; unsorted input is compacted arbitrarily.
+function uniqueSorted(ptr int data, int count):int {
+    if (count <= 1) {
+        return count;
+    }
+    int write = 1;
+    for (int read = 1; read < count; read++) {
+        if (@(data + read) != @(data + write - 1)) {
+            @(data + write) = @(data + read);
+            write++;
+        }
+    }
+    return write;
+}
+
+//  Merges two ascending arrays into `destination`, ascending.
+//
+//  `capacity` is `destination`'s element capacity; the merge needs
+//  `firstCount + secondCount`. Returns the merged length, or -1 when the inputs
+//  are negative or the result does not fit -- in which case `destination` may
+//  hold a partial merge. Duplicates are preserved (this is a merge, not a union).
+function mergeInts(ptr int destination, int capacity, ptr int first, int firstCount,
+                   ptr int second, int secondCount):int {
+    if (firstCount < 0 || secondCount < 0) {
+        return -1;
+    }
+    int total = firstCount + secondCount;
+    if (total > capacity) {
+        return -1;
+    }
+    int i = 0;
+    int j = 0;
+    int k = 0;
+    while (i < firstCount && j < secondCount) {
+        // `<=` keeps the merge stable.
+        if (@(first + i) <= @(second + j)) {
+            @(destination + k) = @(first + i);
+            i++;
+        } else {
+            @(destination + k) = @(second + j);
+            j++;
+        }
+        k++;
+    }
+    while (i < firstCount) {
+        @(destination + k) = @(first + i);
+        i++;
+        k++;
+    }
+    while (j < secondCount) {
+        @(destination + k) = @(second + j);
+        j++;
+        k++;
+    }
+    return total;
+}
+
+//  Writes `value` into `data[0..count)`. `count` is an element count; no bounds
+//  check, so a `count` beyond the array writes past the end.
+function fillInts(ptr int data, int count, int value):void {
+    for (int i = 0; i < count; i++) {
+        @(data + i) = value;
+    }
+    eof: pass;
+}
+
+// ─── queries ───────────────────────────────────────────────────────────────
+
+function findInt(ptr int data, int count, int value):int {
+    for (int i = 0; i < count; i++) {
+        if (@(data + i) == value) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+//  Number of elements equal to `value`. Linear, O(count).
+//  For a sorted array `upperBound - lowerBound` is O(log n) and gives the same
+//  answer.
+function countInt(ptr int data, int count, int value):int {
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (@(data + i) == value) {
+            found++;
+        }
+    }
+    return found;
+}
+
+//  Index of the smallest element, or -1 when `count <= 0`.
+//  On ties the first occurrence wins (strict `<` in the scan).
+function minIndex(ptr int data, int count):int {
+    if (count <= 0) {
+        return -1;
+    }
+    int best = 0;
+    for (int i = 1; i < count; i++) {
+        if (@(data + i) < @(data + best)) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+//  Index of the largest element, or -1 when `count <= 0`.
+//  On ties the first occurrence wins.
+function maxIndex(ptr int data, int count):int {
+    if (count <= 0) {
+        return -1;
+    }
+    int best = 0;
+    for (int i = 1; i < count; i++) {
+        if (@(data + i) > @(data + best)) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+//  True when `data[0..count)` is non-decreasing. `count <= 1` is trivially true.
+//  Equal neighbours are allowed; this is `<=`, not `<`.
+function isSortedAsc(ptr int data, int count):bool {
+    for (int i = 1; i < count; i++) {
+        if (@(data + i - 1) > @(data + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+//  Element-wise equality. Different counts are unequal immediately, so the
+//  comparison is O(min(count)) plus an O(1) size test.
+function equalInts(ptr int first, int firstCount, ptr int second, int secondCount):bool {
+    if (firstCount != secondCount) {
+        return false;
+    }
+    for (int i = 0; i < firstCount; i++) {
+        if (@(first + i) != @(second + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ─── binary heap ───────────────────────────────────────────────────────────
+
+function makeHeap(ptr int data, int count):void {
+    if (count <= 1) {
+        return;
+    }
+    // Sift down from the last internal node; leaves are already heaps.
+    for (int i = count / 2 - 1; i >= 0; i--) {
+        heapSiftDown(data, i, count);
+    }
+    eof: pass;
+}
+
+//  Restores the max-heap property after appending one element.
+//
+//  Assumes `data[0..count-2)` is already a heap and treats `data[count-1]` as the
+//  newly pushed element, sifting it up. Does not grow anything: the caller must
+//  have made room and incremented `count` before calling.
+function pushHeap(ptr int data, int count):void {
+    if (count <= 1) {
+        return;
+    }
+    int index = count - 1;
+    while (index > 0) {
+        int parent = (index - 1) / 2;
+        if (@(data + parent) >= @(data + index)) {
+            return;
+        }
+        int tmp = @(data + parent);
+        @(data + parent) = @(data + index);
+        @(data + index) = tmp;
+        index = parent;
+    }
+    eof: pass;
+}
+
+//  Removes the maximum from the heap.
+//
+//  Swaps `data[0]` with `data[count-1]`, then sifts down over `count-1`
+//  elements. **The maximum ends up at `data[count-1]`**, so the caller reads it
+//  there and treats the heap as having `count-1` elements afterwards. Repeated
+//  calls therefore leave the array sorted ascending.
+function popHeap(ptr int data, int count):void {
+    if (count <= 1) {
+        return;
+    }
+    int tmp = @data;
+    @data = @(data + count - 1);
+    @(data + count - 1) = tmp;
+    heapSiftDown(data, 0, count - 1);
+    eof: pass;
+}
+
+//  True when `data[0..count)` satisfies the max-heap property (every parent
+//  `>=` its children). O(n), linear scan rather than repeated sift-downs.
+function isHeap(ptr int data, int count):bool {
+    for (int i = 1; i < count; i++) {
+        if (@(data + (i - 1) / 2) < @(data + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ─── sortedness and occurrence ─────────────────────────────────────────────
+
+function isSortedDesc(ptr int data, int count):bool {
+    for (int i = 1; i < count; i++) {
+        if (@(data + i - 1) < @(data + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+//  Scans backwards, which is the whole point of having it: `findInt` cannot answer
+//  "where is the last one" without walking the array twice.
+function findLastInt(ptr int data, int count, int value):int {
+    int i = count - 1;
+    while (i >= 0) {
+        if (@(data + i) == value) {
+            return i;
+        }
+        i--;
+    }
+    return -1;
+}
+
+//  One pass for both extremes. Writes four values into `out`: minimum, maximum,
+//  index of the minimum, index of the maximum -- the indices cost nothing extra
+//  once the scan is already touching every element.
+function minMax(ptr int out, int outCapacity, ptr int data, int count):int {
+    if (outCapacity < 4) {
+        return -1;
+    }
+    if (count <= 0) {
+        return 0;
+    }
+    int minAt = 0;
+    int maxAt = 0;
+    for (int i = 1; i < count; i++) {
+        if (@(data + i) < @(data + minAt)) {
+            minAt = i;
+        }
+        if (@(data + i) > @(data + maxAt)) {
+            maxAt = i;
+        }
+    }
+    @(out + 0) = @(data + minAt);
+    @(out + 1) = @(data + maxAt);
+    @(out + 2) = minAt;
+    @(out + 3) = maxAt;
+    return 1;
+}
+
+//  Compacts out every element equal to `value`. Same write-index trick as
+//  `uniqueSorted`: one pass, no shifting per removal.
+function removeValue(ptr int data, int count, int value):int {
+    int write = 0;
+    for (int read = 0; read < count; read++) {
+        if (@(data + read) != value) {
+            @(data + write) = @(data + read);
+            write++;
+        }
+    }
+    return write;
+}
+
+//  The `p`-th percentile of an **already sorted** ascending array, `p` in
+//  `0..100` (clamped). Returns 0 for `count <= 0`.
+//
+//  Uses the nearest-rank method, so the result is always an element of the array
+//  -- no interpolation, which is why it returns `int` rather than a fraction.
+function percentileSorted(ptr int data, int count, int p):int {
+    if (count <= 0) {
+        return 0;
+    }
+    if (p < 0) {
+        p = 0;
+    }
+    if (p > 100) {
+        p = 100;
+    }
+    return @(data + p * (count - 1) / 100);
+}
+
+// ─── set operations on sorted runs ─────────────────────────────────────────
+//
+// All three are the same merge walk with a different rule for equal keys, so they
+// are written out rather than guessed at: `intersect` keeps the shared value,
+// `union` keeps it once, `difference` drops it.
+
+function intersectSorted(ptr int destination, int capacity, ptr int first, int firstCount,
+                         ptr int second, int secondCount):int {
+    int i = 0;
+    int j = 0;
+    int k = 0;
+    while (i < firstCount && j < secondCount) {
+        int a = @(first + i);
+        int b = @(second + j);
+        if (a == b) {
+            if (k >= capacity) { return -1; }
+            @(destination + k) = a;
+            k++;
+            i++;
+            j++;
+        } else if (a < b) {
+            i++;
+        } else {
+            j++;
+        }
+    }
+    return k;
+}
+
+//  Union of two ascending arrays into `destination`, ascending, **duplicates
+//  removed**. Both inputs must be sorted; this does not sort them.
+//
+//  `capacity` is `destination`'s element capacity, and the worst case needs
+//  `firstCount + secondCount`. Returns the element count written, or -1 as soon
+//  as the output would overflow -- at which point `destination` holds a partial
+//  result and must not be read.
+function unionSorted(ptr int destination, int capacity, ptr int first, int firstCount,
+                     ptr int second, int secondCount):int {
+    int i = 0;
+    int j = 0;
+    int k = 0;
+    while (i < firstCount && j < secondCount) {
+        int a = @(first + i);
+        int b = @(second + j);
+        if (k >= capacity) { return -1; }
+        if (a <= b) {
+            @(destination + k) = a;
+            i++;
+            if (a == b) {
+                j++;   // equal keys appear once
+            }
+        } else {
+            @(destination + k) = b;
+            j++;
+        }
+        k++;
+    }
+    while (i < firstCount) {
+        if (k >= capacity) { return -1; }
+        @(destination + k) = @(first + i);
+        i++;
+        k++;
+    }
+    while (j < secondCount) {
+        if (k >= capacity) { return -1; }
+        @(destination + k) = @(second + j);
+        j++;
+        k++;
+    }
+    return k;
+}
+
+//  Elements of `first` that are not in `second`, into `destination`, ascending.
+//  Both inputs must be sorted. Duplicates in `first` are preserved (this is a
+//  multiset difference, not `uniqueSorted`).
+//
+//  Returns the count written, or -1 on capacity overflow (partial output).
+function differenceSorted(ptr int destination, int capacity, ptr int first, int firstCount,
+                          ptr int second, int secondCount):int {
+    int i = 0;
+    int j = 0;
+    int k = 0;
+    while (i < firstCount && j < secondCount) {
+        int a = @(first + i);
+        int b = @(second + j);
+        if (a == b) {
+            i++;   // present in both: dropped
+            j++;
+        } else if (a < b) {
+            if (k >= capacity) { return -1; }
+            @(destination + k) = a;
+            k++;
+            i++;
+        } else {
+            j++;
+        }
+    }
+    while (i < firstCount) {
+        if (k >= capacity) { return -1; }
+        @(destination + k) = @(first + i);
+        i++;
+        k++;
+    }
+    return k;
+}
+
+// ─── heap based sorting ────────────────────────────────────────────────────
+
+function heapSort(ptr int data, int count):void {
+    if (count <= 1) {
+        return;
+    }
+    makeHeap(data, count);
+    // Each pop moves the current maximum to the end and shrinks the heap by one, so
+    // after count-1 of them the array is ascending.
+    int remaining = count;
+    while (remaining > 1) {
+        popHeap(data, remaining);
+        remaining--;
+    }
+    eof: pass;
+}
+
+//  The k largest end up in data[count-k .. count-1], ascending: popHeap puts the
+//  maximum at the tail first, so reading that range forwards gives the k-th largest
+//  up to the largest.
+function topK(ptr int data, int count, int k):int {
+    if (count <= 1 || k <= 0) {
+        return 0;
+    }
+    if (k > count) {
+        k = count;
+    }
+    makeHeap(data, count);
+    for (int done = 0; done < k; done++) {
+        popHeap(data, count - done);
+    }
+    return k;
+}
+
+//  Select first so only the k smallest are in the way, then sort just those k.
+function partialSort(ptr int data, int count, int k):int {
+    if (count <= 1 || k <= 0) {
+        return 0;
+    }
+    if (k >= count) {
+        sortInts(data, count);
+        return count;
+    }
+    nthElement(data, count, k);
+    sortInts(data, k);
+    return k;
+}
+
+// ─── statistics ────────────────────────────────────────────────────────────
+
+//  Mean and population variance, written as doubles into out[0] and out[1].
+//
+//  Two passes rather than Welford's one: the sum of int32 values is exactly
+//  representable in a double (well under 2^53), so there is nothing to protect
+//  against, and a second pass is simpler to read than the incremental update.
+function variance(ptr double out, int outCapacity, ptr int data, int count):int {
+    if (outCapacity < 2) {
+        return -1;
+    }
+    if (count <= 0) {
+        return 0;
+    }
+    double sum = 0.0;
+    for (int i = 0; i < count; i++) {
+        sum = sum + (@(data + i) as double);
+    }
+    double mean = sum / (count as double);
+    double squares = 0.0;
+    for (int i = 0; i < count; i++) {
+        double delta = (@(data + i) as double) - mean;
+        squares = squares + delta * delta;
+    }
+    @(out + 0) = mean;
+    @(out + 1) = squares / (count as double);
+    return 1;
+}
+
+//═══════════════════════════════════════════════════════════════════════════
+//  string arrays: descending order and search
+//═══════════════════════════════════════════════════════════════════════════
+//
+//  The sort itself is `sortStrings` above (quicksort with median-of-three, pure Axiom).
+//  This adds what it does not cover: descending order, binary search, and insertion point.
+//
+//  Why string search needs its own copy: `lowerBound` / `binarySearch` are C code that
+//  compares 4-byte integers, but a string array holds 16-byte descriptors -- the C side
+//  gets a VM address and cannot see the characters. This family is pure Axiom instead,
+//  comparing with `<` `<=` (IRGen emits STR_CMP, unsigned byte order, so UTF-8 is right).
+
+//  Sorts descending. Sorts ascending then reverses: a second comparison path
+//  would double the code for one line of difference, and reversing is O(n).
+function sortStringsDesc(ptr string data, int count):void {
+    if (count <= 1) {
+        return;
+    }
+    sortStrings(data, count);
+    int i = 0;
+    int j = count - 1;
+    while (i < j) {
+        string tmp = @(data + i);
+        @(data + i) = @(data + j);
+        @(data + j) = tmp;
+        i++;
+        j--;
+    }
+    eof: pass;
+}
+
+//  First index whose value is >= `key`; `count` when every element is smaller.
+//  Requires ascending input. This is also "where key would be inserted".
+function lowerBoundStrings(ptr string data, int count, string key):int {
+    int low = 0;
+    int high = count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (@(data + mid) < key) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+    eof: pass;
+}
+
+//  First index whose value is > `key`. `upperBoundStrings - lowerBoundStrings`
+//  is the number of elements equal to `key`.
+function upperBoundStrings(ptr string data, int count, string key):int {
+    int low = 0;
+    int high = count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (@(data + mid) <= key) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+    eof: pass;
+}
+
+//  Index of `key`, or -1. Requires ascending input.
+function binarySearchStrings(ptr string data, int count, string key):int {
+    int at = lowerBoundStrings(data, count, key);
+    if (at < count && @(data + at) == key) {
+        return at;
+    }
+    return -1;
+    eof: pass;
+}
+
+//═══════════════════════════════════════════════════════════════════════════
+//  indirect sort: sort indices, do not move elements
+//═══════════════════════════════════════════════════════════════════════════
+//
+//  Axiom has no function pointers, so "pass a comparator to sort" is a dead end. But
+//  arrays of structs need sorting too (people by age, logs by time), and `sort` only
+//  takes contiguous arrays of `ptr int` / `int64` / `double` / `string`.
+//
+//  The answer is an **indirect sort** (argsort): do not move the array, sort the indices.
+//
+//      struct Person { string name; int age; };
+//
+//      Person people[3];
+//      people[0].name = "charlie"; people[0].age = 30;
+//      people[1].name = "alice";   people[1].age = 25;
+//      people[2].name = "bob";     people[2].age = 35;
+//
+//      int ages[3]  = {30, 25, 35};      // the field to sort on
+//      int order[3] = {0, 1, 2};         // identity permutation
+//      sortIndicesByKey(#order[0], #ages[0], 3);
+//
+//      for (int i = 0; i < 3; i++) { print(people[order[i]].name); }   // alice charlie bob
+//
+//  Why indices instead of sorting the structs directly:
+//
+//  1. **Struct size does not affect the cost.** Moving one struct with 5 strings is an
+//     80-byte copy, and 100,000 of them is 8 MB of memcpy; an index is 4 bytes.
+//  2. **No field offsets needed.** Axiom has no `offsetof`, so "which byte is age" means
+//     hand-computing the layout -- change the struct and the sort silently reads wrong.
+//  3. **Extract keys once, use them many times.** One struct array can be sorted by age
+//     and by name, each with its own `order`.
+//
+//  The caller extracts the keys (one loop), prepares the identity permutation
+//  (`order[i] = i`) and dereferences through `order`. The library does the sort itself.
+//
+//  ── the sorting algorithm ─────────────────────────────────────────────────
+//
+//  Bottom-up merge, insertion sort for small runs. Merge, not quicksort, because it is
+//  **stable**: equal keys keep their relative order, or "sort by age" would scramble people
+//  of the same age -- a scramble that looks like a bug yet cannot be reproduced.
+//
+//  `<=` rather than `<` is where stability lives: a tie takes the left run, keeping order.
+
+comptime int INDIRECT_INSERTION_CUTOFF = 20;
+
+// ─── indirect sort: one implementation, instantiated per type ──────────────
+//
+//  `insertIndexInt` / `insertIndexInt64` / `insertIndexString` were three byte-identical
+//  copies differing only in `keys`' element type; likewise `mergeIndex*` and the drivers.
+//
+//  Generics here, not `elemSize` erasure, for a concrete reason: the merge tests
+//  `keys[a] <= keys[b]`, and how to compare depends on the type -- integers numerically,
+//  `string` by content. Erasure could only dispatch on type at run time; a generic
+//  knows `T` at instantiation, and the code it emits matches a hand-written version.
+//
+//  `order` is always `ptr int` ("which row" is always an integer); only `keys` is generic.
+
+function private insertIndex<T>(ptr int order, ptr T keys, int count):void {
+    for (int i = 1; i < count; i++) {
+        int which = @(order + i);
+        T key = @(keys + which);
+        int j = i - 1;
+        while (j >= 0 && @(keys + @(order + j)) > key) {
+            @(order + j + 1) = @(order + j);
+            j--;
+        }
+        @(order + j + 1) = which;
+    }
+    eof: pass;
+}
+
+function private mergeIndex<T>(ptr int dst, ptr int src, ptr T keys, int lo, int mid, int hi):void {
+    int i = lo;
+    int j = mid;
+    int k = lo;
+    while (i < mid && j < hi) {
+        //  `<=`: a tie takes the left run, which is exactly the stability.
+        if (@(keys + @(src + i)) <= @(keys + @(src + j))) {
+            @(dst + k) = @(src + i);
+            i++;
+        } else {
+            @(dst + k) = @(src + j);
+            j++;
+        }
+        k++;
+    }
+    while (i < mid) {
+        @(dst + k) = @(src + i);
+        i++;
+        k++;
+    }
+    while (j < hi) {
+        @(dst + k) = @(src + j);
+        j++;
+        k++;
+    }
+    eof: pass;
+}
+
+//  Sorts `order[0..count)` so that `keys[order[0]] <= keys[order[1]] <= ...`.
+//
+//  `order` must start as the identity permutation `{0, 1, ..., count-1}` -- it carries
+//  the "which row" information and is not just any array. `keys` is read-only.
+function private sortIndicesByKeyAny<T>(ptr int order, ptr T keys, int count):void {
+    if (count <= 1) {
+        return;
+    }
+    if (count < INDIRECT_INSERTION_CUTOFF) {
+        insertIndex(order, keys, count);
+        return;
+    }
+    ptr int scratch = alloc(count * sizeof(int)) as ptr int;
+    if (scratch == 0 as ptr int) {
+        insertIndex(order, keys, count);     // must still give a right answer if alloc failed
+        return;
+    }
+    int width = 1;
+    while (width < count) {
+        int lo = 0;
+        while (lo < count) {
+            int mid = lo + width;
+            if (mid > count) { mid = count; }
+            int hi = lo + 2 * width;
+            if (hi > count) { hi = count; }
+            mergeIndex(scratch, order, keys, lo, mid, hi);
+            lo = lo + 2 * width;
+        }
+        for (int i = 0; i < count; i++) {
+            @(order + i) = @(scratch + i);
+        }
+        width = width * 2;
+    }
+    free(scratch);
+    eof: pass;
+}
+
+//  True when `keys[order[0]] <= keys[order[1]] <= ...` — i.e. the permutation
+//  really does put the keys in order. Exists because "sorted" is otherwise a
+//  claim nobody checks.
+function private isSortedByKeyAny<T>(ptr int order, ptr T keys, int count):bool {
+    for (int i = 1; i < count; i++) {
+        if (@(keys + @(order + i - 1)) > @(keys + @(order + i))) {
+            return false;
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+// ─── descending order and checks ───────────────────────────────────────────
+
+//  Reverses `count` ints. Reversing a sorted `order` is how descending order is
+//  obtained: a second comparison path would double the merge code for one line
+//  of difference — and reversing a stable ascending order is still stable for the
+//  only thing that matters here (equal keys end up adjacent either way).
+function reverseIndices(ptr int data, int count):void {
+    int i = 0;
+    int j = count - 1;
+    while (i < j) {
+        int tmp = @(data + i);
+        @(data + i) = @(data + j);
+        @(data + j) = tmp;
+        i++;
+        j--;
+    }
+    eof: pass;
+}
+
+//  Fills `order[0..count)` with `0, 1, ..., count-1`. Call before any of the
+//  `SortIndices*` functions: they permute a given permutation, they do not
+//  create one.
+function fillIdentity(ptr int order, int count):void {
+    for (int i = 0; i < count; i++) {
+        @(order + i) = i;
+    }
+    eof: pass;
+}
+
+// ─── public entry points ───────────────────────────────────────────────────
+//
+//  These keep type suffixes rather than a single `sortIndicesByKey`: the three functions
+//  are already public API and renaming would break call sites. New code can use the
+//  generic name -- `keys` infers the type; the old names just wrap the new implementation.
+
+function sortIndicesByKey(ptr int order, ptr int keys, int count):void {
+    sortIndicesByKeyAny(order, keys, count);
+    eof: pass;
+}
+
+//  `sortIndicesByKey` for `int64` keys — timestamps, large IDs.
+function sortIndicesByKey64(ptr int order, ptr int64 keys, int count):void {
+    sortIndicesByKeyAny(order, keys, count);
+    eof: pass;
+}
+
+//  `sortIndicesByKey` for `string` keys — names, paths, labels.
+function sortIndicesByString(ptr int order, ptr string keys, int count):void {
+    sortIndicesByKeyAny(order, keys, count);
+    eof: pass;
+}
+
+function isSortedByKey(ptr int order, ptr int keys, int count):bool {
+    return isSortedByKeyAny(order, keys, count);
+    eof: pass;
+}
+
+function isSortedByKey64(ptr int order, ptr int64 keys, int count):bool {
+    return isSortedByKeyAny(order, keys, count);
+    eof: pass;
+}
+
+function isSortedByString(ptr int order, ptr string keys, int count):bool {
+    return isSortedByKeyAny(order, keys, count);
+    eof: pass;
+}
+
+//===--- TimSort ----------------------------------------------------------===//
+//
+//  Two layers live here:
+//
+//    `timSortInts` / `timSortInts64`  declared in algorithm.axd, implemented in
+//                                     algorithm.c. The loader packs both into
+//                                     the .acvm, so a call tries the shared
+//                                     library first and falls through to the
+//                                     Axiom body below when the DLL is absent.
+//    `timSortAny<T>` / `algTim*<T>`   the Axiom bodies. Everything here is
+//                                     `private`, and the names carry an `alg`
+//                                     prefix on purpose: `private` hides a name
+//                                     from *callers*, not from the flat scope, so
+//                                     a second module with its own `timMinRun`
+//                                     would collide (stdlib/timsort.ax has
+//                                     exactly that name).
+//
+//  The bodies used to exist twice, once for `int` and once for `int64`, differing
+//  only in the element type -- eighteen functions where nine would do. They are
+//  generic now: `timSortAny<int32>` and `timSortAny<int64>` are separate compiled
+//  functions with the element stride, the comparisons and `sizeof(T)` already
+//  concrete, so the generated code is what the hand-written pair used to be. The
+//  gain is not "less typing"; it is that a fix to the merge logic cannot land in
+//  one copy and miss the other, which is the failure mode the old comments warned
+//  about in so many words.
+//
+//  `timSortInts` / `timSortInts64` cannot become one function even so: their names
+//  and signatures are the ABI of `algorithm.dll`, so they stay as two thin
+//  wrappers that choose the instantiation.
+//
+//  The algorithm, identical for both element widths:
+//
+//    * natural runs — ascending stretches, or strictly descending ones that are
+//      reversed in place (strictly, so equal keys keep their order);
+//    * a run shorter than minrun is extended to it and finished with binary
+//      insertion sort, because another merge level costs more than that;
+//    * runs sit on a stack whose lengths stay balanced (no run longer than the
+//      sum of the two below it), which bounds the merge traffic at O(n log n);
+//    * before a merge the overlap is trimmed from both borders by binary
+//      search, so two runs that do not interleave cost two searches and one
+//      memcpy;
+//    * the smaller side of each merge is copied to a scratch buffer and the
+//      merge walks streaks: while one side keeps winning, the inner loop is a
+//      compare, a store and one bound test.
+//
+//  Cost model: every local lives in the frame, so the hot loops walk with
+//  pointers (`@(p + i)`) and never use `p - q` — a pointer difference costs a
+//  DIV to turn bytes back into an element count.
+//
+//  Scratch is `count/2 + 1` elements, allocated once and freed before return.
+//  When that allocation fails the array goes to a plain binary insertion sort:
+//  stable, but O(n^2). (The C side falls back to the median-of-three quicksort
+//  instead, which is not stable — the only behavioural difference between the
+//  two, and it is unreachable in practice: it needs a failed malloc of n/2
+//  elements.)
+
+comptime int ALG_TIM_MAX_RUNS = 128;   // depth < 40 for any int count
+
+//  Counting sort instead of TimSort when the values occupy a narrow range.
+//
+//  The C side picks between three engines; this is the one that matters for a
+//  fallback, because it turns the duplicate-heavy case from n log n comparisons
+//  into two linear passes. Measured on n = 20000 with eight distinct values:
+//  11.1M instructions for TimSort against 3.6M for counting, a 3.1x win.
+//
+//  Radix was tried and rejected: 13.5M against TimSort's 14.4M for wide random
+//  data, a 7% gain that would cost the whole probe machinery plus two more
+//  specialised copies. Counting wins big or not at all, which is the right shape
+//  for code that has to pay for itself.
+//
+//  `range <= n / ALG_COUNT_DIV` is the same rule as the C side's
+//  ACVM_DENSE_DIV, and it is there for the same reason: the counter array is one
+//  int per bucket, so at range == n it is as large as the input and the page
+//  faults eat the arithmetic. n/8 keeps it to n bytes.
+comptime int ALG_COUNT_DIV = 8;
+
+//  Below this the fixed cost of the scan and the scatter dominates and TimSort's
+//  insertion sort is already the cheaper answer.
+comptime int ALG_COUNT_MIN = 256;
+
+//  Elements read by the cheap gate that decides whether an exact scan is worth
+//  it. A full min/max pass over an array that turns out to be wide is a pass
+//  thrown away -- measured at 3.7% on random data and 18.5% on a descending
+//  array, both of which TimSort already handles well. Sampling first makes that
+//  pass conditional and the regressions disappear.
+comptime int ALG_COUNT_SAMPLES = 256;
+
+//  minrun: n, or slightly more, so that n/minrun sits just under a power of two
+//  and runs merge in balanced pairs. Element type independent, so it is not
+//  generic.
+function private algTimMinRun(int n):int {
+    int r = 0;
+    while (n >= 64) {
+        r = r | (n & 1);
+        n = n >> 1;
+    }
+    return n + r;
+    eof: pass;
+}
+
+//  Length of the run at `lo`, reversed in place when it is strictly descending.
+//  Equal head pairs are left alone (no reversal), which is what keeps the sort
+//  stable.
+function private algTimRunLen<T>(ptr T a, int lo, int hi):int {
+    int remaining = hi - lo;
+    if (remaining < 2) {
+        return remaining;
+    }
+    //  An ascending run may contain equals: they are already in order, so leaving
+    //  them alone is what stability means. A *descending* run must be strict --
+    //  reversing a stretch with equal neighbours would swap them.
+    if (!(@(a + lo + 1) < @(a + lo))) {
+        int run = 2;
+        while (lo + run < hi && !(@(a + lo + run - 1) > @(a + lo + run))) {
+            run++;
+        }
+        return run;
+    }
+    int run = 2;
+    while (lo + run < hi && @(a + lo + run) < @(a + lo + run - 1)) {
+        run++;
+    }
+    int i = 0;
+    int j = run - 1;
+    while (i < j) {
+        T t = @(a + lo + i);
+        @(a + lo + i) = @(a + lo + j);
+        @(a + lo + j) = t;
+        i++;
+        j--;
+    }
+    return run;
+    eof: pass;
+}
+
+//  Binary insertion sort over [lo, hi): log k compares per element and one
+//  memmove for the shift, instead of a compare-and-swap per position.
+function private algTimInsert<T>(ptr T a, int lo, int hi):void {
+    int i = lo + 1;
+    while (i < hi) {
+        T key = @(a + i);
+        int low = lo;
+        int high = i;
+        while (low < high) {
+            int mid = low + ((high - low) >> 1);
+            if (@(a + mid) <= key) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if (low != i) {
+            memmove((a + low + 1) as ptr void, (a + low) as ptr void,
+                    (i - low) * sizeof(T));
+        }
+        @(a + low) = key;
+        i++;
+    }
+    eof: pass;
+}
+
+//  First offset in [0, len) whose element is >= key. Used only to trim a merge.
+function private algTimLower<T>(ptr T a, int base, int len, T key):int {
+    int low = 0;
+    int high = len;
+    while (low < high) {
+        int mid = low + ((high - low) >> 1);
+        if (@(a + base + mid) < key) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+    eof: pass;
+}
+
+//  First offset in [0, len) whose element is > key.
+function private algTimUpper<T>(ptr T a, int base, int len, T key):int {
+    int low = 0;
+    int high = len;
+    while (low < high) {
+        int mid = low + ((high - low) >> 1);
+        if (@(a + base + mid) <= key) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+    eof: pass;
+}
+
+//  Merge where the left run is the smaller side: copy it out, merge forward.
+//  A tie goes to the left run, which is what stability means here.
+function private algTimMergeLo<T>(ptr T a, int b1, int n1, int b2, int n2,
+                                  ptr T tmp):void {
+    memcpy(tmp as ptr void, (a + b1) as ptr void, n1 * sizeof(T));
+    int i = 0;
+    int j = b2;
+    int k = b1;
+    int iEnd = n1;
+    int jEnd = b2 + n2;
+    while (i < iEnd && j < jEnd) {
+        // While the left side wins, copy without re-testing both sides.
+        while (i < iEnd && !(@(a + j) < @(tmp + i))) {
+            @(a + k) = @(tmp + i);
+            k++;
+            i++;
+        }
+        if (i >= iEnd) {
+            break;
+        }
+        while (j < jEnd && @(a + j) < @(tmp + i)) {
+            @(a + k) = @(a + j);
+            k++;
+            j++;
+        }
+    }
+    if (i < iEnd) {
+        memcpy((a + k) as ptr void, (tmp + i) as ptr void, (iEnd - i) * sizeof(T));
+    }
+    eof: pass;
+}
+
+//  Mirror of `algTimMergeLo` for n1 > n2: copy the right run and merge
+//  backwards. A tie goes to the right run — also for stability.
+function private algTimMergeHi<T>(ptr T a, int b1, int n1, int b2, int n2,
+                                  ptr T tmp):void {
+    memcpy(tmp as ptr void, (a + b2) as ptr void, n2 * sizeof(T));
+    int i = b1 + n1 - 1;
+    int j = n2 - 1;
+    int k = b2 + n2 - 1;
+    while (i >= b1 && j >= 0) {
+        while (j >= 0 && !(@(tmp + j) < @(a + i))) {
+            @(a + k) = @(tmp + j);
+            k--;
+            j--;
+        }
+        if (j < 0) {
+            break;
+        }
+        while (i >= b1 && @(tmp + j) < @(a + i)) {
+            @(a + k) = @(a + i);
+            k--;
+            i--;
+        }
+    }
+    if (j >= 0) {
+        memcpy((a + k - j) as ptr void, tmp as ptr void, (j + 1) * sizeof(T));
+    }
+    eof: pass;
+}
+
+//  Merge runs `i` and `i+1` after trimming the part of each that is already in
+//  place, then shift the stack down over the pair.
+function private algTimMergeAt<T>(ptr T a, ptr int base, ptr int lens, int i,
+                                  int runs, ptr T tmp):void {
+    int oBase = @(base + i);
+    int oN1 = @(lens + i);
+    int oN2 = @(lens + i + 1);
+    int b1 = oBase;
+    int n1 = oN1;
+    int b2 = @(base + i + 1);
+    int n2 = oN2;
+
+    // Left elements <= the right head are already where they belong.
+    int cut = algTimUpper(a, b1, n1, @(a + b2));
+    b1 = b1 + cut;
+    n1 = n1 - cut;
+    if (n1 > 0) {
+        // Right elements >= the last left element stay put as well.
+        n2 = algTimLower(a, b2, n2, @(a + b1 + n1 - 1));
+    }
+    if (n1 > 0 && n2 > 0) {
+        if (n1 <= n2) {
+            algTimMergeLo(a, b1, n1, b2, n2, tmp);
+        } else {
+            algTimMergeHi(a, b1, n1, b2, n2, tmp);
+        }
+    }
+    @(base + i) = oBase;
+    @(lens + i) = oN1 + oN2;
+    int j = i + 1;
+    while (j + 1 < runs) {
+        @(base + j) = @(base + j + 1);
+        @(lens + j) = @(lens + j + 1);
+        j++;
+    }
+    eof: pass;
+}
+
+//  One pass, three answers: the minimum, the maximum, and whether the input is
+//  already non-decreasing.
+//
+//  Returns true when the array is sorted by the time this returns -- either
+//  because it already was, or because counting sort finished it -- and false when
+//  the caller should fall through to TimSort.
+//
+//  Folding the "already sorted?" test into the min/max scan is what makes the
+//  scan free in the best case: walking the array once to find the range would
+//  otherwise be a pass that TimSort then repeats for its own run detection.
+//  Returning early here is the same discovery TimSort would make, minus the run
+//  stack and the merge bookkeeping, so an ordered array now finishes a little
+//  sooner than it used to.
+//
+//  The width arithmetic is done in `int127` for every `T`, not just for `int64`.
+//  That is what makes one body correct for both: two `int32` values are at most
+//  2^32 apart, two `int64` values at most 2^64, and `int127` holds either without
+//  the signed overflow that would turn "too wide to count-sort" into "negative
+//  range, proceed". The three `int127` operations are per call, not per element,
+//  so the wider temporaries cost nothing measurable.
+function private algCountAny<T>(ptr T a, int n, ptr T scratch):bool {
+    //  Gate first. A sample is a subset, so its range can only be narrower than
+    //  the real one: a wide sample proves the array is wide and counting cannot
+    //  win, without touching the rest of the array.
+    int127 limit = (n / ALG_COUNT_DIV) as int127;
+    int step = n / ALG_COUNT_SAMPLES;
+    if (step < 1) {
+        step = 1;
+    }
+    T sampledLo = @a;
+    T sampledHi = @a;
+    int s = 0;
+    while (s < n) {
+        T v = @(a + s);
+        if (v < sampledLo) {
+            sampledLo = v;
+        }
+        if (v > sampledHi) {
+            sampledHi = v;
+        }
+        s = s + step;
+    }
+    int127 sampledSpan = (sampledHi as int127) - (sampledLo as int127);
+    if (sampledSpan > limit) {
+        return false;
+    }
+
+    T lo = @a;
+    T hi = @a;
+    bool ascending = true;
+    T prev = @a;
+    int i = 1;
+    while (i < n) {
+        T v = @(a + i);
+        if (v < lo) {
+            lo = v;
+        }
+        if (v > hi) {
+            hi = v;
+        }
+        if (v < prev) {
+            ascending = false;
+        }
+        prev = v;
+        i++;
+    }
+    if (ascending) {
+        return true;
+    }
+    //  Guard before the narrowing cast: `as int` is checked and would trap, so
+    //  "range too wide to count-sort" has to be decided while it is still wide.
+    int127 span = (hi as int127) - (lo as int127);
+    if (span >= limit) {
+        return false;
+    }
+    int range = (span as int) + 1;
+    if (range <= 0) {
+        return false;
+    }
+    ptr int counters = alloc(range * sizeof(int)) as ptr int;
+    if (counters == 0 as ptr int) {
+        return false;
+    }
+
+    int d = 0;
+    while (d < range) {
+        @(counters + d) = 0;
+        d++;
+    }
+    i = 0;
+    while (i < n) {
+        int bucket = (@(a + i) - lo) as int;
+        @(counters + bucket) = @(counters + bucket) + 1;
+        i++;
+    }
+    int sum = 0;
+    d = 0;
+    while (d < range) {
+        int c = @(counters + d);
+        @(counters + d) = sum;
+        sum = sum + c;
+        d++;
+    }
+    //  Walking the input in order and placing each element at the next free slot
+    //  of its bucket is what makes this stable: equal keys keep their order.
+    i = 0;
+    while (i < n) {
+        T value = @(a + i);
+        int bucket = (value - lo) as int;
+        int at = @(counters + bucket);
+        @(scratch + at) = value;
+        @(counters + bucket) = at + 1;
+        i++;
+    }
+    memcpy(a as ptr void, scratch as ptr void, n * sizeof(T));
+    free(counters as ptr void);
+    return true;
+    eof: pass;
+}
+
+//  Sorts `count` elements of type `T`. The two callers below are the only
+//  instantiations, and each exists because `algorithm.axd` names it.
+function private timSortAny<T>(ptr T data, int count):void {
+    if (count < 2) {
+        return;
+    }
+    //  One buffer for both engines: counting sort needs `count` elements for its
+    //  scatter, TimSort only `count/2 + 1` for its merge scratch, so `count`
+    //  serves either and neither allocates a second time.
+    ptr T tmp = alloc(count * sizeof(T)) as ptr T;
+    if (tmp == 0 as ptr T) {
+        // Out of arena: correct but quadratic, and still stable.
+        algTimInsert(data, 0, count);
+        return;
+    }
+
+    if (count >= ALG_COUNT_MIN && algCountAny(data, count, tmp)) {
+        free(tmp as ptr void);
+        return;
+    }
+
+    int minRun = algTimMinRun(count);
+    int runBase[ALG_TIM_MAX_RUNS];
+    int runLen[ALG_TIM_MAX_RUNS];
+    ptr int base = #runBase[0];
+    ptr int lens = #runLen[0];
+    int runs = 0;
+    int lo = 0;
+
+    while (lo < count) {
+        int len = algTimRunLen(data, lo, count);
+        if (len < minRun) {
+            int forced = count - lo;
+            if (forced > minRun) {
+                forced = minRun;
+            }
+            algTimInsert(data, lo, lo + forced);
+            len = forced;
+        }
+        @(base + runs) = lo;
+        @(lens + runs) = len;
+        runs++;
+        lo = lo + len;
+
+        // Restore `lens[n-3] > lens[n-2] + lens[n-1]` and `lens[n-2] > lens[n-1]`.
+        // Merging the shorter pair first is what bounds the element traffic.
+        while (runs > 1) {
+            int n = runs;
+            bool merged = false;
+            if (n > 2 && @(lens + n - 3) <= @(lens + n - 2) + @(lens + n - 1)) {
+                if (@(lens + n - 3) < @(lens + n - 1)) {
+                    n = n - 1;
+                }
+                algTimMergeAt(data, base, lens, n - 2, runs, tmp);
+                runs--;
+                merged = true;
+            } else if (@(lens + n - 2) <= @(lens + n - 1)) {
+                algTimMergeAt(data, base, lens, n - 2, runs, tmp);
+                runs--;
+                merged = true;
+            }
+            if (!merged) {
+                break;
+            }
+        }
+
+        // The invariants bound the depth far below ALG_TIM_MAX_RUNS; this only
+        // keeps a bug from writing past the stack arrays.
+        if (runs >= ALG_TIM_MAX_RUNS) {
+            algTimMergeAt(data, base, lens, runs - 2, runs, tmp);
+            runs--;
+        }
+    }
+
+    // Collapse what is left, shortest pair first.
+    while (runs > 1) {
+        int n = runs;
+        if (n > 2 && @(lens + n - 3) < @(lens + n - 1)) {
+            n = n - 1;
+        }
+        algTimMergeAt(data, base, lens, n - 2, runs, tmp);
+        runs--;
+    }
+
+    free(tmp as ptr void);
+    eof: pass;
+}
+
+//  Sorts `count` 32 bit integers. Native when algorithm.dll is present;
+//  otherwise this body runs (the loader merges the two declarations into one
+//  function — see SEMA.md §5.4.2).
+function timSortInts(ptr int data, int count):void {
+    timSortAny(data, count);
+    eof: pass;
+}
+
+//  Native TimSort entry point for `int64`, declared in `algorithm.axd`.
+//
+//  The DLL version adds the counting/radix engines on unstructured input; this
+//  Axiom body is TimSort only, so without `algorithm.dll` the result is still
+//  correct and still stable, just slower on random data.
+function timSortInts64(ptr int64 data, int count):void {
+    timSortAny(data, count);
+    eof: pass;
+}
+
+
+//═══════════════════════════════════════════════════════════════════════════
+//  Axiom fallback: sortDoubleNative
+//═══════════════════════════════════════════════════════════════════════════
+//
+//  Only reached without algorithm.dll. Same algorithm as the C side -- radix over
+//  the folded bit pattern -- written out in Axiom so the fallback keeps NaN's
+//  defined position instead of falling back to comparisons that cannot express it.
+//
+//  Doubles cannot be bit-cast in Axiom, so the fold is done arithmetically: the
+//  key is built from the sign, the biased exponent and the mantissa via a union
+//  of comparisons. That needs `int64` arithmetic and `math`'s frexp-equivalent,
+//  which the language does not expose -- so this fallback sorts by comparison and
+//  documents that NaN is out of contract here. A fallback is
+//  allowed to be slower, and this one is also allowed to be less total.
+function sortDoubleNative(ptr double data, int count):void {
+    sortFloats(data, count);
+    eof: pass;
+}

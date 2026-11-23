@@ -1,0 +1,13 @@
+// Left shift past the top of `int128`.
+//
+// The usual carry-out test is `shifted & ~maskFor(bits)`, and at 128 bits
+// `~maskFor(128)` is zero -- there is no 129th bit. Both the VM and the folder need
+// the operand-vs-limit comparison instead, or the shift silently wraps.
+
+function main():void {
+    int128 maxv = 170141183460469231731687303715884105727i128;
+    print("before\n");
+    int128 doubled = maxv << 1;
+    print(doubled);
+    eof: pass;
+}

@@ -1,0 +1,11 @@
+// `unsigned int128` must be refused, not accepted and then mis-printed.
+//
+// Its range is 0 .. 2^128−1 and the VM carries every scalar in a *signed* 128-bit
+// cell, so the upper half has no representation: printing, `<` and float conversion
+// would all read those values as negative. One honest error beats three silent ones.
+
+function main():void {
+    unsigned int128 u = 1;
+    print(u);
+    eof: pass;
+}

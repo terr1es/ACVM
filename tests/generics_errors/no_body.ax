@@ -1,0 +1,7 @@
+//  Declaration only, no body -> there is nothing to instantiate per type.
+function mapOf<T>(ptr T data, int count):T;
+
+function main():void {
+    pass;
+    eof: pass;
+}

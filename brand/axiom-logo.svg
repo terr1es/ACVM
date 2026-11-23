@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Axiom">
+  <title>Axiom</title>
+  <desc>Isosceles triangle, 50 degree apex, 65 degree base angles. The inner A is a solid letterform with mitered apex, flat baseline and square-ended crossbar; its legs are parallel to the triangle sides.</desc>
+  <path d="M128 28 L34.74 228 L221.26 228 Z"
+        fill="none" stroke="currentColor" stroke-width="10"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path fill="currentColor" fill-rule="evenodd" d="M128.00 70.59 L62.99 210.00 L193.01 210.00 Z M128.00 89.52 L98.71 152.33 L157.29 152.33 Z M94.98 160.33 L161.02 160.33 L184.18 210.00 L71.82 210.00 Z"/>
+</svg>

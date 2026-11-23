@@ -1,0 +1,606 @@
+//  csv.ax -- reading and writing CSV / TSV (RFC 4180 tables, not "split on commas").
+//
+//      function import (return:(csv));
+//
+//      Doc d = docNew(0);
+//      ptr CsvTable t = csvParse(#d, "name,port\nweb,80\ndb,5432\n", ',');
+//      print(csvCellName(t, 0, "name"));      // web
+//      print(csvCell(t, 1, 1));               // 5432
+//      print(csvWrite(#d, t, ','));
+//      docFree(#d);
+//
+//  ── why not array of array ───────────────────────────────────────────────
+//
+//  CSV is a **table**: rows are equal width, row 0 usually a header. A nested Value
+//  array would make "read a column by name" a two-level scan and lose the "every row
+//  is the same width" invariant. So there is a table type: cells are strings, stored
+//  contiguously (rows * cols) row-major, so reaching a row is a multiply, not a walk.
+//
+//  ── quoting rules (RFC 4180) ─────────────────────────────────────────────
+//
+//  A field may be wrapped in `"`, `""` inside meaning one literal quote, and it may
+//  contain the delimiter and newlines. **A write quotes only when needed** -- delimiter,
+//  quote, newline, edge spaces -- else `80` becomes `"80"` and diffs fill with noise.
+//
+//  ── rows of unequal width ────────────────────────────────────────────────
+//
+//  Short rows are padded with "", long rows are an error ("row 4 has 5 fields, expected
+//  3"). Padding is the only way to keep the invariant: uneven rows make each lookup check.
+//
+//  depends: value
+
+module "csv" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(value));
+
+struct CsvTable {
+    ptr string names;      // header, cols of them; all "" without a header
+    ptr string cells;      // rows * cols, row-major
+    int rows;
+    int cols;
+    int capacity;          // row capacity
+};
+
+struct CsvReader {
+    ptr unsigned int8 bytes;
+    int length;
+    int pos;
+    ptr Doc doc;
+    int delimiter;
+    int fieldCount;        // fields on the current row
+    int rowNumber;
+};
+
+//===--- parsing ---------------------------------------------------------===//
+
+function private csvFail(ptr CsvReader r, string message):ptr CsvTable {
+    docFail(r->doc, message, r->pos);
+    return null;
+    eof: pass;
+}
+
+//  Reads one field starting at `pos`, following the quoting rules. Returns the
+//  text (arena) and leaves `pos` just after the closing delimiter or newline.
+//
+//  `*finished` is set when the field ended the record (newline or EOF) rather
+//  than a delimiter, because that distinction is what terminates the row loop.
+function private csvReadField(ptr CsvReader r, ptr bool finished):string {
+    @finished = false;
+    int startPos = r->pos;
+    int capacity = r->length - r->pos + 1;
+    ptr int8 buffer = arenaTake(#r->doc->arena, capacity);
+    if (buffer == null) {
+        csvFail(r, "out of memory");
+        return "";
+    }
+    int out = 0;
+    bool quoted = false;
+
+    if (r->pos < r->length && @(r->bytes + r->pos) as int == 34) {
+        quoted = true;
+        r->pos = r->pos + 1;
+        while (true) {
+            if (r->pos >= r->length) {
+                r->pos = startPos;
+                csvFail(r, "unterminated quoted field");
+                return "";
+            }
+            int c = @(r->bytes + r->pos) as int;
+            if (c == 34) {
+                if (r->pos + 1 < r->length && @(r->bytes + r->pos + 1) as int == 34) {
+                    @((buffer + out) as ptr unsigned int8) = ((34) & 255) as unsigned int8;
+                    out = out + 1;
+                    r->pos = r->pos + 2;
+                } else {
+                    r->pos = r->pos + 1;
+                    break;
+                }
+            } else {
+                @((buffer + out) as ptr unsigned int8) = ((c) & 255) as unsigned int8;
+                out = out + 1;
+                r->pos = r->pos + 1;
+            }
+        }
+        // Anything between the closing quote and the delimiter is an error in
+        // RFC 4180; accepting it silently is how `"a"b` becomes `ab`.
+        if (r->pos < r->length) {
+            int c = @(r->bytes + r->pos) as int;
+            if (c != r->delimiter && c != 10 && c != 13) {
+                csvFail(r, "unexpected text after a closing quote");
+                return "";
+            }
+        }
+    } else {
+        while (r->pos < r->length) {
+            int c = @(r->bytes + r->pos) as int;
+            if (c == r->delimiter || c == 10 || c == 13) {
+                break;
+            }
+            @((buffer + out) as ptr unsigned int8) = ((c) & 255) as unsigned int8;
+            out = out + 1;
+            r->pos = r->pos + 1;
+        }
+    }
+
+    if (r->pos < r->length) {
+        int c = @(r->bytes + r->pos) as int;
+        if (c == r->delimiter) {
+            r->pos = r->pos + 1;
+        } else {
+            @finished = true;
+            if (c == 13) {
+                r->pos = r->pos + 1;
+                if (r->pos < r->length && @(r->bytes + r->pos) as int == 10) {
+                    r->pos = r->pos + 1;
+                }
+            } else if (c == 10) {
+                r->pos = r->pos + 1;
+            }
+        }
+    } else {
+        @finished = true;
+    }
+
+    if (!quoted && out > 0) {
+        // Unquoted fields cannot carry meaningful leading/trailing spaces in a
+        // hand-written file, and keeping them makes `port, 8080` differ from
+        // `port,8080`. Quoted fields keep everything.
+        int from = 0;
+        while (from < out) {
+            int c = @(buffer + from) as int;
+            if (c != 32 && c != 9) {
+                break;
+            }
+            from = from + 1;
+        }
+        int stop = out;
+        while (stop > from) {
+            int c = @(buffer + stop - 1) as int;
+            if (c != 32 && c != 9) {
+                break;
+            }
+            stop = stop - 1;
+        }
+        if (from > 0 || stop < out) {
+            if (stop > from) {
+                memmove(buffer as ptr void, (buffer + from) as ptr void, stop - from);
+            }
+            out = stop - from;
+        }
+    }
+    return arenaStringTake(buffer, out);
+    eof: pass;
+}
+
+//  Grows the row store. Like every arena allocation, the old block is abandoned
+//  rather than freed: the whole arena goes away at `docFree`.
+function private csvReserve(ptr Doc d, ptr CsvTable t, int wantRows):bool {
+    if (t->capacity >= wantRows) {
+        return true;
+    }
+    int cap = t->capacity < 8 ? 8 : t->capacity;
+    while (cap < wantRows) {
+        cap = cap * 2;
+    }
+    ptr string cells = arenaTake(#d->arena, cap * t->cols * sizeof(string)) as ptr string;
+    if (cells == null) {
+        return false;
+    }
+    if (t->rows > 0) {
+        memcpy(cells as ptr void, t->cells as ptr void, t->rows * t->cols * sizeof(string));
+    }
+    t->cells = cells;
+    t->capacity = cap;
+    return true;
+    eof: pass;
+}
+
+//  Parses `text` as a CSV table with a header row. The delimiter is a byte:
+//  ',' for CSV, '\t' (9) for TSV, ';' for the European convention.
+//
+//  `cols` is fixed by the header. A row with fewer fields is padded with empty
+//  strings; a row with more is an error, because dropping cells silently is worse
+//  than refusing to load the file.
+function csvParse(ptr Doc doc, string text, int delimiter):ptr CsvTable {
+    CsvReader reader;
+    reader.bytes = strBytesOf(text) as ptr unsigned int8;
+    reader.length = text.length;
+    reader.pos = 0;
+    reader.doc = doc;
+    reader.delimiter = delimiter;
+    reader.fieldCount = 0;
+    reader.rowNumber = 0;
+
+    if (delimiter <= 0) {
+        delimiter = 44;
+        reader.delimiter = 44;
+    }
+
+    // Skip a UTF-8 BOM: spreadsheets write one and it would otherwise become
+    // part of the first header cell.
+    if (text.length >= 3) {
+        if (@(reader.bytes) as int == 239 && @(reader.bytes + 1) as int == 187 &&
+            @(reader.bytes + 2) as int == 191) {
+            reader.pos = 3;
+        }
+    }
+
+    ptr CsvTable table = arenaTake(#doc->arena, sizeof(CsvTable)) as ptr CsvTable;
+    if (table == null) {
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    table->names = null;
+    table->cells = null;
+    table->rows = 0;
+    table->cols = 0;
+    table->capacity = 0;
+
+    // ── header ──
+    bool finished = false;
+    ptr string names = null;
+    int cols = 0;
+    int namesCapacity = 8;
+    names = arenaTake(#doc->arena, namesCapacity * sizeof(string)) as ptr string;
+    if (names == null) {
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    while (!finished) {
+        string field = csvReadField(#reader, #finished);
+        if (docFailed(doc)) {
+            return null;
+        }
+        if (cols == namesCapacity) {
+            namesCapacity = namesCapacity * 2;
+            ptr string grown = arenaTake(#doc->arena, namesCapacity * sizeof(string)) as ptr string;
+            if (grown == null) {
+                docFail(doc, "out of memory", 0);
+                return null;
+            }
+            memcpy(grown as ptr void, names as ptr void, cols * sizeof(string));
+            names = grown;
+        }
+        names[cols] = trim(field);
+        cols = cols + 1;
+    }
+    if (cols == 0) {
+        docFail(doc, "the file has no header row", 0);
+        return null;
+    }
+    table->names = names;
+    table->cols = cols;
+
+    // ── rows ──
+    while (reader.pos < reader.length) {
+        // A trailing newline at EOF must not produce an empty row.
+        if (@(reader.bytes + reader.pos) as int == 10 || @(reader.bytes + reader.pos) as int == 13) {
+            reader.pos = reader.pos + 1;
+            continue;
+        }
+        if (!csvReserve(doc, table, table->rows + 1)) {
+            docFail(doc, "out of memory", 0);
+            return null;
+        }
+        int row = table->rows;
+        int col = 0;
+        finished = false;
+        while (!finished) {
+            string field = csvReadField(#reader, #finished);
+            if (docFailed(doc)) {
+                return null;
+            }
+            if (col >= cols) {
+                docFail(doc, "row " + itoa(row + 2, 10) + " has more fields than the header (" +
+                                 itoa(cols, 10) + ")", reader.pos);
+                return null;
+            }
+            table->cells[row * cols + col] = field;
+            col = col + 1;
+        }
+        while (col < cols) {
+            table->cells[row * cols + col] = "";
+            col = col + 1;
+        }
+        table->rows = row + 1;
+    }
+    doc->root = null;
+    return table;
+    eof: pass;
+}
+
+//  Header-less variant: every line is a record, and the width is taken from the
+//  first row. Column names become "0", "1", ... so `csvCellName` still works.
+function csvParseNoHeader(ptr Doc doc, string text, int delimiter):ptr CsvTable {
+    ptr CsvTable table = csvParse(doc, text, delimiter);
+    if (table == null) {
+        return null;
+    }
+    // The first row was treated as a header; turn it into a data row.
+    if (!csvReserve(doc, table, table->rows + 1)) {
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    int cols = table->cols;
+    // Shift existing rows down by one (backwards, so nothing is overwritten).
+    int row = table->rows;
+    while (row > 0) {
+        memcpy((table->cells + row * cols) as ptr void, (table->cells + (row - 1) * cols) as ptr void,
+               cols * sizeof(string));
+        row = row - 1;
+    }
+    int col = 0;
+    while (col < cols) {
+        table->cells[col] = table->names[col];
+        table->names[col] = itoa(col, 10);
+        col = col + 1;
+    }
+    table->rows = table->rows + 1;
+    return table;
+    eof: pass;
+}
+
+//===--- access ----------------------------------------------------------===//
+
+function csvRows(ptr CsvTable t):int {
+    if (t == null) {
+        return 0;
+    }
+    return t->rows;
+    eof: pass;
+}
+
+function csvCols(ptr CsvTable t):int {
+    if (t == null) {
+        return 0;
+    }
+    return t->cols;
+    eof: pass;
+}
+
+//  Cell by position. Out of range yields "" -- a table lookup during iteration
+//  should not abort, and the empty string reads correctly in a report.
+function csvCell(ptr CsvTable t, int row, int col):string {
+    if (t == null || row < 0 || row >= t->rows || col < 0 || col >= t->cols) {
+        return "";
+    }
+    return t->cells[row * t->cols + col];
+    eof: pass;
+}
+
+//  Column index for a header name, or -1.
+function csvColumn(ptr CsvTable t, string name):int {
+    if (t == null) {
+        return -1;
+    }
+    int i = 0;
+    while (i < t->cols) {
+        if (t->names[i] == name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+    eof: pass;
+}
+
+//  Cell by header name. An unknown column yields "" and, unlike `csvColumn`, it
+//  does not require the caller to write the -1 check at every use.
+function csvCellName(ptr CsvTable t, int row, string name):string {
+    int col = csvColumn(t, name);
+    if (col < 0) {
+        return "";
+    }
+    return csvCell(t, row, col);
+    eof: pass;
+}
+
+function csvHeader(ptr CsvTable t, int col):string {
+    if (t == null || col < 0 || col >= t->cols) {
+        return "";
+    }
+    return t->names[col];
+    eof: pass;
+}
+
+//===--- modification ----------------------------------------------------===//
+
+//  Appends a row of `t->cols` values. Extra values are dropped, missing ones
+//  become "". Returns the new row count, or -1 on failure.
+function csvAppendRow(ptr Doc doc, ptr CsvTable t, ptr string values, int count):int {
+    if (t == null || !csvReserve(doc, t, t->rows + 1)) {
+        return -1;
+    }
+    int row = t->rows;
+    int col = 0;
+    while (col < t->cols) {
+        if (col < count) {
+            t->cells[row * t->cols + col] = arenaStringOfString(#doc->arena, values[col]);
+        } else {
+            t->cells[row * t->cols + col] = "";
+        }
+        col = col + 1;
+    }
+    t->rows = row + 1;
+    return t->rows;
+    eof: pass;
+}
+
+function csvSetCell(ptr Doc doc, ptr CsvTable t, int row, int col, string value):bool {
+    if (t == null || row < 0 || row >= t->rows || col < 0 || col >= t->cols) {
+        return false;
+    }
+    t->cells[row * t->cols + col] = arenaStringOfString(#doc->arena, value);
+    return true;
+    eof: pass;
+}
+
+function csvSetCellName(ptr Doc doc, ptr CsvTable t, int row, string name, string value):bool {
+    return csvSetCell(doc, t, row, csvColumn(t, name), value);
+    eof: pass;
+}
+
+//  Removes a row by shifting the tail up.
+function csvRemoveRow(ptr CsvTable t, int row):bool {
+    if (t == null || row < 0 || row >= t->rows) {
+        return false;
+    }
+    int tail = t->rows - row - 1;
+    if (tail > 0) {
+        memmove((t->cells + row * t->cols) as ptr void,
+                (t->cells + (row + 1) * t->cols) as ptr void, tail * t->cols * sizeof(string));
+    }
+    t->rows = t->rows - 1;
+    return true;
+    eof: pass;
+}
+
+//  Appends a column. Every existing row gets `initial` in the new position, so
+//  the table stays rectangular; the old cell block is abandoned in the arena.
+function csvAppendColumn(ptr Doc doc, ptr CsvTable t, string name, string initial):bool {
+    if (t == null) {
+        return false;
+    }
+    int cols = t->cols + 1;
+    ptr string names = arenaTake(#doc->arena, cols * sizeof(string)) as ptr string;
+    ptr string cells = arenaTake(#doc->arena, t->capacity * cols * sizeof(string)) as ptr string;
+    if (names == null || cells == null) {
+        return false;
+    }
+    memcpy(names as ptr void, t->names as ptr void, t->cols * sizeof(string));
+    names[t->cols] = arenaStringOfString(#doc->arena, name);
+
+    int row = 0;
+    while (row < t->rows) {
+        memcpy((cells + row * cols) as ptr void, (t->cells + row * t->cols) as ptr void,
+               t->cols * sizeof(string));
+        cells[row * cols + t->cols] = arenaStringOfString(#doc->arena, initial);
+        row = row + 1;
+    }
+    // Rows added later still need `initial`; recording it would need another
+    // field, so the padding is written on append instead (see csvAppendRow).
+    t->names = names;
+    t->cells = cells;
+    t->cols = cols;
+    return true;
+    eof: pass;
+}
+
+//===--- serialising -----------------------------------------------------===//
+
+function private csvNeedsQuote(string text, int delimiter):bool {
+    if (text.length == 0) {
+        return false;
+    }
+    int first = strByteAt(text, 0);
+    int last = strByteAt(text, text.length - 1);
+    if (first == 32 || first == 9 || last == 32 || last == 9) {
+        return true;
+    }
+    int i = 0;
+    while (i < text.length) {
+        int c = strByteAt(text, i);
+        if (c == delimiter || c == 34 || c == 10 || c == 13) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+    eof: pass;
+}
+
+function private csvWriteField(ptr StrBuf b, string text, int delimiter):void {
+    if (!csvNeedsQuote(text, delimiter)) {
+        sbPut(b, text);
+        return;
+    }
+    sbPutByte(b, 34);
+    ptr unsigned int8 bytes = strBytesOf(text) as ptr unsigned int8;
+    int i = 0;
+    while (i < text.length) {
+        int c = @(bytes + i) as int;
+        if (c == 34) {
+            // One literal quote inside a quoted field is written as two.
+            sbPutByte(b, 34);
+            sbPutByte(b, 34);
+        } else {
+            sbPutByte(b, c);
+        }
+        i = i + 1;
+    }
+    sbPutByte(b, 34);
+    eof: pass;
+}
+
+//  Writes the table with a header row. CRLF line endings are optional: they are
+//  what RFC 4180 specifies and what Excel emits, so `crlf` defaults to on in the
+//  common path via `csvWrite` below.
+function csvWriteWith(ptr Doc doc, ptr CsvTable t, int delimiter, bool crlf):string {
+    StrBuf b;
+    sbInit(#b, 256);
+    if (t == null) {
+        return sbFinishInto(doc, #b);
+    }
+    if (delimiter <= 0) {
+        delimiter = 44;
+    }
+    int col = 0;
+    while (col < t->cols) {
+        if (col > 0) {
+            sbPutByte(#b, delimiter);
+        }
+        csvWriteField(#b, t->names[col], delimiter);
+        col = col + 1;
+    }
+    csvWriteEol(#b, crlf);
+    int row = 0;
+    while (row < t->rows) {
+        col = 0;
+        while (col < t->cols) {
+            if (col > 0) {
+                sbPutByte(#b, delimiter);
+            }
+            csvWriteField(#b, t->cells[row * t->cols + col], delimiter);
+            col = col + 1;
+        }
+        csvWriteEol(#b, crlf);
+        row = row + 1;
+    }
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+function private csvWriteEol(ptr StrBuf b, bool crlf):void {
+    if (crlf) {
+        sbPutByte(b, 13);
+    }
+    sbPutByte(b, 10);
+    eof: pass;
+}
+
+//  The everyday writer: comma separated, CRLF, header included.
+function csvWrite(ptr Doc doc, ptr CsvTable t, int delimiter):string {
+    return csvWriteWith(doc, t, delimiter, true);
+    eof: pass;
+}
+
+//  Unix line endings, for files that go into version control.
+function csvWriteUnix(ptr Doc doc, ptr CsvTable t, int delimiter):string {
+    return csvWriteWith(doc, t, delimiter, false);
+    eof: pass;
+}
+
+//  Reads `path` and parses it. Same error convention as the rest of `extralib`:
+//  null means failure and `docError` says why.
+function csvParseFile(ptr Doc doc, string path, int delimiter):ptr CsvTable {
+    string text = docReadFile(doc, path);
+    if (docFailed(doc)) {
+        return null;
+    }
+    return csvParse(doc, text, delimiter);
+    eof: pass;
+}

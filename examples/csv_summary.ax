@@ -1,0 +1,279 @@
+//  csv_summary.ax — a real command-line tool: sum **every numeric cell** in some CSVs.
+//
+//  This example chains several recent stdlib pieces, because alone none looks real:
+//
+//      argCount / argAt  file list and width from argv    (compiler built-in)
+//      listDir           expand a directory into files     (io + plain Axiom parsing)
+//      readTextFile      read a file                       (io)
+//      makeSplit         split by lines, then by commas    (str)
+//      atoi / itoa       text and numbers both ways        (built-in)
+//      sortStrings       sort names alphabetically         (algorithm)
+//      padLeft           align columns                     (io)
+//
+//  Usage:
+//
+//      acvm run examples/csv_summary.ax -- data1.csv data2.csv
+//      acvm run examples/csv_summary.ax -- somedir      # a directory is expanded
+//      acvm run examples/csv_summary.ax -- -w 12 a.csv  # set the column width
+//
+//  With no arguments it builds two temp files itself, so plain `acvm run` still shows output.
+
+function import (return:(io));
+function import (return:(str));
+function import (return:(algorithm));
+
+comptime int PATH_BUFFER = 4096;
+comptime int TEXT_BUFFER = 65536;
+
+//  Summary state. Globals are usually avoided in a library (flat scope pollutes importers),
+//  but this is a program, not a library, and the names are prefixed, so the risk is fine —
+//  passing it as an argument instead would make every helper carry one more pointer.
+global int gFileCount = 0;
+global int gRowCount = 0;
+global int gValueCount = 0;
+global int gSum = 0;
+global int gMin = 0;
+global int gMax = 0;
+global bool gFirstValue = true;
+global int gWidth = 10;
+
+// ─── arguments ─────────────────────────────────────────────────────────────
+
+//  Parse `-w N`. Returning true means this pair of arguments was consumed.
+//  Axiom has no varargs and no light way to return several values, so "was it consumed"
+//  plus a global width reads clearer than making the caller advance the index by hand.
+function private takeWidthOption(int index):bool {
+    if (argAt(index) != "-w") {
+        return false;
+    }
+    if (index + 1 >= argCount()) {
+        print("warning: -w needs a number, ignored\n");
+        return true;    // no value after the option: eat the flag, do not treat it as a file
+    }
+    int parsed = atoi(argAt(index + 1));
+    if (parsed > 0 && parsed <= 40) {
+        gWidth = parsed;
+    } else {
+        print("warning: column width must be 1..40, keeping " + itoa(gWidth, 10) + "\n");
+    }
+    return true;
+    eof: pass;
+}
+
+// ─── summarise ─────────────────────────────────────────────────────────────
+
+//  One file: split lines, split fields, add each field that is a number.
+//
+//  Non-numeric fields are skipped, not errors — a CSV header is non-numeric, and "skip the
+//  header and keep going" is the behaviour you want. Strictness would be a `-strict` flag.
+//
+//  Note it adds **every** numeric cell, including the id column — so the report counts
+//  "numeric cells", not "value cells". A real tool would pick columns by name, which needs
+//  the header parsed and a name-to-index map: left out on purpose here (this shows the
+//  stdlib, not CSV semantics). With mixed columns, min / max / count say more than sum.
+function private processFile(string path):void {
+    char text[TEXT_BUFFER];
+    int bytes = readTextFile(path, #text[0], TEXT_BUFFER);
+    if (bytes < 0) {
+        print("skip " + path + " (cannot read, or larger than " +
+              itoa(TEXT_BUFFER, 10) + " bytes)\n");
+        return;
+    }
+
+    string body = makeString(#text[0], bytes);
+
+    //  Split by line first. On Windows a `\r` rides at each line end; strip it too.
+    SplitList lines = makeSplit(body, "\n");
+    int lineCount = splitCount(#lines);
+
+    for (int i = 0; i < lineCount; i++) {
+        string line = splitAt(#lines, i);
+        if (line.length == 0) {
+            continue;       // blank line
+        }
+        if (line[line.length - 1 .. line.length] == "\r") {
+            line = line[0 .. line.length - 1];
+        }
+
+        //  Then split the fields by comma.
+        SplitList fields = makeSplit(line, ",");
+        int fieldCount = splitCount(#fields);
+        int beforeLine = gValueCount;
+        for (int j = 0; j < fieldCount; j++) {
+            string field = splitAt(#fields, j);
+            if (!isAllDigits(field)) {
+                continue;   // header, empty field, comment
+            }
+            int value = atoi(field);
+            gValueCount = gValueCount + 1;
+            gSum = gSum + value;
+            if (gFirstValue) {
+                gMin = value;
+                gMax = value;
+                gFirstValue = false;
+            } else {
+                if (value < gMin) { gMin = value; }
+                if (value > gMax) { gMax = value; }
+            }
+        }
+        //  A "row with data" added at least one number. The header and blank lines do not.
+        if (gValueCount > beforeLine) {
+            gRowCount = gRowCount + 1;
+        }
+        splitFree(#fields);
+    }
+
+    splitFree(#lines);
+    gFileCount = gFileCount + 1;
+    eof: pass;
+}
+
+//  Is the string all decimal digits (one leading minus allowed)? `atoi` traps on non-digits,
+//  so it must be checked first — the difference between parsing user data and parsing
+//  text you generated yourself.
+function private isAllDigits(string s):bool {
+    if (s.length == 0) {
+        return false;
+    }
+    int start = 0;
+    if (s[0..1] == "-") {
+        start = 1;
+        if (s.length == 1) {
+            return false;
+        }
+    }
+    for (int i = start; i < s.length; i++) {
+        string ch = s[i .. i + 1];
+        bool digit = ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+                     ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9";
+        if (!digit) {
+            return false;
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+// ─── directory expansion ───────────────────────────────────────────────────
+
+//  An argument may be a file or a directory. A directory lists its `.csv` files and runs each.
+function private handleArgument(string target):void {
+    if (!isDirectory(target)) {
+        processFile(target);
+        return;
+    }
+
+    char names[PATH_BUFFER];
+    int count = listDir(target, #names[0], PATH_BUFFER);
+    if (count < 0) {
+        print("skip " + target + " (cannot list)\n");
+        return;
+    }
+
+    //  Names must be handled alphabetically so output is stable — file system order is
+    //  undefined, and a summary that depends on it is unusable.
+    string picked[64] = {""};
+    int found = 0;
+    for (int i = 0; i < count && found < 64; i++) {
+        string name = dirEntryAt(#names[0], PATH_BUFFER, i);
+        if (pathExtension(name) == ".csv" && !isDirectory(pathJoin(target, name))) {
+            @(#picked[0] + found) = pathJoin(target, name);
+            found = found + 1;
+        }
+    }
+    sortStrings(#picked[0], found);
+
+    if (found == 0) {
+        print("skip " + target + " (no .csv inside)\n");
+        return;
+    }
+    for (int i = 0; i < found; i++) {
+        processFile(@(#picked[0] + i));
+    }
+    eof: pass;
+}
+
+// ─── report ────────────────────────────────────────────────────────────────
+
+//  Alignment via `padLeft`. Width is configurable because mixed scripts need more room.
+//  Labels flush left, values in their own column. `padRight` not `padLeft`: with labels of
+//  differing length, left alignment is what puts the value column in line.
+function private row(string label, string value):void {
+    print(padRight(label, 16, " ") + value + "\n");
+    eof: pass;
+}
+
+function private report():void {
+    print("\n");
+    row("files", itoa(gFileCount, 10));
+    row("rows with data", itoa(gRowCount, 10));
+    row("numeric cells", itoa(gValueCount, 10));
+    if (gValueCount > 0) {
+        row("sum", itoa(gSum, 10));
+        row("min", itoa(gMin, 10));
+        row("max", itoa(gMax, 10));
+        //  Integer division: this is an integer summary, no floats. A real mean would mean
+        //  the data holds decimals, and that needs another path (`ftoa` + `atof`).
+        row("mean (int)", itoa(gSum / gValueCount, 10));
+    }
+    eof: pass;
+}
+
+// ─── self-made data when no arguments ──────────────────────────────────────
+
+function private selfDemo():void {
+    print("no arguments: building two temporary files to summarize\n\n");
+
+    string first = "csv_summary_a.csv";
+    string second = "csv_summary_b.csv";
+    writeTextFile(first, "id,value\n" + "1,120\n" + "2,80\n" + "3,350\n");
+    writeTextFile(second, "id,value\n" + "4,15\n" + "5,900\n");
+
+    //  Build a directory and put a second file inside, to exercise the directory path.
+    makeDir("csv_summary_dir");
+    writeTextFile(pathJoin("csv_summary_dir", "b.csv"),
+                  "id,value\n" + "6,42\n" + "7,7\n");
+
+    print("-- " + first + " --\n");
+    processFile(first);
+    print("-- " + second + " --\n");
+    processFile(second);
+    print("-- " + "csv_summary_dir" + " (directory) --\n");
+    handleArgument("csv_summary_dir");
+
+    print("\n");
+    report();
+
+    removeFile(first);
+    removeFile(second);
+    removeFile(pathJoin("csv_summary_dir", "b.csv"));
+    removeDir("csv_summary_dir");
+    eof: pass;
+}
+
+function main():void {
+    print("csv_summary -- " + itoa(argCount(), 10) + " argument(s)\n");
+
+    if (argCount() == 0) {
+        selfDemo();
+        print("\ndone\n");
+        return;
+    }
+
+    int index = 0;
+    while (index < argCount()) {
+        if (takeWidthOption(index)) {
+            index = index + 2;      // `-w` together with its value
+            continue;
+        }
+        string target = argAt(index);
+        print("-- " + target + " --\n");
+        handleArgument(target);
+        index = index + 1;
+    }
+
+    print("\n");
+    report();
+    print("\ndone\n");
+    eof: pass;
+}

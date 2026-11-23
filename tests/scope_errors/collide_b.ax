@@ -1,0 +1,6 @@
+// The other half of the collision. Same name, same signature, different file.
+
+function shared(int x):int {
+    return x - 1;
+    eof: pass;
+}

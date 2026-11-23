@@ -1,0 +1,37 @@
+// eof is a single-exit cleanup hook; `virtual` replaces it for one branch.
+function f(int x):int {
+    print("body ");
+    if (x < 0) {
+        virtual {
+            print("virtual ");
+            return -1;
+            eof: print("virtual-eof ");
+        }
+    }
+    return 0;
+    eof: print("outer-eof ");
+}
+
+function g(int x):int {
+    print("g-body ");
+    if (x < 0) {
+        virtual {
+            print("g-virtual ");
+            return -1;          // no eof: the outer cleanup still runs
+        }
+    }
+    return 0;
+    eof: print("g-eof ");
+}
+
+function main():void {
+    print(f(-1));
+    print("| ");
+    print(f(1));
+    print("| ");
+    print(g(-1));
+    print("| ");
+    print(g(1));
+    print("\n");
+    eof: pass;
+}

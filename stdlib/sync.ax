@@ -1,0 +1,596 @@
+//  sync.ax — atomic operations and synchronization primitives, pure Axiom.
+//
+//      function import (return:(sync));
+//
+//      Mutex m = makeMutex();
+//      mutexLock(#m);
+//      shared = shared + 1;        // critical section
+//      mutexUnlock(#m);
+//
+//      atomicAdd(#counter, 1);     // the case that needs no lock
+//
+//  ── why this library exists ───────────────────────────────────────────────
+//
+//  An Axiom `process` is a preemptive flow of execution (spec §2.2.1.4), and processes
+//  share global state. A safe point can **interrupt any compound operation between two
+//  instructions**: `x = x + 1` is read -> add -> write, and a switch may happen mid-way.
+//
+//  This is not theoretical. Measured: two processes each running `shared = shared + 1`
+//  100 times with a `yield()` in between end at **100, not 200** -- half the updates lost.
+//
+//  The spec calls atomics "not designed yet", so this fills the gap within the language.
+//
+//  ── where atomicity comes from: the safe points ───────────────────────────
+//
+//  Safe points occur in only four places (spec §5.8): **before a function call**, **at a
+//  loop back edge**, **at the top of the process main loop**, and **`yield()`**.
+//
+//  Corollary: **a function with no loop, no call and no `yield` has no safe point
+//  between entry and return, so its whole body is atomic.** Measured: two processes
+//  each calling such a function 200 times on one scalar end at exactly 400.
+//
+//  This is the foundation of the library. Every `ATOMIC:` function below obeys it -- and
+//  atomicity vanishes **silently** if a call or loop creeps in: worse than a crash.
+//
+//  ── blocking under cooperative scheduling ─────────────────────────────────
+//
+//  The scheduler is single-threaded round-robin (the M3 path), so
+//  "blocking" can only mean **yield and retry**: `while (!canTake) { yield(); }`.
+//
+//  Never busy-wait without a `yield()`: the lock holder would never be scheduled and you
+//  deadlock. Every wait loop below calls `yield()` and carries a guard limit -- past it,
+//  give up and report, rather than turning a logic error into an endless loop.
+//
+//  ── a limit you must know up front ────────────────────────────────────────
+//
+//  **When `main` ends, every process stops immediately** (the VM does this; see the
+//  scheduling loop in `VM.cpp`). So code that "waits for other processes" must run in
+//  `main` and must not return early. That is what `awaitCount` is for:
+//
+//      int pending[1] = {3};
+//      // ... the three processes each call atomicSub(#pending[0], 1) at the end
+//      awaitCount(#pending[0]);       // main waits here until it reaches 0
+//
+//  This is also why there is no `join`: a process has no handle, only shared state, and
+//  counting is the only reliable handshake.
+//
+//  ── do not use sub-byte integers for shared slots ─────────────────────────
+//
+//  Spec §2.2.1.6: an aligned scalar access is atomic, but **read-modify-write of a
+//  sub-byte integer (`int4`, `int12`) is several instructions** and not atomic -- use `int`.
+
+// ─── wait limits ───────────────────────────────────────────────────────────
+//
+// See "the two limits" above. Every wait loop refers to these constants, no literals.
+
+/// Waits for other Axiom code to release a lock or hand back a slot.
+module "sync" version "0.1.0";
+
+comptime int WAIT_SPINS_LOCK = 1000000;
+
+/// Waits for another process to finish a stretch of work.
+comptime int WAIT_SPINS_WORKER = 10000000;
+
+// ─── atomic operations ─────────────────────────────────────────────────────
+//
+// All obey "no loop, no call, no yield", so each is one indivisible instruction sequence.
+//
+// Returning the old value is deliberate: from it a caller learns "which one am I", the
+// basis of locks, barriers and one-time init. The new value alone would not do.
+
+//  ATOMIC: adds `delta`, returns the value before the add.
+function atomicAdd(ptr int counter, int delta):int {
+    int old = @counter;
+    @counter = old + delta;
+    return old;
+}
+
+//  ATOMIC: subtracts `delta`, returns the value before the subtraction.
+function atomicSub(ptr int counter, int delta):int {
+    int old = @counter;
+    @counter = old - delta;
+    return old;
+}
+
+//  ATOMIC: adds one and returns the **new** value, sparing the caller the `+ 1`.
+function atomicIncrement(ptr int counter):int {
+    int raised = @counter + 1;
+    @counter = raised;
+    return raised;
+}
+
+//  ATOMIC: subtracts one and returns the **new** value.
+function atomicDecrement(ptr int counter):int {
+    int lowered = @counter - 1;
+    @counter = lowered;
+    return lowered;
+}
+
+//  ATOMIC: stores `value` and returns the old one.
+function atomicSwap(ptr int counter, int value):int {
+    int old = @counter;
+    @counter = value;
+    return old;
+}
+
+//  ATOMIC: read. A single read is already atomic; the wrapper makes intent explicit.
+function atomicLoad(ptr int counter):int {
+    return @counter;
+}
+
+//  ATOMIC: write.
+function atomicStore(ptr int counter, int value):void {
+    @counter = value;
+    eof: pass;
+}
+
+//  ATOMIC: stores `value` only when the current value is `expected`; returns success.
+//  This is compare-and-swap, the basis of lock-free structures.
+function atomicCompareExchange(ptr int counter, int expected, int value):bool {
+    if (@counter != expected) {
+        return false;
+    }
+    @counter = value;
+    return true;
+}
+
+//  ATOMIC: takes the maximum (writes only when larger). Returns the final value.
+function atomicMax(ptr int counter, int value):int {
+    int current = @counter;
+    if (value > current) {
+        @counter = value;
+        return value;
+    }
+    return current;
+}
+
+//  ATOMIC: takes the minimum.
+function atomicMin(ptr int counter, int value):int {
+    int current = @counter;
+    if (value < current) {
+        @counter = value;
+        return value;
+    }
+    return current;
+}
+
+// ─── 64-bit versions ───────────────────────────────────────────────────────
+//
+//  The 32-bit forms cannot serve "sum a total": 120,000 values of up to 100,000 sum to 6
+//  billion, past `int32` -- and splicing 64 bits from two halves breaks atomicity anyway.
+//
+//  These obey "no loop, no call, no yield" too, so they are atomic. Spec §2.2.1.6 says a
+//  **single access to an aligned int64 is atomic**, and so is an RMW with no safe point.
+//
+//  Note that Axiom `int64` overflow **traps instead of wrapping** (like C signed add), so
+//  `atomicAdd64` past ±2^63 stops the program. That beats silently wrong totals.
+
+//  ATOMIC: 64-bit add, returns the old value.
+function atomicAdd64(ptr int64 counter, int64 delta):int64 {
+    int64 old = @counter;
+    @counter = old + delta;
+    return old;
+}
+
+//  ATOMIC: 64-bit store, returns the old value.
+function atomicSwap64(ptr int64 counter, int64 value):int64 {
+    int64 old = @counter;
+    @counter = value;
+    return old;
+}
+
+//  ATOMIC: 64-bit read.
+function atomicLoad64(ptr int64 counter):int64 {
+    return @counter;
+}
+
+//  ATOMIC: 64-bit write.
+function atomicStore64(ptr int64 counter, int64 value):void {
+    @counter = value;
+    eof: pass;
+}
+
+//  ATOMIC: 64-bit compare-and-swap.
+function atomicCompareExchange64(ptr int64 counter, int64 expected, int64 value):bool {
+    if (@counter != expected) {
+        return false;
+    }
+    @counter = value;
+    return true;
+}
+
+// ─── mutex ─────────────────────────────────────────────────────────────────
+//
+//  The struct lives on the caller's stack or in a global; `Mutex` itself allocates nothing.
+//
+//  Why `locked` is an `int`, not a `bool`: `bool` is a scalar in Axiom, but an integer has
+//  room for an owner id later (recursive locks, deadlock detection). Today only 0 / 1.
+
+struct Mutex {
+    int locked;
+    /// Number of processes that ever took the lock; diagnostics only. See `mutexLock`.
+    int waits;
+};
+
+//  Creates an unlocked mutex. Pure value; no allocation, nothing to free.
+//
+//  The result must be stored somewhere all participating processes can reach it
+//  (a `global`), and passed by `#` to every operation -- a copy is a different
+//  lock. Not reentrant: see `mutexLock`.
+function makeMutex():Mutex {
+    Mutex m = {0, 0};
+    return m;
+    eof: pass;
+}
+
+//  ATOMIC: tries to take the lock, true on success. **Never yields**, so it works anywhere.
+function mutexTryLock(ptr Mutex m):bool {
+    if (@(#m->locked) != 0) {
+        return false;
+    }
+    @(#m->locked) = 1;
+    return true;
+    eof: pass;
+}
+
+//  Takes the lock, yielding and retrying while it is held.
+//
+//  `guard` is defensive: in a well-behaved cooperative program the holder is always
+//  scheduled and releases, so the loop is bounded. Hitting the guard means one of two
+//  things -- the holder is itself waiting for this lock (re-entrant deadlock), or it is
+//  stuck in a loop with no safe point. Neither is fixable here; return so the caller sees.
+function mutexLock(ptr Mutex m):bool {
+    int guard = 0;
+    while (!mutexTryLock(m)) {
+        guard = guard + 1;
+        if (guard > WAIT_SPINS_LOCK) {
+            return false;
+        }
+        // Sampling the diagnostic counter once every 32 spins.
+        //
+        // Otherwise every failure writes `m->waits`, and that cell shares a cache line with
+        // `locked`: an extra dirty on the line everyone fights over, on every failed attempt.
+        // `waits` is only a rough "how contended" gauge; 1/32 precision does not matter to it.
+        if ((guard & 31) == 0) {
+            atomicIncrement(#m->waits);
+        }
+        yield();
+    }
+    return true;
+    eof: pass;
+}
+
+//  ATOMIC: releases the lock.
+function mutexUnlock(ptr Mutex m):void {
+    @(#m->locked) = 0;
+    eof: pass;
+}
+
+//  ATOMIC: whether the lock is held. Diagnostics only -- not a replacement for
+//  `mutexTryLock`: check-then-lock is not atomic.
+function mutexIsLocked(ptr Mutex m):bool {
+    return @(#m->locked) != 0;
+    eof: pass;
+}
+
+// ─── counting semaphore ────────────────────────────────────────────────────
+//
+//  Limits concurrency ("at most 3 processes inside this section"); a mutex is its
+//  special case (count 1).
+//
+//  The textbook definition lets the count go negative to mean "how many are waiting"; this
+//  does not, since cooperative scheduling has no queue order. `waiters` is an observation.
+
+struct Semaphore {
+    int count;
+    int waiters;
+};
+
+//  Creates a semaphore with `initial` permits available. `initial` is a permit
+//  count, not a maximum: `semPost` can push the count above it.
+//
+//  `initial <= 0` is legal and means every `semWait` blocks until someone posts.
+function makeSemaphore(int initial):Semaphore {
+    Semaphore s = {initial, 0};
+    return s;
+    eof: pass;
+}
+
+//  ATOMIC: if a slot is free (count > 0), decrements and returns true.
+function semTryWait(ptr Semaphore s):bool {
+    if (@(#s->count) <= 0) {
+        return false;
+    }
+    @(#s->count) = @(#s->count) - 1;
+    return true;
+    eof: pass;
+}
+
+//  Waits for a slot, yielding when needed. Returns false when the guard limit is hit.
+function semWait(ptr Semaphore s):bool {
+    int guard = 0;
+    while (!semTryWait(s)) {
+        guard = guard + 1;
+        if (guard > WAIT_SPINS_LOCK) {
+            return false;
+        }
+        // Sampled, for the same reason as `mutexLock`: no shared writes on every failed try.
+        if ((guard & 31) == 0) {
+            atomicIncrement(#s->waiters);
+        }
+        yield();
+    }
+    return true;
+    eof: pass;
+}
+
+//  ATOMIC: hands a slot back. Note it does **not** wake anyone -- under cooperative
+//  scheduling the waiters poll, and there is no "wake" action.
+function semPost(ptr Semaphore s):void {
+    @(#s->count) = @(#s->count) + 1;
+    eof: pass;
+}
+
+//  ATOMIC: currently available slots.
+function semCount(ptr Semaphore s):int {
+    return @(#s->count);
+    eof: pass;
+}
+
+// ─── channel (bounded queue) ───────────────────────────────────────────────
+//
+//  A rendezvous point for one producer and one consumer. Capacity is fixed: when full
+//  `chanPush` yields and waits, when empty `chanPop` yields and waits.
+//
+//  The buffer is caller-provided (as in `vec`), so `makeChannel` allocates nothing.
+//  Elements are `int`: pointers or strings would drag in lifetimes, and a `string` lives in
+//  an arena owned by the sender -- once the sender rolls back, the receiver holds a
+//  dangling string. **To move large data, send an index and share a caller-owned buffer.**
+//
+//  The three ring-buffer updates (write element, advance tail, bump count) happen inside
+//  one function with no safe point, so the whole is atomic.
+
+struct Channel {
+    ptr int buffer;
+    int capacity;
+    /// next write position
+    int head;
+    /// next read position
+    int tail;
+    /// current element count
+    int count;
+    /// closed: push fails, pop returns -1 once the remainder is drained
+    int closed;
+};
+
+//  Creates a channel backed by the caller's `buffer`, holding up to `capacity`
+//  elements. Does not allocate, so the channel is only valid while that buffer
+//  is: returning one from a function that declared the buffer locally leaves a
+//  dangling pointer, with no diagnostic.
+//
+//  `capacity` is an element count. `capacity <= 0` produces a channel that never
+//  accepts a push.
+function makeChannel(ptr int buffer, int capacity):Channel {
+    Channel ch = {buffer, capacity, 0, 0, 0, 0};
+    return ch;
+    eof: pass;
+}
+
+//  ATOMIC: tries to write, returns true on success. Does not block.
+function chanTryPush(ptr Channel ch, int value):bool {
+    if (@(#ch->closed) != 0 || @(#ch->count) >= @(#ch->capacity)) {
+        return false;
+    }
+    int head = @(#ch->head);
+    @(@(#ch->buffer) + head) = value;
+    int advanced = head + 1;
+    if (advanced >= @(#ch->capacity)) {
+        advanced = 0;
+    }
+    @(#ch->head) = advanced;
+    @(#ch->count) = @(#ch->count) + 1;
+    return true;
+    eof: pass;
+}
+
+/// Writes, yielding while the queue is full. Returns false once closed.
+function chanPush(ptr Channel ch, int value):bool {
+    int guard = 0;
+    while (!chanTryPush(ch, value)) {
+        if (@(#ch->closed) != 0) {
+            return false;
+        }
+        guard = guard + 1;
+        if (guard > WAIT_SPINS_LOCK) {
+            return false;
+        }
+        yield();
+    }
+    return true;
+    eof: pass;
+}
+
+//  ATOMIC: tries to read, returns true on success and stores into `out`.
+function chanTryPop(ptr Channel ch, ptr int out):bool {
+    if (@(#ch->count) <= 0) {
+        return false;
+    }
+    int tail = @(#ch->tail);
+    @out = @(@(#ch->buffer) + tail);
+    int advanced = tail + 1;
+    if (advanced >= @(#ch->capacity)) {
+        advanced = 0;
+    }
+    @(#ch->tail) = advanced;
+    @(#ch->count) = @(#ch->count) - 1;
+    return true;
+    eof: pass;
+}
+
+/// Reads, yielding while the queue is empty. **Returns false when closed and drained** --
+/// the only way a consumer learns "no more data is coming".
+function chanPop(ptr Channel ch, ptr int out):bool {
+    int guard = 0;
+    while (!chanTryPop(ch, out)) {
+        if (@(#ch->closed) != 0 && @(#ch->count) <= 0) {
+            return false;
+        }
+        guard = guard + 1;
+        if (guard > WAIT_SPINS_LOCK) {
+            return false;
+        }
+        yield();
+    }
+    return true;
+    eof: pass;
+}
+
+//  ATOMIC: marks the channel closed.
+function chanClose(ptr Channel ch):void {
+    @(#ch->closed) = 1;
+    eof: pass;
+}
+
+//  ATOMIC: current backlog.
+function chanLen(ptr Channel ch):int {
+    return @(#ch->count);
+    eof: pass;
+}
+
+// ─── barrier ───────────────────────────────────────────────────────────────
+//
+//  Brings N processes to one point, then they continue together. `generation` exists so
+//  the barrier can be reused: the N-th arrival advances it, and the others see it change
+//  and know the round is over, so one Barrier works inside a loop.
+//
+//  The number of parties is fixed at construction. One arriving too few or too many both
+//  hang -- the inherent cost of a barrier, not an implementation defect.
+
+struct Barrier {
+    int parties;
+    /// arrived but not yet left
+    int arrived;
+    /// bumps once per round
+    int generation;
+};
+
+//  Creates a barrier for `parties` participants. Every party must call
+//  `barrierWait` once per round; the round ends when the `parties`-th one
+//  arrives.
+//
+//  `parties <= 1` makes every `barrierWait` return true immediately -- a barrier
+//  of one never has anyone to wait for.
+function makeBarrier(int parties):Barrier {
+    Barrier b = {parties, 0, 0};
+    return b;
+    eof: pass;
+}
+
+//  Arrives and waits. On return all `parties` participants have arrived.
+//  Returns false when the guard limit is hit (someone never arrived).
+function barrierWait(ptr Barrier b):bool {
+    int generation = @(#b->generation);
+    //  ATOMIC: bumps the arrival count and tells whether this is the last one.
+    int before = atomicIncrement(#b->arrived);
+    bool last = before + 1 >= @(#b->parties);
+    if (last) {
+        //  ATOMIC: the last arrival resets and advances the generation in one step -- if it
+        //  yielded in between, others would see arrived not zero and wait for the next round.
+        @(#b->arrived) = 0;
+        @(#b->generation) = generation + 1;
+        return true;
+    }
+
+    int guard = 0;
+    while (@(#b->generation) == generation) {
+        guard = guard + 1;
+        if (guard > WAIT_SPINS_LOCK) {
+            return false;
+        }
+        yield();
+    }
+    return true;
+    eof: pass;
+}
+
+//  ATOMIC: current arrival count (diagnostics).
+function barrierArrived(ptr Barrier b):int {
+    return @(#b->arrived);
+    eof: pass;
+}
+
+// ─── waiting for a group of work to finish ─────────────────────────────────
+//
+//  Processes have no handles, so "join" can only be a count: start N workers with the
+//  count at N, each worker decrements before returning, and main waits for zero.
+//
+//  This wait **must** be in main: once main returns the program ends and the remaining
+//  processes are simply dropped (no error, and their `eof` does not run).
+
+//  Waits until `counter` reaches zero. Returns false when the guard limit is hit.
+function awaitCount(ptr int counter):bool {
+    int guard = 0;
+    while (@counter > 0) {
+        guard = guard + 1;
+        if (guard > WAIT_SPINS_WORKER) {
+            return false;
+        }
+        yield();
+    }
+    return true;
+    eof: pass;
+}
+
+//  Waits until `counter` reaches `target`. For "wait for N results", not "wait for zero".
+function awaitReach(ptr int counter, int target):bool {
+    int guard = 0;
+    while (@counter < target) {
+        guard = guard + 1;
+        if (guard > WAIT_SPINS_WORKER) {
+            return false;
+        }
+        yield();
+    }
+    return true;
+    eof: pass;
+}
+
+// ─── one-time initialization ───────────────────────────────────────────────
+//
+//  When several processes race to initialize one resource, exactly one runs the work and
+//  the others wait. States via `atomicCompareExchange`: 0 = fresh, 1 = running, 2 = done.
+
+comptime int ONCE_PENDING = 0;
+comptime int ONCE_RUNNING = 1;
+comptime int ONCE_DONE = 2;
+
+//  True means **the caller** should initialize; false means another did, and we waited.
+//
+//  Usage:
+//
+//      if (onceBegin(#state)) {
+//          ...initialization...
+//          onceEnd(#state);
+//      }
+function onceBegin(ptr int state):bool {
+    if (atomicCompareExchange(state, ONCE_PENDING, ONCE_RUNNING)) {
+        return true;
+    }
+    //  Someone else is running or done; wait for DONE.
+    int guard = 0;
+    while (@state != ONCE_DONE) {
+        guard = guard + 1;
+        if (guard > WAIT_SPINS_LOCK) {
+            return false;
+        }
+        yield();
+    }
+    return false;
+    eof: pass;
+}
+
+//  ATOMIC: marks the initialization complete.
+function onceEnd(ptr int state):void {
+    @state = ONCE_DONE;
+    eof: pass;
+}

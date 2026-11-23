@@ -1,0 +1,7 @@
+// Two components. Accepting this would make "1.0" compare as neither 1.0.0 nor an
+// error, which is a resolution bug waiting for its first user.
+module "badversion" version "1.0";
+
+function main():void {
+    eof: pass;
+}

@@ -1,0 +1,9 @@
+//  Misspelled member: the message must say the union has no such member.
+union Num { int i; double d; };
+
+function main():void {
+    Num n;
+    n.i = 1;
+    print(n.count);
+    eof: pass;
+}

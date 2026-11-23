@@ -1,0 +1,7 @@
+// One of two files that both define `shared(int)`. Imported by collide.ax
+// together with collide_b.ax; the pair must be rejected.
+
+function shared(int x):int {
+    return x + 1;
+    eof: pass;
+}

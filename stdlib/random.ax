@@ -1,0 +1,126 @@
+//  random.ax — portable Axiom fallback for the random library.
+//
+//  random.axd declares `library "random"`, whose functions live in random.dll.
+//  This file implements the same functions in Axiom, and the compiler packs both
+//  into the .acvm:
+//
+//      random.dll present  →  the C version runs
+//      random.dll missing  →  this one runs, and produces the *same* sequence
+//
+//  Identical output is a hard requirement here, not a nicety: a program that
+//  shuffles a deck must deal the same cards on every machine, or a saved seed
+//  stops being reproducible. That is why both sides run xorshift32 bit for bit
+//  rather than two different generators of similar quality.
+//
+//  ── usage ─────────────────────────────────────────────────────────────────
+//
+//      function import (return:(random));
+//
+//      function main():void {
+//          unsigned int seed[1] = {12345u32};
+//          print(randBelow(#seed[0], seed.length, 6));   // 0..5
+//          eof: pass;
+//      }
+//
+//  The state buffer must hold at least one `unsigned int` and must not be zero.
+
+//  One step of xorshift32, matching stdlib/random.c exactly.
+//
+//  `>>` on `unsigned int` is a logical shift in Axiom (verified against
+//  0x80000000 >> 4 == 0x08000000), which is what xorshift needs -- an arithmetic
+//  shift would smear the sign bit and diverge from the C version immediately.
+module "random" version "0.1.0";
+
+function randNext(ptr unsigned int state, int stateCapacity):unsigned int {
+    if (stateCapacity < 1) {
+        return 0u32;
+    }
+    unsigned int x = @state;
+    if (x == 0u32) {
+        // All-zero is xorshift's fixed point: every shift keeps it at zero.
+        x = 2654435769u32;   // 0x9E3779B9, the golden ratio constant
+    }
+    x = x ^ (x << 13);
+    x = x ^ (x >> 17);
+    x = x ^ (x << 5);
+    @state = x;
+    return x;
+}
+
+//  Unbiased value in [0, bound) by rejection.
+//
+//  `0u32 - b` wraps to 2^32 - b, and its remainder modulo b is exactly
+//  `2^32 mod b` -- the count of bit patterns that would skew the result if they
+//  were accepted. Draws below that threshold are retried.
+function randBelow(ptr unsigned int state, int stateCapacity, int bound):int {
+    if (stateCapacity < 1 || bound <= 0) {
+        return 0;
+    }
+    unsigned int b = bound as unsigned int;
+    unsigned int threshold = (0u32 - b) % b;
+    // A sentinel loop rather than `while (true) { return ...; }`: the path checker
+    // treats an unconditional loop as fall-through and then reports that the
+    // function can end without a value.
+    int result = 0;
+    bool settled = false;
+    while (!settled) {
+        unsigned int r = randNext(state, stateCapacity);
+        if (r >= threshold) {
+            result = (r % b) as int;
+            settled = true;
+        }
+    }
+    return result;
+}
+
+//  Uniform draw from [`low`, `high`), i.e. `high` itself is never returned.
+//
+//  `state` is the generator state and `stateCapacity` its element count (at
+//  least 1). The state is mutated, so repeated calls must pass the same array to
+//  continue the sequence.
+//  Returns `low` when `high <= low`: an empty range has no draw, and returning
+//  the lower bound keeps the result inside the caller's stated interval.
+function randRange(ptr unsigned int state, int stateCapacity, int low, int high):int {
+    if (high <= low) {
+        return low;
+    }
+    return low + randBelow(state, stateCapacity, high - low);
+}
+
+//  Fisher-Yates, walking down: every permutation is equally likely, and the result
+//  is decided by exactly count-1 draws.
+function shuffle(ptr int data, int count, ptr unsigned int state, int stateCapacity):void {
+    if (count <= 1 || stateCapacity < 1) {
+        return;
+    }
+    int i = count - 1;
+    while (i > 0) {
+        unsigned int bound = (i + 1) as unsigned int;
+        unsigned int threshold = (0u32 - bound) % bound;
+        unsigned int r = 0u32;
+        while (true) {
+            r = randNext(state, stateCapacity);
+            if (r >= threshold) {
+                break;
+            }
+        }
+        int j = (r % bound) as int;
+        int tmp = @(data + i);
+        @(data + i) = @(data + j);
+        @(data + j) = tmp;
+        i--;
+    }
+    eof: pass;
+}
+
+//  FNV-1a over the values, one mix per element. Returns `unsigned int` rather than
+//  narrowing to `int`: Axiom's `as int` traps when the value does not fit, and a
+//  hash is above 2^31 about half the time.
+function hashInts(ptr int data, int count):unsigned int {
+    unsigned int h = 2166136261u32;   // FNV offset basis
+    for (int i = 0; i < count; i++) {
+        h = h ^ (@(data + i) as unsigned int);
+        h = h * 16777619u32;          // FNV prime
+    }
+    return h;
+}

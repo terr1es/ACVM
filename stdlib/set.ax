@@ -1,0 +1,313 @@
+//  set.ax — ASTL's ordered sets: SetInt / SetInt64 / SetStr.
+//
+//      function import (return:(set));
+//
+//      int store[64] = {0};
+//      SetInt s = makeSetInt(#store[0], 64);
+//      setIntAdd(#s, 42);
+//      setIntAdd(#s, 7);
+//      print(setIntContains(#s, 42));      // true
+//      print(setIntAt(#s, 0));             // 7   -- ordered, so index 0 is the smallest
+//
+//  ── why an ordered array and not a hash table ─────────────────────────────
+//
+//  Three reasons, in order of importance:
+//
+//  1. **It reuses `algorithm` directly**. `lowerBound` / `binarySearch` are C code (with
+//     an Axiom fallback), so lookups are native O(log n), and the O(n) shift on insert is
+//     a `memmove`, also native. No set operation runs a single interpreted loop.
+//  2. **Order is worth something by itself**. Minimum, k-th smallest and range scans are
+//     O(1) or O(log n); a hash table cannot -- it must sort to answer "what is smallest".
+//  3. **Order asks less of a type than hashing**. Hashing needs a hash function, and Axiom
+//     cannot pass functions -- generics do not rescue that either: monomorphization can
+//     specialize `<` but cannot conjure a hash for a type. Order needs only `<`, which is
+//     builtin for any comparable type -- why string sets use an array, not a hash table.
+//
+//  Cost: insert/delete are O(n); above ~10k elements with frequent churn, use `hash.ax`.
+//
+//  ── string sets and `algorithm` ───────────────────────────────────────────
+//
+//  `algorithm` only knows `int` / `int64` and has no string version (it cannot: it compares
+//  by value, while strings must compare by content). So `SetStr`'s binary search is
+//  hand-written, but still does only `O(log n)` string comparisons -- cheap in practice.
+
+module "set" version "0.1.0";
+
+function import (return:(vec));
+function import (return:(algorithm));
+function import (return:(strbyte));
+
+// ─── int set ───────────────────────────────────────────────────────────────
+
+struct SetInt {
+    Vec items;      // ascending, elemSize = sizeof(int)
+};
+
+//  Binds a set to a caller-owned `int` buffer. The buffer is used as-is; nothing
+//  is allocated until the set outgrows it.
+function makeSetInt(ptr int buffer, int capacity):SetInt {
+    SetInt s = {makeVec(buffer, capacity)};
+    return s;
+    eof: pass;
+}
+
+//  Releases heap storage if the set had to grow. Borrowed buffers are untouched.
+function setIntFree(ptr SetInt s):void {
+    vecFree(#s->items);
+    eof: pass;
+}
+
+//  Inserts `value` keeping the set sorted. Returns false only when the set is
+//  full and could not grow; inserting a value that is already present is a
+//  success that changes nothing.
+function setIntAdd(ptr SetInt s, int value):bool {
+    const int at = lowerBound(s->items.data as ptr int, s->items.count, value);
+    if (at < s->items.count && @(s->items.data as ptr int + at) == value) {
+        return true;   // already there
+    }
+    int slot = value;
+    return vecInsert(#s->items, at, #slot as ptr char);
+    eof: pass;
+}
+
+//  True when `value` is in the set. O(log n), native.
+function setIntContains(ptr SetInt s, int value):bool {
+    if (s->items.count <= 0) {
+        return false;
+    }
+    return binarySearch(s->items.data as ptr int, s->items.count, value) >= 0;
+    eof: pass;
+}
+
+//  Removes `value`. Returns false when it was not present.
+function setIntRemove(ptr SetInt s, int value):bool {
+    const int at = lowerBound(s->items.data as ptr int, s->items.count, value);
+    if (at >= s->items.count) {
+        return false;
+    }
+    int found = @(s->items.data as ptr int + at);
+    if (found != value) {
+        return false;
+    }
+    return vecRemove(#s->items, at);
+    eof: pass;
+}
+
+//  Number of distinct values. O(1) -- reads the backing vector's count.
+function setIntCount(ptr SetInt s):int {
+    return s->items.count;
+    eof: pass;
+}
+
+//  Element at `index` in ascending order, so index 0 is the minimum. Returns 0
+//  for an out-of-range index, which cannot be told apart from a stored zero --
+//  check `setIntCount` first when that matters.
+function setIntAt(ptr SetInt s, int index):int {
+    return vecGetInt(#s->items, index);
+    eof: pass;
+}
+
+// ─── int64 set ─────────────────────────────────────────────────────────────
+
+struct SetInt64 {
+    Vec items;      // ascending, elemSize = sizeof(int64)
+};
+
+//  Creates an `int64` set over the caller's `buffer`, with room for `capacity`
+//  elements before anything is allocated.
+//
+//  `capacity` is an element count, not a byte count. It is only a starting size:
+//  the set grows on demand, at which point the backing store moves to the heap
+//  and `buffer` stops being updated (docs/tutorial/01-vec.md §1.4 ④).
+function makeSetInt64(ptr int64 buffer, int capacity):SetInt64 {
+    SetInt64 s = {makeVec(buffer as ptr char, capacity, sizeof(int64))};
+    return s;
+    eof: pass;
+}
+
+//  Releases the backing store if the set owns one, then zeroes the structure.
+//  Safe to call twice; a borrowed buffer is not freed.
+function setInt64Free(ptr SetInt64 s):void {
+    vecFree(#s->items);
+    eof: pass;
+}
+
+//  Inserts `value`, keeping the set sorted.
+//
+//  Returns true when the value is a member afterwards -- both "inserted now" and
+//  "was already there" return true, so the result is membership, not novelty.
+//  Returns false only when the backing store could not be grown.
+//  O(n) worst case: the insert shifts every larger element up by one.
+function setInt64Add(ptr SetInt64 s, int64 value):bool {
+    const int at = lowerBound64(s->items.data as ptr int64, s->items.count, value);
+    if (at < s->items.count) {
+        int64 present = @(s->items.data as ptr int64 + at);
+        if (present == value) {
+            return true;
+        }
+    }
+    int64 slot = value;
+    return vecInsert(#s->items, at, #slot as ptr char);
+    eof: pass;
+}
+
+//  True when `value` is a member. O(log n), native (`binarySearch64`).
+function setInt64Contains(ptr SetInt64 s, int64 value):bool {
+    if (s->items.count <= 0) {
+        return false;
+    }
+    return binarySearch64(s->items.data as ptr int64, s->items.count, value) >= 0;
+    eof: pass;
+}
+
+//  Removes `value`. Returns false when it was not present.
+//  O(n) worst case: the removal shifts every larger element down by one.
+function setInt64Remove(ptr SetInt64 s, int64 value):bool {
+    const int at = lowerBound64(s->items.data as ptr int64, s->items.count, value);
+    if (at >= s->items.count) {
+        return false;
+    }
+    int64 found = @(s->items.data as ptr int64 + at);
+    if (found != value) {
+        return false;
+    }
+    return vecRemove(#s->items, at);
+    eof: pass;
+}
+
+//  Number of distinct values. O(1).
+function setInt64Count(ptr SetInt64 s):int {
+    return s->items.count;
+    eof: pass;
+}
+
+//  Element at `index` in ascending order, so index 0 is the minimum.
+//
+//  Returns 0 for an out-of-range index, which cannot be told apart from a stored
+//  zero -- check `setInt64Count` first when that matters.
+function setInt64At(ptr SetInt64 s, int index):int64 {
+    ptr char slot = vecAt(#s->items, index);
+    if (slot == 0 as ptr char) {
+        return 0i64;
+    }
+    return @(slot as ptr int64);
+    eof: pass;
+}
+
+// ─── string set ────────────────────────────────────────────────────────────
+//
+//  Hand-written binary search: `algorithm` has no string version, because its comparisons
+//  are native value comparisons while strings must compare by content.
+//
+//  The comparison uses `strCompare`, which returns -1 / 0 / +1 -- exactly the three-way
+//  result a binary search wants. The builtin `<` works now (fixed in the compiler), but
+//  it yields only true/false, so every comparison is written twice; see `strbyte.ax`.
+//
+//  Note what is stored: **a copy of the descriptor** (16 bytes), not the characters. So:
+//    * the set does not own the character memory; it belongs to the arena that made it
+//    * a string inserted from inside an `arena_scope` leaves a dangling descriptor once
+//      that scope rolls back (AX01-M02): keep it alive, or `dup` it (which leaks)
+//    * strings are immutable, so several sets sharing one character buffer is safe
+
+struct SetStr {
+    Vec items;      // ascending, elemSize = sizeof(string)
+};
+
+//  Creates a `string` set over the caller's `buffer`, with room for `capacity`
+//  descriptors (16 bytes each) before anything is allocated.
+//
+//  Stores descriptor copies, not character data: the set does not own the text,
+//  so a key that came from inside an `arena_scope` becomes a dangling descriptor
+//  once that scope ends (AX01-M02). Keep the strings alive for the set's whole
+//  lifetime, or copy them with `dup`.
+function makeSetStr(ptr string buffer, int capacity):SetStr {
+    SetStr s = {makeVec(buffer as ptr char, capacity, sizeof(string))};
+    return s;
+    eof: pass;
+}
+
+//  Releases the backing store if the set owns one, then zeroes the structure.
+//  Does not free the key strings -- the set never owned them.
+function setStrFree(ptr SetStr s):void {
+    vecFree(#s->items);
+    eof: pass;
+}
+
+//  Where the binary search lands: the index of the first `>= value` (lowerBound's meaning).
+function private setStrLowerBound(ptr SetStr s, string value):int {
+    int low = 0;
+    int high = s->items.count;
+    while (low < high) {
+        const int mid = low + (high - low) / 2;
+        string here = @(s->items.data as ptr string + mid);
+        if (strCompare(here, value) < 0) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+    eof: pass;
+}
+
+//  Inserts `value`, keeping the set ordered by `strCompare` (byte-wise).
+//
+//  Returns true when the value is a member afterwards (inserted now, or already
+//  present); false only when the backing store could not be grown.
+//  O(n) worst case for the shift, plus O(log n) comparisons; each comparison
+//  walks bytes because strings are compared, not their descriptors.
+function setStrAdd(ptr SetStr s, string value):bool {
+    const int at = setStrLowerBound(s, value);
+    if (at < s->items.count) {
+        string present = @(s->items.data as ptr string + at);
+        if (strCompare(present, value) == 0) {
+            return true;
+        }
+    }
+    string slot = value;
+    return vecInsert(#s->items, at, #slot as ptr char);
+    eof: pass;
+}
+
+//  True when `value` is a member, comparing contents byte by byte. O(log n)
+//  comparisons, each of which is a `strCompare` over the text.
+function setStrContains(ptr SetStr s, string value):bool {
+    const int at = setStrLowerBound(s, value);
+    if (at >= s->items.count) {
+        return false;
+    }
+    string present = @(s->items.data as ptr string + at);
+    return strCompare(present, value) == 0;
+    eof: pass;
+}
+
+//  Removes `value`. Returns false when it was not present. O(n) worst case.
+function setStrRemove(ptr SetStr s, string value):bool {
+    const int at = setStrLowerBound(s, value);
+    if (at >= s->items.count) {
+        return false;
+    }
+    string present = @(s->items.data as ptr string + at);
+    if (strCompare(present, value) != 0) {
+        return false;
+    }
+    return vecRemove(#s->items, at);
+    eof: pass;
+}
+
+//  Number of distinct values. O(1).
+function setStrCount(ptr SetStr s):int {
+    return s->items.count;
+    eof: pass;
+}
+
+//  Element at `index` in ascending order. Returns "" when out of range, which is
+//  also a value a set can legitimately hold -- check the count first.
+function setStrAt(ptr SetStr s, int index):string {
+    ptr char slot = vecAt(#s->items, index);
+    if (slot == 0 as ptr char) {
+        return "";
+    }
+    return @(slot as ptr string);
+    eof: pass;
+}

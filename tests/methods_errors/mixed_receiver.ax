@@ -1,0 +1,8 @@
+//  The same name cannot mix a value receiver and a pointer receiver.
+struct S {
+    int n;
+    function f(self):int { return 1; }
+    function f(ptr self, int k):int { return 2; }
+};
+
+function main():void { S s = {0}; print(s.f()); eof: pass; }

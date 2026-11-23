@@ -1,0 +1,11 @@
+// Library B: same name, same signature, different body. Must not interfere with A.
+
+function private helper(int x):int {
+    return x * 2;
+    eof: pass;
+}
+
+function bOwn():int {
+    return helper(1);
+    eof: pass;
+}

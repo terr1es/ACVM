@@ -1,0 +1,5 @@
+library "nowhere";
+union Num { int i; double d; };
+function takesUnion(Num n):void;
+
+function main():void { pass; eof: pass; }

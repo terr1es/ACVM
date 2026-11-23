@@ -1,0 +1,336 @@
+//  io.ax — the part of the I/O library that is plain Axiom.
+//
+//  `io.axd` declares the functions that have to call the operating system. This
+//  file holds everything that does not: path splitting and text formatting are
+//  `lastIndexOf`, `substring` and `+`, so they need no DLL, no marshalling and no
+//  Axiom fallback -- they simply are the implementation.
+//
+//  Importing the module brings both halves into scope:
+//
+//      function import (return:(io));
+//
+//  ── one restriction shapes this whole file ────────────────────────────────
+//
+//  Axiom can read a string's `length` and slice it with `s[from..to]`, but it
+//  cannot take a character out of it: `s[i]` indexes UTF-16 code units while a
+//  string is stored as UTF-8 bytes, so `"hello"[0]` yields a garbage glyph
+//  Every function below therefore works on *ranges*
+//  found with `indexOf` / `lastIndexOf`, never on single characters.
+//
+//  The practical consequence: these are correct for any UTF-8 input as long as
+//  the bytes being searched for are ASCII, which path separators and dots are.
+//  `substring` operates on byte offsets, and `s.length` is a byte count -- so an
+//  offset computed here and fed back into `s[a..b]` is consistent with itself.
+
+// ─── paths ─────────────────────────────────────────────────────────────────
+//
+// Both separators are understood on every platform. A Windows path reaching a
+// Linux program is a user error, but failing to *split* it would be our bug, and
+// splitting is all these functions do.
+
+//  Index of the last path separator, or -1 when there is none. Private: it is an
+//  implementation detail of the four functions below.
+module "io" version "0.1.0";
+
+function private lastSeparator(string path):int {
+    int slash = lastIndexOf(path, "/");
+    int backslash = lastIndexOf(path, "\\");
+    if (backslash > slash) {
+        return backslash;
+    }
+    return slash;
+}
+
+//  The final component: `"a/b/c.txt"` -> `"c.txt"`. A path with no separator is
+//  returned unchanged, so `pathBase("c.txt")` is `"c.txt"`.
+function pathBase(string path):string {
+    if (path.length == 0) {
+        return "";
+    }
+    int cut = lastSeparator(path);
+    if (cut < 0) {
+        return path;
+    }
+    return path[cut + 1 .. path.length];
+}
+
+//  Everything before the final component: `"a/b/c.txt"` -> `"a/b"`.
+//  Returns "" when there is no separator, and "/" for a path directly under the
+//  root, so that `pathJoin(pathDir(p), pathBase(p))` rebuilds `p`.
+function pathDir(string path):string {
+    int cut = lastSeparator(path);
+    if (cut < 0) {
+        return "";
+    }
+    if (cut == 0) {
+        return path[0..1];   // the root itself
+    }
+    return path[0..cut];
+}
+
+//  Extension **including the dot**: `"a/b/c.txt"` -> `".txt"`, so that
+//  `pathStem(p) + pathExtension(p) == pathBase(p)`.
+//
+//  A dot only counts when it is not the first character of the name, which keeps
+//  `".gitignore"` (an extensionless dotfile) intact instead of reporting
+//  `".gitignore"` as its own extension.
+function pathExtension(string path):string {
+    string base = pathBase(path);
+    int dot = lastIndexOf(base, ".");
+    if (dot <= 0) {
+        return "";
+    }
+    return base[dot .. base.length];
+}
+
+//  The name without its extension: `"a/b/c.txt"` -> `"c"`.
+function pathStem(string path):string {
+    string base = pathBase(path);
+    int dot = lastIndexOf(base, ".");
+    if (dot <= 0) {
+        return base;
+    }
+    return base[0..dot];
+}
+
+//  Joins two components with exactly one separator. An empty side is ignored, so
+//  `pathJoin("", "x")` is `"x"` and `pathJoin("x", "")` is `"x"` -- which makes
+//  `pathJoin(pathDir(p), pathBase(p))` an identity even for a bare filename.
+function pathJoin(string dir, string name):string {
+    if (dir.length == 0) {
+        return name;
+    }
+    if (name.length == 0) {
+        return dir;
+    }
+    // Compare the last byte rather than the last character: the separators are
+    // ASCII, so a single byte is the whole character.
+    string tail = dir[dir.length - 1 .. dir.length];
+    if (tail == "/" || tail == "\\") {
+        return dir + name;
+    }
+    return dir + "/" + name;
+}
+
+//  True when `path` ends with `extension`. Both with and without the dot are
+//  accepted, because half the world writes `endsWith(path, ".txt")` and the other
+//  half writes `"txt"`.
+function pathHasExtension(string path, string extension):bool {
+    if (extension.length == 0) {
+        return true;
+    }
+    if (pathExtension(path) == extension) {
+        return true;
+    }
+    if (extension[0..1] == ".") {
+        return false;   // already compared with the dot; a second chance makes no sense
+    }
+    return pathExtension(path) == ("." + extension);
+}
+
+// ─── formatting ────────────────────────────────────────────────────────────
+//
+// Table alignment and fixed widths. These are O(n²) in the padding width because
+// each `+` copies the whole string, which is irrelevant at the widths a terminal
+// or a CSV column uses (single or double digits) and would not be at 10 000.
+
+//  Pads `value` on the left until it is at least `width` bytes. `fill` is
+//  repeated, so a multi-character fill still lands on the requested width unless
+//  it does not divide evenly -- in which case the result overshoots by less than
+//  one fill.
+function padLeft(string value, int width, string fill):string {
+    if (fill.length == 0 || value.length >= width) {
+        return value;
+    }
+    string result = value;
+    while (result.length < width) {
+        result = fill + result;
+    }
+    return result;
+}
+
+//  Pads `value` on the right. See `padLeft` for the width caveat.
+function padRight(string value, int width, string fill):string {
+    if (fill.length == 0 || value.length >= width) {
+        return value;
+    }
+    string result = value;
+    while (result.length < width) {
+        result = result + fill;
+    }
+    return result;
+}
+
+//  Left-pads with zeros: `padZero("42", 5)` -> `"00042"`. The natural companion to
+//  `itoa` for timestamps, fixed-width records and file names that sort correctly.
+function padZero(string value, int width):string {
+    return padLeft(value, width, "0");
+}
+
+//  A number in a fixed-width field. Negative values keep their sign and the sign
+//  counts towards the width, so a column of them stays aligned.
+function formatInt(int value, int width):string {
+    return padLeft(itoa(value, 10), width, " ");
+}
+
+//  A number as fixed-width zero-padded decimal, sign preserved:
+//  `formatIntPadded(-7, 4)` -> `"-007"`.
+function formatIntPadded(int value, int width):string {
+    if (value < 0) {
+        return "-" + padZero(itoa(-value, 10), width - 1);
+    }
+    return padZero(itoa(value, 10), width);
+}
+
+//  One byte as two lowercase hex digits, zero-padded: `hexByte(10)` -> `"0a"`.
+//  `itoa` does not pad, so the padding is the whole point of this wrapper.
+function hexByte(int value):string {
+    int clamped = value % 256;
+    if (clamped < 0) {
+        clamped = clamped + 256;
+    }
+    return padZero(itoa(clamped, 16), 2);
+}
+
+//  Formats `value` with exactly `decimals` digits after the point.
+//
+//      ftoaFixed(3.14159, 2)   → "3.14"
+//      ftoaFixed(2.0, 2)       → "2.00"
+//      ftoaFixed(9.999, 2)     → "10.00"   (the carry reaches the integer part)
+//      ftoaFixed(-0.5, 0)      → "-1"      (away from zero, not "-0")
+//      ftoaFixed(0.1 + 0.2, 2) → "0.30"    (the noise is dropped)
+//
+//  ── why not use `ftoa` directly ───────────────────────────────────────────
+//
+//  `ftoa` gives the "shortest round-trip representation": `0.1 + 0.2` prints
+//  `0.30000000000000004`, and `100.0` even prints `1e+02`. Debugging likes that (complete
+//  information); reports cannot: money, percentages and CSV export need fixed decimals.
+//
+//  ── an error we must accept ───────────────────────────────────────────────
+//
+//  `ftoaFixed(1.005, 2)` gives **"1.00"**, not the intuitive "1.01".
+//
+//  The cause is not the implementation: a double cannot hold 1.005; the nearest value is
+//  1.00499999999999989..., so two-place rounding must give 1.00. C's `printf("%.2f", 1.005)`,
+//  Python's `f"{1.005:.2f}"` and Java's `String.format("%.2f", 1.005)` **all give 1.00**.
+//  This matches them instead of guessing what decimal the caller meant.
+//
+//  For cent accuracy avoid `double`: store integer cents, insert the point when printing.
+//
+//  ── negative zero ─────────────────────────────────────────────────────────
+//
+//  `ftoaFixed(-0.001, 2)` gives `"0.00"`, not `"-0.00"`. C gives `-0.00`, but that is
+//  visual noise: the magnitude is invisible already, and a minus sign only suggests a bug.
+function ftoaFixed(double value, int decimals):string {
+    //  Past 15 decimals is pointless -- 15-17 significant digits, and the rest is noise.
+    int digits = decimals;
+    if (digits < 0) {
+        digits = 0;
+    }
+    if (digits > 15) {
+        digits = 15;
+    }
+
+    //  Non-finite values have no fixed-point form; ftoa prints "inf" / "nan" / "-inf".
+    if (value != value) {
+        return ftoa(value);         // NaN
+    }
+    if (value > 1.7976931348623157e308 || value < -1.7976931348623157e308) {
+        return ftoa(value);         // inf
+    }
+
+    //  Work on the absolute value and add the sign last, so "carry into the integer part"
+    //  and "negative modulo" need no special case, and the logic has a single path.
+    bool negative = value < 0.0;
+    double magnitude = fabs(value);
+
+    //  10^digits. `pow` is exact for integer exponents (10^k is representable up to 1e22).
+    double scale = pow(10.0, digits as double);
+    double scaled = round(magnitude * scale);
+
+    //  Magnitudes beyond int64 fall back to ftoa: above 9.2e18 fixed-point output is a long
+    //  string of digits that nobody reads, and `as int64` is undefined at that magnitude.
+    if (scaled >= 9.2e18) {
+        return ftoa(value);
+    }
+    int64 fixed = scaled as int64;
+
+    //  Split integer and fraction. With digits == 0 the divisor is 1, so frac stays 0.
+    int64 divisor = 1;
+    for (int i = 0; i < digits; i++) {
+        divisor = divisor * 10;
+    }
+    int64 whole = fixed / divisor;
+    int64 fraction = fixed % divisor;
+
+    string out = itoa(whole, 10);
+    if (digits > 0) {
+        out = out + "." + padZero(itoa(fraction, 10), digits);
+    }
+
+    //  Only prepend the minus when the result is genuinely non-zero -- see "negative zero".
+    if (negative && fixed != 0) {
+        out = "-" + out;
+    }
+    return out;
+}
+
+// ─── parsing a directory listing ───────────────────────────────────────────
+//
+//  `listDir` writes names into the buffer as `name\0name\0...\0\0`, all from one syscall.
+//  The two functions below walk bytes already in memory -- pure Axiom, no filesystem.
+//
+//  Dereference must go through `int8`: `ptr char` has a 2-byte stride, but names in the
+//  buffer are **packed** bytes, so walking with `ptr char` would skip half of them. Hence
+//  cast to `ptr int8` here and back to `ptr char` for the substring (`makeString` wants it).
+
+//  Counts the entries packed into a `listDir` buffer. Returns 0 when the buffer is
+//  empty or was never filled.
+function dirCount(ptr char buffer, int capacity):int {
+    if (capacity <= 0) {
+        return 0;
+    }
+    ptr int8 bytes = buffer as ptr int8;
+    int count = 0;
+    int offset = 0;
+    while (offset < capacity) {
+        int start = offset;
+        while (offset < capacity && ((@(bytes + offset) as int) & 255) != 0) {
+            offset = offset + 1;
+        }
+        if (offset - start == 0) {
+            break;      // double NUL: the terminator
+        }
+        count = count + 1;
+        offset = offset + 1;
+    }
+    return count;
+    eof: pass;
+}
+
+//  Returns entry `index`, or "" when out of range. Same buffer as `listDir`.
+function dirEntryAt(ptr char buffer, int capacity, int index):string {
+    if (index < 0 || capacity <= 0) {
+        return "";
+    }
+    ptr int8 bytes = buffer as ptr int8;
+    int seen = 0;
+    int offset = 0;
+    while (offset < capacity) {
+        int start = offset;
+        while (offset < capacity && ((@(bytes + offset) as int) & 255) != 0) {
+            offset = offset + 1;
+        }
+        int length = offset - start;
+        if (length == 0) {
+            return "";      // terminator
+        }
+        if (seen == index) {
+            return makeString((bytes + start) as ptr char, length);
+        }
+        seen = seen + 1;
+        offset = offset + 1;
+    }
+    return "";
+    eof: pass;
+}

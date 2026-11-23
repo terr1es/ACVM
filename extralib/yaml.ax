@@ -1,0 +1,1546 @@
+//  yaml.ax -- reading and writing YAML.
+//
+//      function import (return:(yaml));
+//
+//      Doc d = docNew(0);
+//      ptr Value root = yamlParse(#d, "db:\n  host: h\n  port: 5432\n");
+//      print(valStrOf(valPath(root, "db.host"), "?"));   // h
+//      print(yamlWrite(#d, root));
+//      docFree(#d);
+//
+//  ── scope ────────────────────────────────────────────────────────────────
+//
+//  Supported: block mappings and sequences (any nesting), flow `[...]` / `{...}`, plain
+//  and single/double quoted scalars, block scalars (`|` and `>`, with `-`/`+` chomping),
+//  comments, multiple documents (`---`/`...`), anchors and aliases (`&a` / `*a`, a
+//  **deep copy** per use, never shared), and scalar typing (null/bool/int/float/string).
+//
+//  Not supported, and not pretended: the tag system (`!!set`, `!!binary`, `!custom`),
+//  complex keys (`? key`), merge keys (`<<`), directives (`%YAML`). A `?` start or a
+//  `!!` prefix is an error, not plain text -- a quiet misread is worse than a refusal.
+//
+//  ── why anchors expand as copies ─────────────────────────────────────────
+//
+//  `&a` and `*a` name **one node** in YAML, which may form a cycle. A Value tree has no
+//  sharing and no cycles, so an alias becomes a deep copy. A node referenced ten times
+//  then takes ten copies; in exchange the tree is freely editable, with no hidden aliasing.
+//
+//  ── indentation rules ────────────────────────────────────────────────────
+//
+//  YAML's one hard rule is "a child is indented more than its parent". This compares
+//  leading spaces, so **it does not demand** exactly 2: a file indented with 4 spaces,
+//  or a mix, still reads. A tab as indentation is forbidden by YAML and is an error.
+//
+//  depends: value
+
+module "yaml" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(value));
+
+comptime int kYamlMaxDepth = 100;
+
+struct YamlReader {
+    ptr unsigned int8 bytes;
+    int length;
+    int pos;
+    int line;
+    // Offset of the current line's first byte. Indentation is `pos - lineStart`,
+    // which stays correct after `yamlSkipToContent` has moved `pos` past the
+    // leading spaces -- measuring from `pos` would always report 0.
+    int lineStart;
+    ptr Doc doc;
+    // Anchor table: name -> node. Small and linear; documents rarely have many.
+    ptr YamlAnchor anchors;
+    int anchorCount;
+    int anchorCapacity;
+};
+
+struct YamlAnchor {
+    string name;
+    ptr Value node;
+};
+
+//===--- line helpers ----------------------------------------------------===//
+
+function private yamlByteAt(ptr YamlReader r, int at):int {
+    if (at < 0 || at >= r->length) {
+        return -1;
+    }
+    return @(r->bytes + at) as int;
+    eof: pass;
+}
+
+function private yamlFail(ptr YamlReader r, string message):ptr Value {
+    return docFail(r->doc, message + " (line " + itoa(r->line, 10) + ")", r->pos);
+    eof: pass;
+}
+
+function private yamlSpace(int b):bool {
+    return b == 32 || b == 9;
+    eof: pass;
+}
+
+//  End of the current line (index of the newline byte, or `length`).
+function private yamlLineEnd(ptr YamlReader r):int {
+    int i = r->pos;
+    while (i < r->length) {
+        int b = @(r->bytes + i) as int;
+        if (b == 10 || b == 13) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return i;
+    eof: pass;
+}
+
+//  Moves to the start of the next line.
+function private yamlAdvanceLine(ptr YamlReader r):void {
+    int end = yamlLineEnd(r);
+    if (end < r->length && @(r->bytes + end) as int == 13) {
+        end = end + 1;
+    }
+    if (end < r->length && @(r->bytes + end) as int == 10) {
+        end = end + 1;
+    }
+    r->pos = end;
+    r->line = r->line + 1;
+    r->lineStart = end;
+    eof: pass;
+}
+
+//  True when the rest of the line is empty or only a comment.
+function private yamlLineRestEmpty(ptr YamlReader r):bool {
+    int i = r->pos;
+    while (i < r->length) {
+        int b = @(r->bytes + i) as int;
+        if (b == 10 || b == 13) {
+            return true;
+        }
+        if (b == 35) {
+            return true;
+        }
+        if (!yamlSpace(b)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+    eof: pass;
+}
+
+//  Skips a comment on the current line.
+function private yamlSkipComment(ptr YamlReader r):void {
+    int i = r->pos;
+    while (i < r->length) {
+        int b = @(r->bytes + i) as int;
+        if (b == 35) {
+            r->pos = i;
+            while (r->pos < r->length && @(r->bytes + r->pos) as int != 10) {
+                r->pos = r->pos + 1;
+            }
+            return;
+        }
+        if (b == 10 || b == 13) {
+            return;
+        }
+        i = i + 1;
+    }
+    eof: pass;
+}
+
+//  Advances past blank lines, comment-only lines and document markers until a
+//  line with content is at `pos`. Returns false at end of input or at a document
+//  terminator (`...`), which ends the current document.
+function private yamlSkipToContent(ptr YamlReader r):bool {
+    while (r->pos < r->length) {
+        int i = r->pos;
+        while (i < r->length && yamlSpace(@(r->bytes + i) as int)) {
+            i = i + 1;
+        }
+        int b = yamlByteAt(r, i);
+        if (b < 0) {
+            return false;
+        }
+        if (b == 10 || b == 13) {
+            r->pos = i;
+            yamlAdvanceLine(r);
+            continue;
+        }
+        if (b == 35) {
+            r->pos = i;
+            yamlSkipComment(r);
+            continue;
+        }
+        // `---` starts a document, `...` ends one. Both are whole-line markers.
+        if (b == 45 && yamlByteAt(r, i + 1) == 45 && yamlByteAt(r, i + 2) == 45 &&
+            yamlLineRestEmptyAt(r, i + 3)) {
+            r->pos = i;
+            return true;
+        }
+        if (b == 46 && yamlByteAt(r, i + 1) == 46 && yamlByteAt(r, i + 2) == 46 &&
+            yamlLineRestEmptyAt(r, i + 3)) {
+            r->pos = i;
+            return false;
+        }
+        r->pos = i;
+        return true;
+    }
+    return false;
+    eof: pass;
+}
+
+function private yamlLineRestEmptyAt(ptr YamlReader r, int from):bool {
+    int i = from;
+    while (i < r->length) {
+        int b = @(r->bytes + i) as int;
+        if (b == 10 || b == 13) {
+            return true;
+        }
+        if (b == 35) {
+            return true;
+        }
+        if (!yamlSpace(b)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+    eof: pass;
+}
+
+//  Indentation (column of the first non-space byte) of the line at `pos`.
+function private yamlIndentAt(ptr YamlReader r):int {
+    if (r->pos > r->lineStart && @(r->bytes + r->lineStart) as int == 9) {
+        return -1;      // tabs are not allowed as indentation
+    }
+    return r->pos - r->lineStart;
+    eof: pass;
+}
+
+//===--- scalars ---------------------------------------------------------===//
+
+function private yamlIsNullWord(string text):bool {
+    return text == "" || text == "~" || text == "null" || text == "Null" || text == "NULL";
+    eof: pass;
+}
+
+//  Resolves a plain scalar. Quoted scalars never come here: quoting is how YAML
+//  says "this is a string", so `"true"` must stay a string.
+//
+//  `yes`/`no`/`on`/`off` are accepted as booleans because YAML 1.1 (which most
+//  configuration files were written against) defines them that way, and a config
+//  that says `enabled: yes` means the boolean.
+function private yamlResolvePlain(ptr Doc doc, string text):ptr Value {
+    if (yamlIsNullWord(text)) {
+        return valNull(doc);
+    }
+    if (text == "true" || text == "True" || text == "TRUE" || text == "yes" ||
+        text == "Yes" || text == "YES" || text == "on" || text == "On" || text == "ON") {
+        return valBool(doc, true);
+    }
+    if (text == "false" || text == "False" || text == "FALSE" || text == "no" ||
+        text == "No" || text == "NO" || text == "off" || text == "Off" || text == "OFF") {
+        return valBool(doc, false);
+    }
+    if (text == ".inf" || text == ".Inf" || text == ".INF") {
+        return valFloat(doc, 1.0 / 0.0);
+    }
+    if (text == "-.inf" || text == "-.Inf" || text == "-.INF") {
+        return valFloat(doc, -1.0 / 0.0);
+    }
+    if (text == ".nan" || text == ".NaN" || text == ".NAN") {
+        return valFloat(doc, 0.0 / 0.0);
+    }
+
+    // A number has to look like one completely: `1.2.3` and `12abc` are strings.
+    ptr int8 bytes = strBytesOf(text);
+    int length = text.length;
+    bool looksNumeric = length > 0;
+    int i = 0;
+    if (looksNumeric) {
+        int first = strByteAt(text, 0);
+        if (first == 45 || first == 43) {
+            i = 1;
+        }
+    }
+    if (i >= length) {
+        looksNumeric = false;
+    }
+    bool hasDot = false;
+    bool hasExp = false;
+    while (i < length) {
+        int c = @(bytes + i) as int;
+        if (c >= 48 && c <= 57) {
+            i = i + 1;
+        } else if (c == 95) {
+            i = i + 1;
+        } else if (c == 46) {
+            hasDot = true;
+            i = i + 1;
+        } else if (c == 101 || c == 69) {
+            hasExp = true;
+            i = i + 1;
+        } else if (c == 43 || c == 45) {
+            // Only valid right after an exponent marker.
+            if (i == 0 || (@(bytes + i - 1) as int != 101 && @(bytes + i - 1) as int != 69)) {
+                looksNumeric = false;
+                i = length;
+            } else {
+                i = i + 1;
+            }
+        } else if (c == 58 && hasDot == false) {
+            // Sexagesimal (`1:30`) — treated as a string, not a number.
+            looksNumeric = false;
+            i = length;
+        } else {
+            looksNumeric = false;
+            i = length;
+        }
+    }
+    if (!looksNumeric) {
+        return valString(doc, text);
+    }
+    if (hasDot || hasExp) {
+        double value = 0.0;
+        if (txtParseFloat(bytes, length, #value) != length) {
+            return valString(doc, text);
+        }
+        return valFloat(doc, value);
+    }
+    int64 value = 0i64;
+    if (txtParseInt64(bytes, length, #value) != length) {
+        return valString(doc, text);
+    }
+    return valInt(doc, value);
+    eof: pass;
+}
+
+//  Reads a single- or double-quoted scalar at `pos` (quote already peeked).
+function private yamlReadQuoted(ptr YamlReader r):string {
+    int quote = yamlByteAt(r, r->pos);
+    bool single = quote == 39;
+    r->pos = r->pos + 1;
+    ptr int8 buffer = arenaTake(#r->doc->arena, r->length - r->pos + 4);
+    if (buffer == null) {
+        yamlFail(r, "out of memory");
+        return "";
+    }
+    int out = 0;
+    while (true) {
+        if (r->pos >= r->length) {
+            yamlFail(r, "unterminated quoted scalar");
+            return "";
+        }
+        int c = @(r->bytes + r->pos) as int;
+        if (c == quote) {
+            if (single && yamlByteAt(r, r->pos + 1) == 39) {
+                // '' inside a single-quoted scalar is one quote.
+                @((buffer + out) as ptr unsigned int8) = ((39) & 255) as unsigned int8;
+                out = out + 1;
+                r->pos = r->pos + 2;
+                continue;
+            }
+            r->pos = r->pos + 1;
+            return arenaStringTake(buffer, out);
+        }
+        if (c == 92 && !single) {
+            int esc = yamlByteAt(r, r->pos + 1);
+            r->pos = r->pos + 2;
+            int literal = -1;
+            if (esc == 110) {
+                literal = 10;
+            } else if (esc == 116) {
+                literal = 9;
+            } else if (esc == 114) {
+                literal = 13;
+            } else if (esc == 34) {
+                literal = 34;
+            } else if (esc == 92) {
+                literal = 92;
+            } else if (esc == 47) {
+                literal = 47;
+            } else if (esc == 48) {
+                literal = 0;
+            }
+            if (literal >= 0) {
+                @((buffer + out) as ptr unsigned int8) = ((literal) & 255) as unsigned int8;
+                out = out + 1;
+                continue;
+            }
+            if (esc == 117 || esc == 120) {
+                int digits = esc == 117 ? 4 : 2;
+                int code = 0;
+                int k = 0;
+                bool ok = true;
+                while (k < digits) {
+                    int digit = txtHexValue(yamlByteAt(r, r->pos + k));
+                    if (digit < 0) {
+                        ok = false;
+                        k = digits;
+                    } else {
+                        code = (code << 4) | digit;
+                        k = k + 1;
+                    }
+                }
+                if (!ok) {
+                    yamlFail(r, "bad escape in a double-quoted scalar");
+                    return "";
+                }
+                r->pos = r->pos + digits;
+                out = out + yamlUtf8Encode(buffer, out, code);
+                continue;
+            }
+            // Unknown escape: keep the byte, so `\d` in a regex survives.
+            @((buffer + out) as ptr unsigned int8) = ((92) & 255) as unsigned int8;
+            out = out + 1;
+            if (esc >= 0) {
+                @((buffer + out) as ptr unsigned int8) = ((esc) & 255) as unsigned int8;
+                out = out + 1;
+            }
+            continue;
+        }
+        if (c == 10 || c == 13) {
+            // A newline inside quotes is folded to a space, as YAML specifies
+            // for flow scalars.
+            yamlAdvanceLine(r);
+            @((buffer + out) as ptr unsigned int8) = ((32) & 255) as unsigned int8;
+            out = out + 1;
+            while (r->pos < r->length && yamlSpace(@(r->bytes + r->pos) as int)) {
+                r->pos = r->pos + 1;
+            }
+            continue;
+        }
+        @((buffer + out) as ptr unsigned int8) = ((c) & 255) as unsigned int8;
+        out = out + 1;
+        r->pos = r->pos + 1;
+    }
+    return "";
+    eof: pass;
+}
+
+function private yamlUtf8Encode(ptr int8 at, int offset, int code):int {
+    if (code < 0 || code > 1114111 || (code >= 55296 && code <= 57343)) {
+        code = 65533;
+    }
+    ptr unsigned int8 out = at as ptr unsigned int8;
+    if (code < 128) {
+        @(out + offset) = code as unsigned int8;
+        return 1;
+    }
+    if (code < 2048) {
+        @(out + offset) = (192 | (code >> 6)) as unsigned int8;
+        @(out + offset + 1) = (128 | (code & 63)) as unsigned int8;
+        return 2;
+    }
+    if (code < 65536) {
+        @(out + offset) = (224 | (code >> 12)) as unsigned int8;
+        @(out + offset + 1) = (128 | ((code >> 6) & 63)) as unsigned int8;
+        @(out + offset + 2) = (128 | (code & 63)) as unsigned int8;
+        return 3;
+    }
+    @(out + offset) = (240 | (code >> 18)) as unsigned int8;
+    @(out + offset + 1) = (128 | ((code >> 12) & 63)) as unsigned int8;
+    @(out + offset + 2) = (128 | ((code >> 6) & 63)) as unsigned int8;
+    @(out + offset + 3) = (128 | (code & 63)) as unsigned int8;
+    return 4;
+    eof: pass;
+}
+
+//  Trims trailing spaces and a trailing comment from a plain scalar. A '#' starts
+//  a comment only when preceded by a space, which is why `a#b` stays a string.
+function private yamlTrimPlain(ptr YamlReader r, int from, int to):string {
+    int stop = to;
+    int i = from;
+    while (i < to) {
+        int c = @(r->bytes + i) as int;
+        if (c == 35 && (i == from || yamlSpace(@(r->bytes + i - 1) as int))) {
+            stop = i;
+            i = to;
+        } else {
+            i = i + 1;
+        }
+    }
+    while (stop > from && yamlSpace(@(r->bytes + stop - 1) as int)) {
+        stop = stop - 1;
+    }
+    int start = from;
+    while (start < stop && yamlSpace(@(r->bytes + start) as int)) {
+        start = start + 1;
+    }
+    if (stop <= start) {
+        return "";
+    }
+    return arenaString(#r->doc->arena, (r->bytes + start) as ptr int8, stop - start);
+    eof: pass;
+}
+
+//===--- anchors ---------------------------------------------------------===//
+
+function private yamlSetAnchor(ptr YamlReader r, string name, ptr Value node):void {
+    int i = 0;
+    while (i < r->anchorCount) {
+        if (r->anchors[i].name == name) {
+            r->anchors[i].node = node;
+            return;
+        }
+        i = i + 1;
+    }
+    if (r->anchorCount >= r->anchorCapacity) {
+        int cap = r->anchorCapacity < 8 ? 8 : r->anchorCapacity * 2;
+        ptr YamlAnchor grown = arenaTake(#r->doc->arena, cap * sizeof(YamlAnchor)) as ptr YamlAnchor;
+        if (grown == null) {
+            return;
+        }
+        if (r->anchorCount > 0) {
+            memcpy(grown as ptr void, r->anchors as ptr void, r->anchorCount * sizeof(YamlAnchor));
+        }
+        r->anchors = grown;
+        r->anchorCapacity = cap;
+    }
+    r->anchors[r->anchorCount].name = name;
+    r->anchors[r->anchorCount].node = node;
+    r->anchorCount = r->anchorCount + 1;
+    eof: pass;
+}
+
+function private yamlGetAnchor(ptr YamlReader r, string name):ptr Value {
+    int i = 0;
+    while (i < r->anchorCount) {
+        if (r->anchors[i].name == name) {
+            return r->anchors[i].node;
+        }
+        i = i + 1;
+    }
+    return null;
+    eof: pass;
+}
+
+//  Reads an anchor or alias name: `&name` defines, `*name` references.
+function private yamlReadAnchorName(ptr YamlReader r):string {
+    int start = r->pos;
+    while (r->pos < r->length) {
+        int c = @(r->bytes + r->pos) as int;
+        bool ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+                  c == 95 || c == 45 || c == 46;
+        if (!ok) {
+            break;
+        }
+        r->pos = r->pos + 1;
+    }
+    return arenaString(#r->doc->arena, (r->bytes + start) as ptr int8, r->pos - start);
+    eof: pass;
+}
+
+//  Parses a flow collection (`[...]` or `{...}`) starting at `pos`.
+function private yamlParseFlow(ptr YamlReader r, int depth):ptr Value {
+    int opener = yamlByteAt(r, r->pos);
+    bool mapping = opener == 123;
+    ptr Value container = mapping ? valObject(r->doc) : valArray(r->doc);
+    if (container == null) {
+        return null;
+    }
+    r->pos = r->pos + 1;
+    if (depth > kYamlMaxDepth) {
+        return yamlFail(r, "nesting is too deep");
+    }
+    while (true) {
+        while (r->pos < r->length) {
+            int c = @(r->bytes + r->pos) as int;
+            if (yamlSpace(c)) {
+                r->pos = r->pos + 1;
+            } else if (c == 10 || c == 13) {
+                yamlAdvanceLine(r);
+            } else if (c == 35) {
+                yamlSkipComment(r);
+            } else {
+                r->pos = r->pos + 0;
+                break;
+            }
+        }
+        if (r->pos >= r->length) {
+            return yamlFail(r, "unterminated flow collection");
+        }
+        int c = yamlByteAt(r, r->pos);
+        if ((mapping && c == 125) || (!mapping && c == 93)) {
+            r->pos = r->pos + 1;
+            return container;
+        }
+        if (mapping) {
+            string key = "";
+            int kc = yamlByteAt(r, r->pos);
+            if (kc == 34 || kc == 39) {
+                key = yamlReadQuoted(r);
+            } else {
+                int start = r->pos;
+                while (r->pos < r->length) {
+                    int b = @(r->bytes + r->pos) as int;
+                    if (b == 58 || b == 44 || b == 125 || b == 10 || b == 13) {
+                        break;
+                    }
+                    r->pos = r->pos + 1;
+                }
+                key = yamlTrimPlain(r, start, r->pos);
+            }
+            while (r->pos < r->length && yamlSpace(@(r->bytes + r->pos) as int)) {
+                r->pos = r->pos + 1;
+            }
+            if (yamlByteAt(r, r->pos) != 58) {
+                return yamlFail(r, "expected ':' in a flow mapping");
+            }
+            r->pos = r->pos + 1;
+            ptr Value value = yamlParseFlowValue(r, depth + 1);
+            if (value == null) {
+                return null;
+            }
+            valSet(r->doc, container, key, value);
+        } else {
+            ptr Value item = yamlParseFlowValue(r, depth + 1);
+            if (item == null) {
+                return null;
+            }
+            valPush(r->doc, container, item);
+        }
+        while (r->pos < r->length) {
+            int b = @(r->bytes + r->pos) as int;
+            if (yamlSpace(b)) {
+                r->pos = r->pos + 1;
+            } else if (b == 10 || b == 13) {
+                yamlAdvanceLine(r);
+            } else if (b == 35) {
+                yamlSkipComment(r);
+            } else {
+                r->pos = r->pos + 0;
+                break;
+            }
+        }
+        int following = yamlByteAt(r, r->pos);
+        if (following == 44) {
+            r->pos = r->pos + 1;
+        } else if ((mapping && following == 125) || (!mapping && following == 93)) {
+            r->pos = r->pos + 1;
+            return container;
+        } else {
+            return yamlFail(r, "expected ',' or the closing bracket in a flow collection");
+        }
+    }
+    return null;
+    eof: pass;
+}
+
+//  One value inside a flow collection.
+function private yamlParseFlowValue(ptr YamlReader r, int depth):ptr Value {
+    if (depth > kYamlMaxDepth) {
+        return yamlFail(r, "nesting is too deep");
+    }
+    while (r->pos < r->length && yamlSpace(@(r->bytes + r->pos) as int)) {
+        r->pos = r->pos + 1;
+    }
+    int c = yamlByteAt(r, r->pos);
+    if (c == 91 || c == 123) {
+        return yamlParseFlow(r, depth);
+    }
+    if (c == 42) {
+        r->pos = r->pos + 1;
+        string name = yamlReadAnchorName(r);
+        ptr Value target = yamlGetAnchor(r, name);
+        if (target == null) {
+            return yamlFail(r, "unknown anchor '*" + name + "'");
+        }
+        return valCopy(r->doc, target);
+    }
+    if (c == 34 || c == 39) {
+        string text = yamlReadQuoted(r);
+        if (docFailed(r->doc)) {
+            return null;
+        }
+        return valStringRaw(r->doc, text);
+    }
+    int start = r->pos;
+    while (r->pos < r->length) {
+        int b = @(r->bytes + r->pos) as int;
+        if (b == 44 || b == 93 || b == 125 || b == 10 || b == 13) {
+            break;
+        }
+        r->pos = r->pos + 1;
+    }
+    string text = yamlTrimPlain(r, start, r->pos);
+    if (text.length == 0) {
+        return valNull(r->doc);
+    }
+    return yamlResolvePlain(r->doc, text);
+    eof: pass;
+}
+
+//  Reads a block scalar (`|` or `>`) whose indicator is at `pos`. Lines are
+//  consumed while their indentation stays at or beyond the content indent.
+function private yamlParseBlockScalar(ptr YamlReader r, int parentIndent):ptr Value {
+    int indicator = yamlByteAt(r, r->pos);
+    bool folded = indicator == 62;
+    r->pos = r->pos + 1;
+    int chomp = 0;
+    int explicitIndent = 0;
+    while (true) {
+        int c = yamlByteAt(r, r->pos);
+        if (c == 45) {
+            chomp = -1;
+            r->pos = r->pos + 1;
+        } else if (c == 43) {
+            chomp = 1;
+            r->pos = r->pos + 1;
+        } else if (c >= 49 && c <= 57) {
+            explicitIndent = c - 48;
+            r->pos = r->pos + 1;
+        } else {
+            break;
+        }
+    }
+    while (r->pos < r->length && yamlSpace(@(r->bytes + r->pos) as int)) {
+        r->pos = r->pos + 1;
+    }
+    yamlSkipComment(r);
+    yamlAdvanceLine(r);
+
+    int contentIndent = -1;
+    if (explicitIndent > 0) {
+        contentIndent = parentIndent + explicitIndent;
+    }
+
+    StrBuf b = {null, 0, 0};
+    sbInit(#b, 128);
+    int pendingBlank = 0;
+    bool first = true;
+    while (r->pos < r->length) {
+        int lineStart = r->pos;
+        int indent = 0;
+        int i = lineStart;
+        while (i < r->length && @(r->bytes + i) as int == 32) {
+            indent = indent + 1;
+            i = i + 1;
+        }
+        bool blank = true;
+        int probe = i;
+        while (probe < r->length) {
+            int c = @(r->bytes + probe) as int;
+            if (c == 10 || c == 13) {
+                probe = r->length;
+            } else {
+                blank = false;
+                probe = r->length;
+            }
+        }
+        if (blank) {
+            pendingBlank = pendingBlank + 1;
+            yamlAdvanceLine(r);
+            continue;
+        }
+        if (contentIndent < 0) {
+            if (indent <= parentIndent) {
+                break;
+            }
+            contentIndent = indent;
+        }
+        if (indent < contentIndent) {
+            break;
+        }
+        if (pendingBlank > 0) {
+            int k = 0;
+            while (k < pendingBlank) {
+                sbPutByte(#b, 10);
+                k = k + 1;
+            }
+            pendingBlank = 0;
+        } else if (!first) {
+            if (folded) {
+                sbPutByte(#b, 32);
+            } else {
+                sbPutByte(#b, 10);
+            }
+        }
+        int end = yamlLineEnd(r);
+        int contentStart = lineStart + contentIndent;
+        if (contentStart > end) {
+            contentStart = end;
+        }
+        sbPutBytes(#b, (r->bytes + contentStart) as ptr int8, end - contentStart);
+        first = false;
+        yamlAdvanceLine(r);
+    }
+
+    if (chomp == 1) {
+        int k = 0;
+        while (k <= pendingBlank) {
+            sbPutByte(#b, 10);
+            k = k + 1;
+        }
+    } else if (chomp == 0 && b.length > 0) {
+        sbPutByte(#b, 10);
+    }
+
+    ptr Value node = valStringRaw(r->doc, sbFinishInto(r->doc, #b));
+    if (node != null) {
+        node->flags = kFlagMultiline;
+    }
+    return node;
+    eof: pass;
+}
+
+//===--- block structure -------------------------------------------------===//
+
+//  Finds the ':' that ends a mapping key on the current line: it must be followed
+//  by a space or the end of the line, and must not be inside quotes. Returns the
+//  index, or -1 when the line is not a mapping entry.
+function private yamlFindKeyColon(ptr YamlReader r, int from, int to):int {
+    int i = from;
+    int quote = 0;
+    while (i < to) {
+        int c = @(r->bytes + i) as int;
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+            }
+        } else if (c == 34 || c == 39) {
+            quote = c;
+        } else if (c == 58) {
+            int after = -1;
+            if (i + 1 < to) {
+                after = @(r->bytes + i + 1) as int;
+            }
+            if (after < 0 || yamlSpace(after)) {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+    eof: pass;
+}
+
+//  Reads the value that follows `key:` on the same line, or the nested block on
+//  the lines below. `indent` is the key's own indentation, so a nested block must
+//  be strictly deeper than it.
+function private yamlReadValueAfterKey(ptr YamlReader r, int indent, int depth):ptr Value {
+    while (r->pos < r->length && yamlSpace(@(r->bytes + r->pos) as int)) {
+        r->pos = r->pos + 1;
+    }
+    int c = yamlByteAt(r, r->pos);
+    if (c < 0 || c == 10 || c == 13 || c == 35) {
+        // No inline value: the value is the block below, if any.
+        if (!yamlSkipToContent(r)) {
+            return valNull(r->doc);
+        }
+        int nextIndent = yamlIndentAt(r);
+        if (nextIndent < 0) {
+            return yamlFail(r, "tab used as indentation");
+        }
+        if (nextIndent <= indent) {
+            return valNull(r->doc);
+        }
+        int nextByte = yamlByteAt(r, r->pos);
+        if (nextByte == 45 && (yamlByteAt(r, r->pos + 1) == 45 && yamlByteAt(r, r->pos + 2) == 45) &&
+            yamlLineRestEmptyAt(r, r->pos + 3)) {
+            // A document marker ends this document; the key has no value.
+            return valNull(r->doc);
+        }
+        return yamlParseBlock(r, nextIndent, depth + 1);
+    }
+
+    // Inline value on the same line.
+    bool isAlias = false;
+    ptr Value node = null;
+    string anchorName = "";
+    if (c == 38) {           // '&'
+        r->pos = r->pos + 1;
+        anchorName = yamlReadAnchorName(r);
+        while (r->pos < r->length && yamlSpace(@(r->bytes + r->pos) as int)) {
+            r->pos = r->pos + 1;
+        }
+        int inner = yamlByteAt(r, r->pos);
+        if (inner < 0 || inner == 10 || inner == 13 || inner == 35) {
+            // `key: &a` followed by a block.
+            ptr Value block = valNull(r->doc);
+            if (yamlSkipToContent(r)) {
+                int nextIndent = yamlIndentAt(r);
+                if (nextIndent > indent) {
+                    block = yamlParseBlock(r, nextIndent, depth + 1);
+                }
+            }
+            yamlSetAnchor(r, anchorName, block);
+            return block;
+        }
+        node = yamlParseInlineValue(r, indent, depth);
+        if (node == null) {
+            return null;
+        }
+        yamlSetAnchor(r, anchorName, node);
+        return node;
+    }
+
+    node = yamlParseInlineValue(r, indent, depth);
+    return node;
+    eof: pass;
+}
+
+//  A value written on the same line as its key (or after a dash).
+function private yamlParseInlineValue(ptr YamlReader r, int indent, int depth):ptr Value {
+    int c = yamlByteAt(r, r->pos);
+    if (c == 42) {           // '*'
+        r->pos = r->pos + 1;
+        string name = yamlReadAnchorName(r);
+        ptr Value target = yamlGetAnchor(r, name);
+        if (target == null) {
+            return yamlFail(r, "unknown anchor '*" + name + "'");
+        }
+        return valCopy(r->doc, target);
+    }
+    if (c == 124 || c == 62) {     // '|' or '>'
+        return yamlParseBlockScalar(r, indent);
+    }
+    if (c == 91 || c == 123) {
+        ptr Value flow = yamlParseFlow(r, depth);
+        if (flow == null) {
+            return null;
+        }
+        // Anything after a flow collection must be a comment or end of line.
+        yamlSkipComment(r);
+        return flow;
+    }
+    if (c == 34 || c == 39) {
+        string text = yamlReadQuoted(r);
+        if (docFailed(r->doc)) {
+            return null;
+        }
+        yamlSkipComment(r);
+        return valStringRaw(r->doc, text);
+    }
+    int end = yamlLineEnd(r);
+    string text = yamlTrimPlain(r, r->pos, end);
+    r->pos = end;
+    return yamlResolvePlain(r->doc, text);
+    eof: pass;
+}
+
+//  A mapping whose first entry starts at `pos` with indentation `indent`.
+function private yamlParseMappingAt(ptr YamlReader r, int indent, int depth):ptr Value {
+    ptr Value object = valObject(r->doc);
+    if (object == null) {
+        return null;
+    }
+    while (true) {
+        if (!yamlSkipToContent(r)) {
+            return object;
+        }
+        if (yamlIndentAt(r) != indent) {
+            return object;
+        }
+        int lineEnd = yamlLineEnd(r);
+        int colon = yamlFindKeyColon(r, r->pos, lineEnd);
+        if (colon < 0) {
+            return object;
+        }
+        string key = "";
+        int first = yamlByteAt(r, r->pos);
+        if (first == 34 || first == 39) {
+            key = yamlReadQuoted(r);
+            if (docFailed(r->doc)) {
+                return null;
+            }
+        } else {
+            key = yamlTrimPlain(r, r->pos, colon);
+            r->pos = colon;
+        }
+        while (r->pos < lineEnd && yamlSpace(@(r->bytes + r->pos) as int)) {
+            r->pos = r->pos + 1;
+        }
+        if (yamlByteAt(r, r->pos) != 58) {
+            return yamlFail(r, "expected ':' after a key");
+        }
+        r->pos = r->pos + 1;
+        if (valGet(object, key) != null) {
+            return yamlFail(r, "duplicate key '" + key + "'");
+        }
+        ptr Value value = yamlReadValueAfterKey(r, indent, depth);
+        if (value == null) {
+            return null;
+        }
+        valSet(r->doc, object, key, value);
+    }
+    return object;
+    eof: pass;
+}
+
+//  A sequence whose first dash is at `pos` with indentation `indent`.
+function private yamlParseSequenceAt(ptr YamlReader r, int indent, int depth):ptr Value {
+    ptr Value array = valArray(r->doc);
+    if (array == null) {
+        return null;
+    }
+    while (true) {
+        if (!yamlSkipToContent(r)) {
+            return array;
+        }
+        if (yamlIndentAt(r) != indent) {
+            return array;
+        }
+        int c = yamlByteAt(r, r->pos);
+        if (c != 45) {
+            return array;
+        }
+        int after = yamlByteAt(r, r->pos + 1);
+        if (after >= 0 && !yamlSpace(after) && after != 10 && after != 13) {
+            // `-5` is a scalar, not a dash.
+            return array;
+        }
+        r->pos = r->pos + 1;
+        while (r->pos < r->length && yamlSpace(@(r->bytes + r->pos) as int)) {
+            r->pos = r->pos + 1;
+        }
+        int itemIndent = indent + 1;
+        int probe = r->pos;
+        while (probe < r->length && yamlSpace(@(r->bytes + probe) as int)) {
+            probe = probe + 1;
+        }
+        // The item's own indentation is where its content starts, which is what
+        // lets `- key: v` continue with `  other: v` at the same column.
+        int contentIndent = yamlIndentAt(r);
+        if (contentIndent < 0) {
+            return yamlFail(r, "tab used as indentation");
+        }
+        int start = yamlByteAt(r, r->pos);
+        ptr Value item = null;
+        if (start < 0 || start == 10 || start == 13 || start == 35) {
+            // Dash alone: the item is the block below.
+            if (yamlSkipToContent(r)) {
+                int nextIndent = yamlIndentAt(r);
+                if (nextIndent > indent) {
+                    item = yamlParseBlock(r, nextIndent, depth + 1);
+                }
+            }
+            if (item == null) {
+                item = valNull(r->doc);
+            }
+        } else if (start == 45 && yamlSpace(yamlByteAt(r, r->pos + 1))) {
+            // Nested sequence on the same line: `- - x`.
+            item = yamlParseSequenceAt(r, contentIndent, depth + 1);
+        } else {
+            int lineEnd = yamlLineEnd(r);
+            int colon = yamlFindKeyColon(r, r->pos, lineEnd);
+            if (start == 91 || start == 123 || start == 34 || start == 39 || start == 124 ||
+                start == 62 || start == 42 || start == 38) {
+                colon = -1;
+            }
+            if (colon >= 0) {
+                // `- key: value` is a mapping starting here.
+                item = yamlParseMappingAt(r, contentIndent, depth + 1);
+            } else {
+                item = yamlParseInlineValue(r, indent, depth + 1);
+            }
+        }
+        if (item == null) {
+            return null;
+        }
+        valPush(r->doc, array, item);
+    }
+    return array;
+    eof: pass;
+}
+
+//  Parses whatever is at `pos` as a block node: sequence, mapping, flow
+//  collection or a lone scalar.
+function private yamlParseBlock(ptr YamlReader r, int minIndent, int depth):ptr Value {
+    if (depth > kYamlMaxDepth) {
+        return yamlFail(r, "nesting is too deep");
+    }
+    if (!yamlSkipToContent(r)) {
+        return valNull(r->doc);
+    }
+    int indent = yamlIndentAt(r);
+    if (indent < 0) {
+        return yamlFail(r, "tab used as indentation");
+    }
+    if (indent < minIndent) {
+        return valNull(r->doc);
+    }
+    int c = yamlByteAt(r, r->pos);
+    if (c == 45 && yamlByteAt(r, r->pos + 1) == 45 && yamlByteAt(r, r->pos + 2) == 45 &&
+        yamlLineRestEmptyAt(r, r->pos + 3)) {
+        r->pos = r->pos + 3;
+        return yamlParseBlock(r, minIndent, depth);
+    }
+    if (c == 91 || c == 123) {
+        ptr Value flow = yamlParseFlow(r, depth);
+        yamlSkipComment(r);
+        return flow;
+    }
+    if (c == 124 || c == 62) {
+        return yamlParseBlockScalar(r, indent - 1);
+    }
+    if (c == 45) {
+        int after = yamlByteAt(r, r->pos + 1);
+        if (after < 0 || yamlSpace(after) || after == 10 || after == 13) {
+            return yamlParseSequenceAt(r, indent, depth);
+        }
+    }
+    int lineEnd = yamlLineEnd(r);
+    int colon = yamlFindKeyColon(r, r->pos, lineEnd);
+    if (colon >= 0) {
+        return yamlParseMappingAt(r, indent, depth);
+    }
+    return yamlParseInlineValue(r, indent - 1, depth);
+    eof: pass;
+}
+
+//===--- public entry ----------------------------------------------------===//
+
+function private yamlReaderInit(ptr YamlReader r, ptr Doc doc, string text):void {
+    r->bytes = strBytesOf(text) as ptr unsigned int8;
+    r->length = text.length;
+    r->pos = 0;
+    r->line = 1;
+    r->lineStart = 0;
+    r->doc = doc;
+    r->anchors = null;
+    r->anchorCount = 0;
+    r->anchorCapacity = 0;
+    if (text.length >= 3) {
+        if (@(r->bytes) as int == 239 && @(r->bytes + 1) as int == 187 &&
+            @(r->bytes + 2) as int == 191) {
+            r->pos = 3;
+        }
+    }
+    eof: pass;
+}
+
+//  Parses the first document in `text`. Extra documents are ignored -- use
+//  `yamlParseAll` when a stream of documents is expected.
+function yamlParse(ptr Doc doc, string text):ptr Value {
+    YamlReader reader = {null, 0, 0, 1, 0, null, null, 0, 0};
+    yamlReaderInit(#reader, doc, text);
+    ptr Value root = yamlParseBlock(#reader, 0, 0);
+    if (root == null) {
+        return null;
+    }
+    doc->root = root;
+    return root;
+    eof: pass;
+}
+
+//  Parses every document separated by `---`, returning an array. A single
+//  document yields an array of one, which keeps callers uniform.
+function yamlParseAll(ptr Doc doc, string text):ptr Value {
+    YamlReader reader = {null, 0, 0, 1, 0, null, null, 0, 0};
+    yamlReaderInit(#reader, doc, text);
+    ptr Value array = valArray(doc);
+    if (array == null) {
+        return null;
+    }
+    while (true) {
+        // Separators: `---` starts a document (and is also allowed before the
+        // first one), `...` ends the stream.
+        int before = reader.pos;
+        while (true) {
+            while (reader.pos < reader.length) {
+                int i = reader.pos;
+                while (i < reader.length && (yamlSpace(@(reader.bytes + i) as int) ||
+                                             @(reader.bytes + i) as int == 10 ||
+                                             @(reader.bytes + i) as int == 13)) {
+                    if (@(reader.bytes + i) as int == 10 || @(reader.bytes + i) as int == 13) {
+                        reader.pos = i;
+                        yamlAdvanceLine(#reader);
+                        i = reader.pos;
+                    } else {
+                        i = i + 1;
+                    }
+                }
+                reader.pos = i;
+                break;
+            }
+            if (yamlByteAt(#reader, reader.pos) == 35) {
+                yamlSkipComment(#reader);
+                continue;
+            }
+            if (yamlByteAt(#reader, reader.pos) == 45 && yamlByteAt(#reader, reader.pos + 1) == 45 &&
+                yamlByteAt(#reader, reader.pos + 2) == 45 &&
+                yamlLineRestEmptyAt(#reader, reader.pos + 3)) {
+                reader.pos = reader.pos + 3;
+                yamlAdvanceLine(#reader);
+                continue;
+            }
+            break;
+        }
+        if (!yamlSkipToContent(#reader)) {
+            return array;
+        }
+        int c = yamlByteAt(#reader, reader.pos);
+        if (c == 46 && yamlByteAt(#reader, reader.pos + 1) == 46 &&
+            yamlByteAt(#reader, reader.pos + 2) == 46) {
+            return array;      // explicit end of stream
+        }
+        int posBefore = reader.pos;
+        ptr Value item = yamlParseBlock(#reader, 0, 0);
+        if (item == null) {
+            return null;
+        }
+        if (reader.pos == posBefore) {
+            // No progress: a construct the parser cannot consume would loop
+            // forever, so this is reported instead of hanging.
+            return yamlFail(#reader, "unexpected content");
+        }
+        if (!valPush(doc, array, item)) {
+            return null;
+        }
+        if (reader.pos <= before) {
+            return array;
+        }
+    }
+    return array;
+    eof: pass;
+}
+
+//===--- serialising -----------------------------------------------------===//
+
+//  A plain scalar is safe only when it cannot be read back as something else:
+//  no leading indicator, no `: ` or ` #`, no trailing space, and not a word the
+//  resolver would turn into a number or a boolean.
+function private yamlNeedsQuotes(string text):bool {
+    if (text.length == 0) {
+        return true;
+    }
+    int first = strByteAt(text, 0);
+    if (first == 32 || first == 9) {
+        return true;
+    }
+    int last = strByteAt(text, text.length - 1);
+    if (last == 32 || last == 9) {
+        return true;
+    }
+    int markers = 45;
+    if (first == markers || first == 35 || first == 38 || first == 42 || first == 33 ||
+        first == 124 || first == 62 || first == 64 || first == 96 || first == 34 ||
+        first == 39 || first == 37 || first == 123 || first == 91 || first == 44) {
+        return true;
+    }
+    int i = 0;
+    while (i < text.length) {
+        int c = strByteAt(text, i);
+        if (c == 58) {
+            if (i + 1 >= text.length) {
+                return true;
+            }
+            int after = strByteAt(text, i + 1);
+            if (after == 32 || after == 9) {
+                return true;
+            }
+        }
+        if (c == 35 && i > 0 && strByteAt(text, i - 1) == 32) {
+            return true;
+        }
+        if (c == 10 || c == 13 || c == 9) {
+            return true;
+        }
+        i = i + 1;
+    }
+    // A value that resolves to a non-string must be quoted to stay a string.
+    if (yamlIsNullWord(text) || text == "true" || text == "false" || text == "yes" ||
+        text == "no" || text == "on" || text == "off" || text == "True" || text == "False") {
+        return true;
+    }
+    return yamlResolvePlainDummy(text) != 0;
+    eof: pass;
+}
+
+//  Returns 1 when `text` would resolve to a number, 0 otherwise. A tiny helper
+//  with no Doc, because quoting decisions must not allocate.
+function private yamlResolvePlainDummy(string text):int {
+    int i = 0;
+    int length = text.length;
+    if (length == 0) {
+        return 0;
+    }
+    int first = strByteAt(text, 0);
+    if (first == 45 || first == 43) {
+        i = 1;
+    }
+    if (i >= length) {
+        return 0;
+    }
+    while (i < length) {
+        int c = strByteAt(text, i);
+        bool ok = (c >= 48 && c <= 57) || c == 46 || c == 101 || c == 69 || c == 95 ||
+                  ((c == 43 || c == 45) && (strByteAt(text, i - 1) == 101 || strByteAt(text, i - 1) == 69));
+        if (!ok) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+    eof: pass;
+}
+
+function private yamlWriteScalar(ptr StrBuf b, ptr Value v):void {
+    if (v->kind == kValNull) {
+        sbPut(b, "null");
+        return;
+    }
+    if (v->kind == kValBool) {
+        sbPut(b, v->val.i != 0 ? "true" : "false");
+        return;
+    }
+    if (v->kind == kValInt) {
+        sbPut(b, itoa(v->val.i, 10));
+        return;
+    }
+    if (v->kind == kValFloat) {
+        if (v->val.d != v->val.d) {
+            sbPut(b, ".nan");
+            return;
+        }
+        if (v->val.d > 1.7976931348623157e308) {
+            sbPut(b, ".inf");
+            return;
+        }
+        if (v->val.d < -1.7976931348623157e308) {
+            sbPut(b, "-.inf");
+            return;
+        }
+        string text = ftoa(v->val.d);
+        bool hasDot = false;
+        int i = 0;
+        while (i < text.length) {
+            if (strByteAt(text, i) == 46) {
+                hasDot = true;
+            }
+            i = i + 1;
+        }
+        sbPut(b, text);
+        if (!hasDot) {
+            sbPut(b, ".0");
+        }
+        return;
+    }
+    string text = v->val.s;
+    if (yamlNeedsQuotes(text)) {
+        sbPutByte(b, 34);
+        int i = 0;
+        while (i < text.length) {
+            int c = strByteAt(text, i);
+            if (c == 34) {
+                sbPut(b, "\\\"");
+            } else if (c == 92) {
+                sbPut(b, "\\\\");
+            } else if (c == 10) {
+                sbPut(b, "\\n");
+            } else {
+                sbPutByte(b, c);
+            }
+            i = i + 1;
+        }
+        sbPutByte(b, 34);
+        return;
+    }
+    sbPut(b, text);
+    eof: pass;
+}
+
+//  A string holding newlines is written as a literal block: readable, and it
+//  round-trips exactly (double-quoted would turn them into escapes).
+function private yamlIsMultiline(string text):bool {
+    int i = 0;
+    while (i < text.length) {
+        int c = strByteAt(text, i);
+        if (c == 10) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+    eof: pass;
+}
+
+function private yamlWriteBlockText(ptr StrBuf b, string text, int indent):void {
+    sbPut(b, "|\n");
+    int lineStart = 0;
+    int i = 0;
+    while (i <= text.length) {
+        bool atEnd = i == text.length;
+        if (atEnd || strByteAt(text, i) == 10) {
+            if (i > lineStart) {
+                sbPutSpaces(b, indent);
+                sbPutBytes(b, strBytesOf(text) + lineStart, i - lineStart);
+                sbPutByte(b, 10);
+            } else if (!atEnd) {
+                sbPutByte(b, 10);
+            }
+            lineStart = i + 1;
+        }
+        i = i + 1;
+    }
+    eof: pass;
+}
+
+function private yamlWriteNode(ptr Doc doc, ptr StrBuf b, ptr Value v, int indent, int level):void {
+    if (v == null || v->kind == kValObject) {
+        if (v == null || v->count == 0) {
+            sbPut(b, "{}\n");
+            return;
+        }
+        int i = 0;
+        while (i < v->count) {
+            sbPutSpaces(b, indent * level);
+            string key = v->keys[i];
+            if (yamlNeedsQuotes(key)) {
+                sbPutByte(b, 34);
+                sbPut(b, key);
+                sbPutByte(b, 34);
+            } else {
+                sbPut(b, key);
+            }
+            sbPutByte(b, 58);
+            ptr Value child = v->items + i;
+            if (child->kind == kValObject && child->count > 0) {
+                sbPutByte(b, 10);
+                yamlWriteNode(doc, b, child, indent, level + 1);
+            } else if (child->kind == kValArray && child->count > 0) {
+                sbPutByte(b, 10);
+                yamlWriteNode(doc, b, child, indent, level + 1);
+            } else if (child->kind == kValString && yamlIsMultiline(child->val.s)) {
+                sbPutByte(b, 32);
+                yamlWriteBlockText(b, child->val.s, indent * (level + 1));
+            } else {
+                sbPutByte(b, 32);
+                if (child->kind == kValObject) {
+                    sbPut(b, "{}\n");
+                } else if (child->kind == kValArray) {
+                    sbPut(b, "[]\n");
+                } else {
+                    yamlWriteScalar(b, child);
+                    sbPutByte(b, 10);
+                }
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    if (v->kind == kValArray) {
+        if (v->count == 0) {
+            sbPut(b, "[]\n");
+            return;
+        }
+        int i = 0;
+        while (i < v->count) {
+            sbPutSpaces(b, indent * level);
+            sbPutByte(b, 45);
+            ptr Value child = v->items + i;
+            if (child->kind == kValObject && child->count > 0) {
+                // First key on the dash line, the rest aligned under it.
+                sbPutByte(b, 32);
+                bool first = true;
+                int k = 0;
+                while (k < child->count) {
+                    if (!first) {
+                        sbPutSpaces(b, indent * level + 2);
+                    }
+                    string key = child->keys[k];
+                    if (yamlNeedsQuotes(key)) {
+                        sbPutByte(b, 34);
+                        sbPut(b, key);
+                        sbPutByte(b, 34);
+                    } else {
+                        sbPut(b, key);
+                    }
+                    sbPutByte(b, 58);
+                    ptr Value grand = child->items + k;
+                    if ((grand->kind == kValObject && grand->count > 0) ||
+                        (grand->kind == kValArray && grand->count > 0)) {
+                        sbPutByte(b, 10);
+                        yamlWriteNode(doc, b, grand, indent, level + 2);
+                    } else {
+                        sbPutByte(b, 32);
+                        if (grand->kind == kValObject) {
+                            sbPut(b, "{}\n");
+                        } else if (grand->kind == kValArray) {
+                            sbPut(b, "[]\n");
+                        } else {
+                            yamlWriteScalar(b, grand);
+                            sbPutByte(b, 10);
+                        }
+                    }
+                    first = false;
+                    k = k + 1;
+                }
+            } else if (child->kind == kValArray && child->count > 0) {
+                sbPutByte(b, 10);
+                yamlWriteNode(doc, b, child, indent, level + 1);
+            } else if (child->kind == kValString && yamlIsMultiline(child->val.s)) {
+                sbPutByte(b, 32);
+                yamlWriteBlockText(b, child->val.s, indent * (level + 1));
+            } else {
+                sbPutByte(b, 32);
+                if (child->kind == kValObject) {
+                    sbPut(b, "{}\n");
+                } else if (child->kind == kValArray) {
+                    sbPut(b, "[]\n");
+                } else {
+                    yamlWriteScalar(b, child);
+                    sbPutByte(b, 10);
+                }
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    // A lone scalar document.
+    yamlWriteScalar(b, v);
+    sbPutByte(b, 10);
+    eof: pass;
+}
+
+//  Writes a document in block style, two spaces per level by default.
+function yamlWriteIndent(ptr Doc doc, ptr Value root, int spaces):string {
+    if (spaces <= 0) {
+        spaces = 2;
+    }
+    StrBuf b = {null, 0, 0};
+    sbInit(#b, 256);
+    yamlWriteNode(doc, #b, root, spaces, 0);
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+function yamlWrite(ptr Doc doc, ptr Value root):string {
+    return yamlWriteIndent(doc, root, 2);
+    eof: pass;
+}
+
+//  Multi-document stream: each value becomes its own `---` block.
+function yamlWriteAll(ptr Doc doc, ptr Value documents):string {
+    StrBuf b = {null, 0, 0};
+    sbInit(#b, 256);
+    if (documents != null && documents->kind == kValArray) {
+        int i = 0;
+        while (i < documents->count) {
+            if (i > 0) {
+                sbPut(#b, "---\n");
+            }
+            yamlWriteNode(doc, #b, documents->items + i, 2, 0);
+            i = i + 1;
+        }
+    }
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+//  Reads `path` and parses it. The error convention is `value.ax`'s: null means
+//  failure, `docError` says why (including "cannot open" for the file itself).
+function yamlParseFile(ptr Doc doc, string path):ptr Value {
+    string text = docReadFile(doc, path);
+    if (docFailed(doc)) {
+        return null;
+    }
+    return yamlParse(doc, text);
+    eof: pass;
+}

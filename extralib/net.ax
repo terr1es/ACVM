@@ -1,0 +1,213 @@
+//  net.ax — the layer above the syscalls.
+//
+//  net.axd declares the transport: handles, timeouts, errno. This file builds the
+//  things a program actually wants on top of it:
+//
+//    * calls that open and close inside one function, so they cannot leak a
+//      handle even though the language has no `defer`;
+//    * reading a whole response until the peer closes, which is the shape of
+//      every request/response protocol;
+//    * error text as a `string`, so a failure can be printed without the caller
+//      juggling a buffer.
+//
+//  Everything here is ordinary Axiom. Nothing in this file could not have been
+//  written in a program that imports `net`.
+//
+//  ── the one rule ──────────────────────────────────────────────────────────
+//
+//  If you hold a handle, you close it. There is no finaliser. The functions in
+//  this file either do not hand one out (`fetchAll`, `exchange`) or close the one
+//  they opened before returning. A handle that escapes from `tcpConnect` is the
+//  caller's responsibility, and a `return` in the middle of a function is where
+//  leaks come from:
+//
+//      int64 fd = tcpConnect(host, port, 5000);
+//      if (fd < 0) { return; }          // nothing to close yet
+//      if (!tcpSend(fd, request)) {
+//          tcpClose(fd);                 // every failure path closes too
+//          return;
+//      }
+//      ...
+//      tcpClose(fd);
+//
+//  ── buffer convention ─────────────────────────────────────────────────────
+//
+//  `capacity` is a **byte** count and the buffer is `ptr unsigned int8`, whose
+//  elements are exactly one byte. So the count, the allocation and the offsets all
+//  speak the same unit:
+//
+//      unsigned int8[4096] buffer;
+//      int n = tcpRecv(fd, #buffer[0], 4096);
+//      string text = makeString(buffer as ptr char, n);
+//
+//  `ptr char` would be wrong here even though `io` uses it: a `char` element is two
+//  bytes wide, so appending a second chunk at `buffer + total` would stride by two
+//  bytes per byte of data and leave a hole. One-byte elements keep it linear.
+//
+//  The `as ptr char` is a view change, not a conversion: `makeString` wants the
+//  character type, and the bytes are already in the order it expects.
+
+//  depends: (none)
+//
+//  `net.ax` imports nothing -- not even `value`. That is deliberate: it is the
+//  bottom of the stack, so a program that only wants a socket does not pull in an
+//  arena, a value tree and seven parsers.
+
+// ─── error text ───────────────────────────────────────────────────────────
+
+//  A readable description of the last failure on this thread. Empty when nothing
+//  failed, which reads correctly in a message: "connect failed: connection
+//  refused" and "connect failed: " would be worse than an empty tail.
+//
+//  The buffer is fixed at 128 bytes because every message `netErrorText` produces
+//  is a short phrase; a caller that needs more is looking at the wrong number.
+module "net" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function netErrorString():string {
+    unsigned int8[128] buffer;
+    int n = netErrorText(netLastError() as int, #buffer[0], 128);
+    if (n <= 0) {
+        return "";
+    }
+    return makeString(#buffer[0] as ptr char, n);
+}
+
+//  "connect failed: connection refused", or "connect failed: timed out".
+//  `what` names the operation; the reason comes from the platform.
+function netFailure(string what):string {
+    if (netTimedOut()) {
+        return what + " failed: timed out";
+    }
+    return what + " failed: " + netErrorString();
+}
+
+// ─── one-call client ──────────────────────────────────────────────────────
+
+//  Connects, sends `request`, half-closes, and reads the reply until the peer
+//  closes -- then closes the handle. Returns the reply, or "" on failure.
+//
+//  This is the shape of a request/response protocol (HTTP, SMTP, Redis, most
+//  line-oriented services): send one thing, read everything back, disconnect. It
+//  is also the only form that **cannot leak**: the handle is opened and closed in
+//  the same function, so there is no path out of here that leaves it open.
+//
+//  `capacity` bounds the reply. A reply that does not fit returns "" rather than a
+//  truncated string: half a response is not a shorter answer, it is a wrong one,
+//  and the caller would have no way to notice.
+//
+//  The reply is built by appending each chunk, which allocates. For a large reply
+//  that is a lot of copying -- `exchangeInto` avoids it by writing into the
+//  caller's buffer instead.
+function fetchAll(string host, int port, string request, int capacity, int timeoutMs):string {
+    if (capacity <= 0) {
+        return "";
+    }
+    ptr unsigned int8 buffer = alloc(capacity) as ptr unsigned int8;
+    if (buffer == 0 as ptr unsigned int8) {
+        return "";
+    }
+    int n = exchangeInto(host, port, request, buffer, capacity, timeoutMs);
+    string result = "";
+    if (n > 0) {
+        result = makeString(buffer as ptr char, n);
+    }
+    free(buffer as ptr void);
+    return result;
+}
+
+//  `fetchAll` writing into a caller-supplied buffer instead of building a string.
+//  Returns the byte count, or -1 on any failure.
+//
+//  Use this when the reply is big or repeated: it costs one call, no per-chunk
+//  allocation, and the caller decides where the bytes land.
+function exchangeInto(string host, int port, string request, ptr unsigned int8 buffer, int capacity,
+                      int timeoutMs):int {
+    if (capacity <= 0) {
+        return -1;
+    }
+    int64 fd = tcpConnect(host, port, timeoutMs);
+    if (fd < 0) {
+        return -1;
+    }
+
+    // Every path from here to the end must close `fd`. There is no defer, so each
+    // early return closes first -- this is the one place in the module where that
+    // discipline has to be exact.
+    if (tcpSend(fd, request) < 0) {
+        tcpClose(fd);
+        return -1;
+    }
+    // Half-close so a peer that has no length prefix knows the request ended.
+    // Without it such a peer waits for more request and we wait for a reply.
+    tcpShutdownWrite(fd);
+
+    int total = 0;
+    while (total < capacity) {
+        int n = tcpRecv(fd, buffer + total, capacity - total);
+        if (n < 0) {
+            tcpClose(fd);
+            return -1;
+        }
+        if (n == 0) {
+            break;      // clean close: the reply is complete
+        }
+        total = total + n;
+    }
+
+    tcpClose(fd);
+    // A reply exactly filling the buffer might have been longer. Reporting it as
+    // complete would truncate the next byte without saying so, so this counts as
+    // "does not fit".
+    if (total >= capacity) {
+        return -1;
+    }
+    return total;
+}
+
+// ─── server-side helpers ──────────────────────────────────────────────────
+
+//  Reads until the peer closes or `capacity` is reached, appending to `result`.
+//  Returns the total byte count read, or -1 on error. The handle is **not** closed:
+//  a server keeps talking after reading a request.
+//
+//  This is the read side of a line protocol. The writer is `tcpSend`.
+function readUntilClosed(int64 fd, ptr unsigned int8 buffer, int capacity):int {
+    if (capacity <= 0) {
+        return -1;
+    }
+    int total = 0;
+    while (total < capacity) {
+        int n = tcpRecv(fd, buffer + total, capacity - total);
+        if (n < 0) {
+            return -1;
+        }
+        if (n == 0) {
+            break;
+        }
+        total = total + n;
+    }
+    return total;
+}
+
+//  The peer's address as a string, or "" when it cannot be read. Numeric only --
+//  no reverse lookup, so this is safe to call on a hot path.
+function peerAddress(int64 fd):string {
+    unsigned int8[64] buffer;
+    int n = tcpPeerAddress(fd, #buffer[0], 64);
+    if (n <= 0) {
+        return "";
+    }
+    return makeString(#buffer[0] as ptr char, n);
+}
+
+// ─── diagnostics ──────────────────────────────────────────────────────────
+
+//  True when `net.dll` loaded. A program that prints this and then fails knows
+//  whether the problem was the network or the installation.
+function netReady():bool {
+    return netAvailable();
+}

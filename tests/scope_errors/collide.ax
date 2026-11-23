@@ -1,0 +1,16 @@
+// Two imported files defining the same signature. Neither is the entry file, so
+// there is no way to tell which one the author meant -- and the winner was
+// previously decided by import order, silently.
+//
+// The failure this replaces was total but invisible: adding an unrelated
+// `import` could swap out a function the program already relied on, and the call
+// site showed no sign of it.
+
+import "collide_a.ax";
+import "collide_b.ax";
+
+function main():void {
+    print(shared(1));
+    print("\n");
+    eof: pass;
+}

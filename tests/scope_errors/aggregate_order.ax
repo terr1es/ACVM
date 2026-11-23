@@ -1,0 +1,17 @@
+// `<` is not defined for aggregates.
+//
+// It used to compile into a comparison of the two variables' *addresses*, so
+// `a < b` was true whenever `a` merely sat lower in the frame -- including when
+// their contents were equal. That is silently wrong rather than unsupported, and
+// it reached exactly the code that would trust it: sortIndicesByKey<T> and
+// isSortedByKey<T> compare keys with `>`, so a struct key was ordered by address
+// and isSortedByKey then certified the result as sorted.
+
+struct Point { int x; int y; };
+
+function main():void {
+    Point a = {1, 2};
+    Point b = {1, 2};
+    print(a < b);
+    eof: pass;
+}

@@ -1,0 +1,47 @@
+# Build output
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CMakePresets.json.user
+
+# Compiled bytecode modules
+*.axb
+*.acvm
+
+# In case a build tree is pointed at the source directory
+bin/
+
+# Editor / OS noise
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
+
+# Benchmark intermediates
+bench/build/
+
+# Shared libraries built from stdlib/ and extralib/, and compiled modules
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Editor extension packages. Distributed through releases, not the repository:
+# a committed .vsix is a binary blob that goes stale silently.
+*.vsix
+
+# Temporary files that should never have been committed
+*.bak
+*.orig
+*.rej
+*~
+*.swp
+*.tmp

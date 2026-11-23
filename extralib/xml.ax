@@ -1,0 +1,1006 @@
+//  xml.ax -- reading and writing XML.
+//
+//      function import (return:(xml));
+//
+//      Doc d = docNew(0);
+//      ptr XmlNode root = xmlParse(#d, "<cfg><db host=\"h\" port=\"5432\"/></cfg>");
+//      ptr XmlNode db = xmlChild(root, "db");
+//      print(xmlAttrOf(db, "host"));        // h
+//      print(xmlWrite(#d, root, 2));
+//      docFree(#d);
+//
+//  ── why not Value ────────────────────────────────────────────────────────
+//
+//  XML is not a "map from names to values". Three things a generic value tree cannot say:
+//
+//    * **attributes and children are different kinds**. In `<a x="1">v</a>`, `x` is an
+//      attribute and `v` is content; in one object a write cannot tell them apart.
+//    * **mixed content is ordered**. `<p>hi <b>x</b>!</p>` is three runs -- text 'hi ',
+//      element b, text '!' -- and their order matters; a map flattens them into two.
+//    * **elements may repeat a name**. Sibling `<li>` nodes are normal; a map drops one.
+//
+//  Hence a separate `XmlNode` here: children are an ordered array, text is a node of
+//  kind TEXT. `xmlText` concatenates a whole subtree's text, which is what a read wants.
+//
+//  ── what is parsed ───────────────────────────────────────────────────────
+//
+//  Supported: elements, quoted attributes, text, CDATA, the five named entities and
+//  `&#NN;` / `&#xNN;`, self-closing tags, declarations, comments, DOCTYPE (skipped).
+//
+//  Not supported, and **not pretended**: DTDs and entity definitions, namespace
+//  resolution (`ns:tag` is an ordinary name), XPath. Namespace resolution means a
+//  prefix scope table, and 99% of config files treat the prefix as part of the name.
+//
+//  ── strictness ───────────────────────────────────────────────────────────
+//
+//  Unbalanced tags, a valueless attribute, an unescaped `<`, an unknown entity, more
+//  than one root: all errors with a line and column. "Best effort" turns bad into wrong.
+//
+//  depends: value
+
+module "xml" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(value));
+
+comptime int kXmlMaxDepth = 200;
+
+comptime int kXmlElement = 0;
+comptime int kXmlText = 1;
+comptime int kXmlCData = 2;
+
+struct XmlAttr {
+    string name;
+    string value;
+};
+
+struct XmlNode {
+    int kind;
+    string name;          // element name; "" for text nodes
+    string text;          // text payload for TEXT / CDATA
+    ptr XmlAttr attrs;
+    int attrCount;
+    int attrCapacity;
+    ptr XmlNode children;
+    int childCount;
+    int childCapacity;
+};
+
+struct XmlSearch {
+    string name;
+    ptr ptr XmlNode out;
+    int capacity;
+    int found;
+};
+
+struct XmlReader {
+    ptr unsigned int8 bytes;
+    int length;
+    int pos;
+    ptr Doc doc;
+    int depth;
+};
+
+//===--- construction ----------------------------------------------------===//
+
+function private xmlNewNode(ptr Doc doc, int kind):ptr XmlNode {
+    ptr XmlNode node = arenaTake(#doc->arena, sizeof(XmlNode)) as ptr XmlNode;
+    if (node == null) {
+        docFail(doc, "out of memory", 0);
+        return null;
+    }
+    node->kind = kind;
+    node->name = "";
+    node->text = "";
+    node->attrs = null;
+    node->attrCount = 0;
+    node->attrCapacity = 0;
+    node->children = null;
+    node->childCount = 0;
+    node->childCapacity = 0;
+    return node;
+    eof: pass;
+}
+
+function xmlNewElement(ptr Doc doc, string name):ptr XmlNode {
+    ptr XmlNode node = xmlNewNode(doc, kXmlElement);
+    if (node == null) {
+        return null;
+    }
+    node->name = arenaStringOfString(#doc->arena, name);
+    return node;
+    eof: pass;
+}
+
+//  Appends a child. The array is copied to a larger arena block when it grows,
+//  which is why a child pointer must be taken *after* it is attached -- see
+//  `xmlNewChild`.
+function xmlAddChild(ptr Doc doc, ptr XmlNode parent, ptr XmlNode child):bool {
+    if (parent == null || child == null) {
+        return false;
+    }
+    if (parent->childCount >= parent->childCapacity) {
+        int cap = parent->childCapacity < 4 ? 4 : parent->childCapacity * 2;
+        ptr XmlNode grown = arenaTake(#doc->arena, cap * sizeof(XmlNode)) as ptr XmlNode;
+        if (grown == null) {
+            docFail(doc, "out of memory", 0);
+            return false;
+        }
+        if (parent->childCount > 0) {
+            memcpy(grown as ptr void, parent->children as ptr void,
+                   parent->childCount * sizeof(XmlNode));
+        }
+        parent->children = grown;
+        parent->childCapacity = cap;
+    }
+    parent->children[parent->childCount] = @child;
+    parent->childCount = parent->childCount + 1;
+    return true;
+    eof: pass;
+}
+
+//  Creates an element and attaches it, returning a pointer into the parent's
+//  storage so the caller can keep adding to it.
+function xmlNewChild(ptr Doc doc, ptr XmlNode parent, string name):ptr XmlNode {
+    ptr XmlNode node = xmlNewElement(doc, name);
+    if (node == null) {
+        return null;
+    }
+    if (!xmlAddChild(doc, parent, node)) {
+        return null;
+    }
+    return parent->children + (parent->childCount - 1);
+    eof: pass;
+}
+
+function xmlSetAttr(ptr Doc doc, ptr XmlNode node, string name, string value):bool {
+    if (node == null || node->kind != kXmlElement) {
+        return false;
+    }
+    int i = 0;
+    while (i < node->attrCount) {
+        if (node->attrs[i].name == name) {
+            node->attrs[i].value = arenaStringOfString(#doc->arena, value);
+            return true;
+        }
+        i = i + 1;
+    }
+    if (node->attrCount >= node->attrCapacity) {
+        int cap = node->attrCapacity < 4 ? 4 : node->attrCapacity * 2;
+        ptr XmlAttr grown = arenaTake(#doc->arena, cap * sizeof(XmlAttr)) as ptr XmlAttr;
+        if (grown == null) {
+            return false;
+        }
+        if (node->attrCount > 0) {
+            memcpy(grown as ptr void, node->attrs as ptr void, node->attrCount * sizeof(XmlAttr));
+        }
+        node->attrs = grown;
+        node->attrCapacity = cap;
+    }
+    node->attrs[node->attrCount].name = arenaStringOfString(#doc->arena, name);
+    node->attrs[node->attrCount].value = arenaStringOfString(#doc->arena, value);
+    node->attrCount = node->attrCount + 1;
+    return true;
+    eof: pass;
+}
+
+//===--- access ----------------------------------------------------------===//
+
+function xmlAttrOf(ptr XmlNode node, string name):string {
+    if (node == null) {
+        return "";
+    }
+    int i = 0;
+    while (i < node->attrCount) {
+        if (node->attrs[i].name == name) {
+            return node->attrs[i].value;
+        }
+        i = i + 1;
+    }
+    return "";
+    eof: pass;
+}
+
+function xmlHasAttr(ptr XmlNode node, string name):bool {
+    if (node == null) {
+        return false;
+    }
+    int i = 0;
+    while (i < node->attrCount) {
+        if (node->attrs[i].name == name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+    eof: pass;
+}
+
+function xmlChildCount(ptr XmlNode node):int {
+    if (node == null) {
+        return 0;
+    }
+    return node->childCount;
+    eof: pass;
+}
+
+function xmlChildAt(ptr XmlNode node, int index):ptr XmlNode {
+    if (node == null || index < 0 || index >= node->childCount) {
+        return null;
+    }
+    return node->children + index;
+    eof: pass;
+}
+
+//  First child element with this name. Text nodes are skipped, so
+//  `xmlChild(root, "db")` works on a parent whose text is interleaved.
+function xmlChild(ptr XmlNode node, string name):ptr XmlNode {
+    if (node == null) {
+        return null;
+    }
+    int i = 0;
+    while (i < node->childCount) {
+        ptr XmlNode child = node->children + i;
+        if (child->kind == kXmlElement && child->name == name) {
+            return child;
+        }
+        i = i + 1;
+    }
+    return null;
+    eof: pass;
+}
+
+//  Descendant search, depth first. `xmlFind(root, "port")` reaches a deeply
+//  nested element without spelling out the path, which is what a config read
+//  usually wants.
+function xmlFind(ptr XmlNode node, string name):ptr XmlNode {
+    if (node == null) {
+        return null;
+    }
+    if (node->kind == kXmlElement && node->name == name) {
+        return node;
+    }
+    int i = 0;
+    while (i < node->childCount) {
+        ptr XmlNode found = xmlFind(node->children + i, name);
+        if (found != null) {
+            return found;
+        }
+        i = i + 1;
+    }
+    return null;
+    eof: pass;
+}
+
+//  Every descendant with this name, appended to `out` (an array of nodes cannot
+//  live in a Value, so the caller passes a buffer). Returns the count found.
+//
+//  A buffer keeps this allocation-free; a caller that does not know the count
+//  uses `xmlCount` first.
+function xmlFindAll(ptr XmlNode node, string name, ptr ptr XmlNode out, int capacity):int {
+    XmlSearch search;
+    search.name = name;
+    search.out = out;
+    search.capacity = capacity;
+    search.found = 0;
+    xmlCollect(node, #search);
+    return search.found;
+    eof: pass;
+}
+
+function private xmlCollect(ptr XmlNode node, ptr XmlSearch search):void {
+    if (node == null) {
+        return;
+    }
+    if (node->kind == kXmlElement && node->name == search->name) {
+        if (search->found < search->capacity) {
+            search->out[search->found] = node;
+        }
+        search->found = search->found + 1;
+    }
+    int i = 0;
+    while (i < node->childCount) {
+        xmlCollect(node->children + i, search);
+        i = i + 1;
+    }
+    eof: pass;
+}
+
+function xmlCount(ptr XmlNode node, string name):int {
+    ptr ptr XmlNode sink = null;
+    return xmlCountInto(node, name, sink, 0);
+    eof: pass;
+}
+
+function xmlCountInto(ptr XmlNode node, string name, ptr ptr XmlNode out, int capacity):int {
+    XmlSearch search;
+    search.name = name;
+    search.out = out;
+    search.capacity = capacity;
+    search.found = 0;
+    xmlCollect(node, #search);
+    return search.found;
+    eof: pass;
+}
+
+//  All descendant text, concatenated. CDATA counts as text; comments do not
+//  exist in the tree (they are dropped while parsing).
+function xmlText(ptr XmlNode node):string {
+    if (node == null) {
+        return "";
+    }
+    if (node->kind == kXmlText || node->kind == kXmlCData) {
+        return node->text;
+    }
+    if (node->childCount == 0) {
+        return "";
+    }
+    StrBuf b;
+    sbInit(#b, 64);
+    xmlCollectText(node, #b);
+    // The builder's buffer is freed by `sbFinishInto`, but the text is wanted as
+    // a plain string: since the arena outlives the buffer, copy through it.
+    return sbFinishIntoString(#b);
+    eof: pass;
+}
+
+//  Concatenation helper that returns a heap string without needing a Doc.
+//  `xmlText` is also called on subtrees whose owner is not at hand, so it cannot
+//  use `sbFinishInto`.
+function private sbFinishIntoString(ptr StrBuf b):string {
+    if (b->length == 0) {
+        sbFree(b);
+        return "";
+    }
+    string result = makeString(b->data as ptr char, b->length);
+    sbFree(b);
+    return result;
+    eof: pass;
+}
+
+function private xmlCollectText(ptr XmlNode node, ptr StrBuf b):void {
+    if (node->kind == kXmlText || node->kind == kXmlCData) {
+        sbPut(b, node->text);
+        return;
+    }
+    int i = 0;
+    while (i < node->childCount) {
+        xmlCollectText(node->children + i, b);
+        i = i + 1;
+    }
+    eof: pass;
+}
+
+//  Trimmed text of a child element: `xmlChildText(root, "port")` reads
+//  `<port> 8080 </port>` as "8080", which is what every config read needs.
+function xmlChildText(ptr XmlNode node, string name):string {
+    return trim(xmlText(xmlChild(node, name)));
+    eof: pass;
+}
+
+//===--- parsing ---------------------------------------------------------===//
+
+function private xmlFail(ptr XmlReader r, string message):ptr XmlNode {
+    docFail(r->doc, message, r->pos);
+    return null;
+    eof: pass;
+}
+
+function private xmlByteAt(ptr XmlReader r, int at):int {
+    if (at < 0 || at >= r->length) {
+        return -1;
+    }
+    return @(r->bytes + at) as int;
+    eof: pass;
+}
+
+function private xmlSpace(int b):bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+    eof: pass;
+}
+
+function private xmlSkipSpace(ptr XmlReader r):void {
+    while (r->pos < r->length && xmlSpace(@(r->bytes + r->pos) as int)) {
+        r->pos = r->pos + 1;
+    }
+    eof: pass;
+}
+
+//  Appends decoded bytes from `[from, to)` into the arena, expanding entities.
+//  Returns the string; "" on malformed entity (with an error recorded).
+function private xmlDecode(ptr XmlReader r, int from, int to):string {
+    if (to <= from) {
+        return "";
+    }
+    ptr int8 buffer = arenaTake(#r->doc->arena, to - from + 4);
+    if (buffer == null) {
+        docFail(r->doc, "out of memory", r->pos);
+        return "";
+    }
+    int out = 0;
+    int i = from;
+    while (i < to) {
+        int c = @(r->bytes + i) as int;
+        if (c != 38) {
+            @((buffer + out) as ptr unsigned int8) = ((c) & 255) as unsigned int8;
+            out = out + 1;
+            i = i + 1;
+            continue;
+        }
+        int semi = -1;
+        int scan = i + 1;
+        while (scan < to && scan - i < 12) {
+            if (@(r->bytes + scan) as int == 59) {
+                semi = scan;
+                scan = to;
+            } else {
+                scan = scan + 1;
+            }
+        }
+        if (semi < 0) {
+            r->pos = i;
+            docFail(r->doc, "unterminated entity", i);
+            return "";
+        }
+        int entityLength = semi - i - 1;
+        string name = arenaString(#r->doc->arena, (r->bytes + i + 1) as ptr int8, entityLength);
+        if (name == "lt") {
+            @((buffer + out) as ptr unsigned int8) = ((60) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (name == "gt") {
+            @((buffer + out) as ptr unsigned int8) = ((62) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (name == "amp") {
+            @((buffer + out) as ptr unsigned int8) = ((38) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (name == "quot") {
+            @((buffer + out) as ptr unsigned int8) = ((34) & 255) as unsigned int8;
+            out = out + 1;
+        } else if (name == "apos") {
+            @((buffer + out) as ptr unsigned int8) = ((39) & 255) as unsigned int8;
+            out = out + 1;
+        } else {
+            // Numeric form: &#233; or &#xE9;
+            int code = -1;
+            if (entityLength >= 2 && strByteAt(name, 0) == 35) {
+                if (strByteAt(name, 1) == 120 || strByteAt(name, 1) == 88) {
+                    int value = 0;
+                    bool ok = entityLength > 2;
+                    int k = 2;
+                    while (k < entityLength) {
+                        int digit = txtHexValue(strByteAt(name, k));
+                        if (digit < 0) {
+                            ok = false;
+                            k = entityLength;
+                        } else {
+                            value = (value << 4) | digit;
+                            k = k + 1;
+                        }
+                    }
+                    if (ok) {
+                        code = value;
+                    }
+                } else {
+                    int64 value = 0i64;
+                    string digits = substring(name, 1, entityLength);
+                    if (txtParseInt64(strBytesOf(digits), digits.length, #value) == digits.length) {
+                        code = value as int;
+                    }
+                }
+            }
+            if (code < 0) {
+                r->pos = i;
+                docFail(r->doc, "unknown entity '&" + name + ";'", i);
+                return "";
+            }
+            out = out + txtUtf8EncodeAt(buffer, out, code);
+        }
+        i = semi + 1;
+    }
+    return arenaStringTake(buffer, out);
+    eof: pass;
+}
+
+//  UTF-8 encode into an unsigned view (same helper as json.ax, kept local so the
+//  two modules stay independent).
+function private txtUtf8EncodeAt(ptr int8 at, int offset, int code):int {
+    if (code < 0 || code > 1114111 || (code >= 55296 && code <= 57343)) {
+        code = 65533;
+    }
+    ptr unsigned int8 out = at as ptr unsigned int8;
+    if (code < 128) {
+        @(out + offset) = code as unsigned int8;
+        return 1;
+    }
+    if (code < 2048) {
+        @(out + offset) = (192 | (code >> 6)) as unsigned int8;
+        @(out + offset + 1) = (128 | (code & 63)) as unsigned int8;
+        return 2;
+    }
+    if (code < 65536) {
+        @(out + offset) = (224 | (code >> 12)) as unsigned int8;
+        @(out + offset + 1) = (128 | ((code >> 6) & 63)) as unsigned int8;
+        @(out + offset + 2) = (128 | (code & 63)) as unsigned int8;
+        return 3;
+    }
+    @(out + offset) = (240 | (code >> 18)) as unsigned int8;
+    @(out + offset + 1) = (128 | ((code >> 12) & 63)) as unsigned int8;
+    @(out + offset + 2) = (128 | ((code >> 6) & 63)) as unsigned int8;
+    @(out + offset + 3) = (128 | (code & 63)) as unsigned int8;
+    return 4;
+    eof: pass;
+}
+
+//  Reads a name: letters, digits, '_', '-', '.', ':' (namespace prefixes are
+//  kept as part of the name).
+function private xmlReadName(ptr XmlReader r):string {
+    int start = r->pos;
+    while (r->pos < r->length) {
+        int c = @(r->bytes + r->pos) as int;
+        bool ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+                  c == 95 || c == 45 || c == 46 || c == 58 || c >= 128;
+        if (!ok) {
+            return arenaString(#r->doc->arena, (r->bytes + start) as ptr int8, r->pos - start);
+        }
+        r->pos = r->pos + 1;
+    }
+    return arenaString(#r->doc->arena, (r->bytes + start) as ptr int8, r->pos - start);
+    eof: pass;
+}
+
+//  Skips `<!-- ... -->` with the opening already consumed.
+function private xmlSkipComment(ptr XmlReader r):bool {
+    int i = r->pos;
+    while (i + 2 < r->length) {
+        if (@(r->bytes + i) as int == 45 && @(r->bytes + i + 1) as int == 45 &&
+            @(r->bytes + i + 2) as int == 62) {
+            r->pos = i + 3;
+            return true;
+        }
+        i = i + 1;
+    }
+    xmlFail(r, "unterminated comment");
+    return false;
+    eof: pass;
+}
+
+//  Skips `<!DOCTYPE ...>` and `<?xml ... ?>`, including a bracketed internal
+//  subset. Both are metadata for us: the tree does not carry them.
+function private xmlSkipDeclaration(ptr XmlReader r):bool {
+    int i = r->pos;
+    int brackets = 0;
+    while (i < r->length) {
+        int c = @(r->bytes + i) as int;
+        if (c == 91) {
+            brackets = brackets + 1;
+        } else if (c == 93) {
+            if (brackets > 0) {
+                brackets = brackets - 1;
+            }
+        } else if (c == 62 && brackets == 0) {
+            r->pos = i + 1;
+            return true;
+        }
+        i = i + 1;
+    }
+    xmlFail(r, "unterminated declaration");
+    return false;
+    eof: pass;
+}
+
+//  Reads one element, starting at '<'.
+function private xmlReadElement(ptr XmlReader r):ptr XmlNode {
+    if (r->depth >= kXmlMaxDepth) {
+        return xmlFail(r, "nesting is too deep");
+    }
+    if (xmlByteAt(r, r->pos) != 60) {
+        return xmlFail(r, "expected '<'");
+    }
+    r->pos = r->pos + 1;
+    string name = xmlReadName(r);
+    if (name.length == 0) {
+        return xmlFail(r, "expected an element name");
+    }
+    ptr XmlNode node = xmlNewNode(r->doc, kXmlElement);
+    if (node == null) {
+        return null;
+    }
+    node->name = name;
+
+    // ── attributes ──
+    while (true) {
+        xmlSkipSpace(r);
+        int c = xmlByteAt(r, r->pos);
+        if (c == 62) {
+            r->pos = r->pos + 1;
+            break;
+        }
+        if (c == 47) {
+            if (xmlByteAt(r, r->pos + 1) != 62) {
+                return xmlFail(r, "expected '>' after '/'");
+            }
+            r->pos = r->pos + 2;
+            return node;      // self-closing
+        }
+        if (c < 0) {
+            return xmlFail(r, "unterminated start tag");
+        }
+        string attrName = xmlReadName(r);
+        if (attrName.length == 0) {
+            return xmlFail(r, "expected an attribute name");
+        }
+        xmlSkipSpace(r);
+        if (xmlByteAt(r, r->pos) != 61) {
+            return xmlFail(r, "expected '=' after an attribute name");
+        }
+        r->pos = r->pos + 1;
+        xmlSkipSpace(r);
+        int quote = xmlByteAt(r, r->pos);
+        if (quote != 34 && quote != 39) {
+            return xmlFail(r, "expected a quoted attribute value");
+        }
+        r->pos = r->pos + 1;
+        int start = r->pos;
+        while (r->pos < r->length && xmlByteAt(r, r->pos) != quote) {
+            r->pos = r->pos + 1;
+        }
+        if (r->pos >= r->length) {
+            return xmlFail(r, "unterminated attribute value");
+        }
+        string value = xmlDecode(r, start, r->pos);
+        if (docFailed(r->doc)) {
+            return null;
+        }
+        r->pos = r->pos + 1;
+        if (!xmlSetAttr(r->doc, node, attrName, value)) {
+            return xmlFail(r, "out of memory");
+        }
+    }
+
+    // ── content ──
+    r->depth = r->depth + 1;
+    while (true) {
+        if (r->pos >= r->length) {
+            return xmlFail(r, "unterminated element <" + name + ">");
+        }
+        int c = @(r->bytes + r->pos) as int;
+        if (c == 60) {
+            // A child element, or the closing tag.
+            if (xmlByteAt(r, r->pos + 1) == 47) {
+                r->pos = r->pos + 2;
+                string closing = xmlReadName(r);
+                if (closing != name) {
+                    return xmlFail(r, "expected </" + name + ">, found </" + closing + ">");
+                }
+                xmlSkipSpace(r);
+                if (xmlByteAt(r, r->pos) != 62) {
+                    return xmlFail(r, "expected '>' in a closing tag");
+                }
+                r->pos = r->pos + 1;
+                r->depth = r->depth - 1;
+                return node;
+            }
+            if (xmlByteAt(r, r->pos + 1) == 33) {
+                // <!-- comment --> or <![CDATA[ ... ]]>
+                if (xmlByteAt(r, r->pos + 2) == 45 && xmlByteAt(r, r->pos + 3) == 45) {
+                    r->pos = r->pos + 4;
+                    if (!xmlSkipComment(r)) {
+                        return null;
+                    }
+                    continue;
+                }
+                if (xmlByteAt(r, r->pos + 2) == 91) {
+                    int start = r->pos + 9;      // past "<![CDATA["
+                    int i = start;
+                    bool closed = false;
+                    while (i + 2 < r->length) {
+                        if (@(r->bytes + i) as int == 93 && @(r->bytes + i + 1) as int == 93 &&
+                            @(r->bytes + i + 2) as int == 62) {
+                            closed = true;
+                            i = r->length;
+                        } else {
+                            i = i + 1;
+                        }
+                    }
+                    if (!closed) {
+                        return xmlFail(r, "unterminated CDATA section");
+                    }
+                    int end = i - 2;
+                    if (end < start) {
+                        end = start;
+                    }
+                    ptr XmlNode textNode = xmlNewNode(r->doc, kXmlCData);
+                    if (textNode == null) {
+                        return null;
+                    }
+                    textNode->text = arenaString(#r->doc->arena, (r->bytes + start) as ptr int8,
+                                                 end - start);
+                    xmlAddChild(r->doc, node, textNode);
+                    r->pos = end + 3;
+                    continue;
+                }
+                // Another declaration inside content: skip it.
+                r->pos = r->pos + 2;
+                if (!xmlSkipDeclaration(r)) {
+                    return null;
+                }
+                continue;
+            }
+            if (xmlByteAt(r, r->pos + 1) == 63) {
+                // Processing instruction: skip to '?>'
+                r->pos = r->pos + 2;
+                int i = r->pos;
+                bool closed = false;
+                while (i + 1 < r->length) {
+                    if (@(r->bytes + i) as int == 63 && @(r->bytes + i + 1) as int == 62) {
+                        closed = true;
+                        i = r->length;
+                    } else {
+                        i = i + 1;
+                    }
+                }
+                if (!closed) {
+                    return xmlFail(r, "unterminated processing instruction");
+                }
+                r->pos = i - 1;
+                continue;
+            }
+            ptr XmlNode child = xmlReadElement(r);
+            if (child == null) {
+                return null;
+            }
+            if (!xmlAddChild(r->doc, node, child)) {
+                return null;
+            }
+            continue;
+        }
+
+        // Text run: everything up to the next '<'.
+        int start = r->pos;
+        while (r->pos < r->length && @(r->bytes + r->pos) as int != 60) {
+            r->pos = r->pos + 1;
+        }
+        string text = xmlDecode(r, start, r->pos);
+        if (docFailed(r->doc)) {
+            return null;
+        }
+        if (text.length > 0) {
+            ptr XmlNode textNode = xmlNewNode(r->doc, kXmlText);
+            if (textNode == null) {
+                return null;
+            }
+            textNode->text = text;
+            if (!xmlAddChild(r->doc, node, textNode)) {
+                return null;
+            }
+        }
+    }
+    return null;
+    eof: pass;
+}
+
+//  Parses a document. Returns the root element, or null with the message in the
+//  document. Whitespace outside the root is ignored; text outside the root other
+//  than whitespace is an error, as the specification requires.
+function xmlParse(ptr Doc doc, string text):ptr XmlNode {
+    XmlReader reader;
+    reader.bytes = strBytesOf(text) as ptr unsigned int8;
+    reader.length = text.length;
+    reader.pos = 0;
+    reader.doc = doc;
+    reader.depth = 0;
+
+    if (text.length >= 3) {
+        if (@(reader.bytes) as int == 239 && @(reader.bytes + 1) as int == 187 &&
+            @(reader.bytes + 2) as int == 191) {
+            reader.pos = 3;
+        }
+    }
+
+    ptr XmlNode root = null;
+    while (reader.pos < reader.length) {
+        xmlSkipSpace(#reader);
+        if (reader.pos >= reader.length) {
+            break;
+        }
+        int c = @(reader.bytes + reader.pos) as int;
+        if (c != 60) {
+            docFail(doc, "text outside the root element", reader.pos);
+            return null;
+        }
+        int nextByte = xmlByteAt(#reader, reader.pos + 1);
+        if (nextByte == 63) {
+            reader.pos = reader.pos + 2;
+            if (!xmlSkipDeclaration(#reader)) {
+                return null;
+            }
+            continue;
+        }
+        if (nextByte == 33) {
+            if (xmlByteAt(#reader, reader.pos + 2) == 45 && xmlByteAt(#reader, reader.pos + 3) == 45) {
+                reader.pos = reader.pos + 4;
+                if (!xmlSkipComment(#reader)) {
+                    return null;
+                }
+                continue;
+            }
+            if (!xmlSkipDeclaration(#reader)) {
+                return null;
+            }
+            continue;
+        }
+        if (root != null) {
+            docFail(doc, "more than one root element", reader.pos);
+            return null;
+        }
+        root = xmlReadElement(#reader);
+        if (root == null) {
+            return null;
+        }
+    }
+    if (root == null) {
+        docFail(doc, "no root element", 0);
+        return null;
+    }
+    doc->root = null;
+    return root;
+    eof: pass;
+}
+
+//===--- serialising -----------------------------------------------------===//
+
+function private xmlWriteEscaped(ptr StrBuf b, string text, bool attribute):void {
+    ptr unsigned int8 bytes = strBytesOf(text) as ptr unsigned int8;
+    int i = 0;
+    while (i < text.length) {
+        int c = @(bytes + i) as int;
+        if (c == 38) {
+            sbPut(b, "&amp;");
+        } else if (c == 60) {
+            sbPut(b, "&lt;");
+        } else if (c == 62) {
+            sbPut(b, "&gt;");
+        } else if (c == 34 && attribute) {
+            sbPut(b, "&quot;");
+        } else if (c == 10 && attribute) {
+            // A raw newline inside an attribute value is normalised to a space
+            // by every parser, so it has to be escaped to survive.
+            sbPut(b, "&#10;");
+        } else {
+            sbPutByte(b, c);
+        }
+        i = i + 1;
+    }
+    eof: pass;
+}
+
+//  A whitespace-only text node carries no meaning for element-structured
+//  documents -- it is the newline and indentation the file happened to use. In
+//  pretty mode it is dropped, otherwise re-indenting would double every gap.
+function private xmlIgnorable(ptr XmlNode node):bool {
+    if (node->kind != kXmlText && node->kind != kXmlCData) {
+        return false;
+    }
+    return trim(node->text).length == 0;
+    eof: pass;
+}
+
+//  How many children a pretty writer would emit.
+function private xmlMeaningful(ptr XmlNode node, bool pretty):int {
+    if (!pretty) {
+        return node->childCount;
+    }
+    int total = 0;
+    int i = 0;
+    while (i < node->childCount) {
+        if (!xmlIgnorable(node->children + i)) {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+    eof: pass;
+}
+
+function private xmlWriteNode(ptr StrBuf b, ptr XmlNode node, int indent, int level, bool inline):void {
+    if (node->kind == kXmlText) {
+        xmlWriteEscaped(b, node->text, false);
+        return;
+    }
+    if (node->kind == kXmlCData) {
+        sbPut(b, "<![CDATA[");
+        sbPut(b, node->text);
+        sbPut(b, "]]>");
+        return;
+    }
+
+    sbPutByte(b, 60);
+    sbPut(b, node->name);
+    int i = 0;
+    while (i < node->attrCount) {
+        sbPutByte(b, 32);
+        sbPut(b, node->attrs[i].name);
+        sbPut(b, "=\"");
+        xmlWriteEscaped(b, node->attrs[i].value, true);
+        sbPutByte(b, 34);
+        i = i + 1;
+    }
+
+    bool pretty = indent > 0 && !inline;
+    int meaningful = xmlMeaningful(node, pretty);
+    if (meaningful == 0) {
+        sbPut(b, "/>");
+        return;
+    }
+    sbPutByte(b, 62);
+
+    // Any meaningful text child keeps the element on one line, including mixed
+    // content (`<p>hi <b>x</b>!</p>`). Splitting it would insert whitespace into
+    // the text, and in XML whitespace is data.
+    bool textOnly = false;
+    int k = 0;
+    while (k < node->childCount) {
+        ptr XmlNode child = node->children + k;
+        if (!xmlIgnorable(child) && (child->kind == kXmlText || child->kind == kXmlCData)) {
+            textOnly = true;
+            k = node->childCount;
+        } else {
+            k = k + 1;
+        }
+    }
+
+    if (textOnly || !pretty) {
+        int k = 0;
+        while (k < node->childCount) {
+            if (!(pretty && xmlIgnorable(node->children + k))) {
+                xmlWriteNode(b, node->children + k, indent, level + 1, true);
+            }
+            k = k + 1;
+        }
+    } else {
+        int k = 0;
+        while (k < node->childCount) {
+            if (!xmlIgnorable(node->children + k)) {
+                sbPutByte(b, 10);
+                sbPutSpaces(b, indent * (level + 1));
+                xmlWriteNode(b, node->children + k, indent, level + 1, false);
+            }
+            k = k + 1;
+        }
+        sbPutByte(b, 10);
+        sbPutSpaces(b, indent * level);
+    }
+    sbPut(b, "</");
+    sbPut(b, node->name);
+    sbPutByte(b, 62);
+    eof: pass;
+}
+
+//  Writes the tree. `indent` <= 0 gives one line; a positive value gives one
+//  element per line, two spaces per level typically.
+function xmlWrite(ptr Doc doc, ptr XmlNode root, int indent):string {
+    StrBuf b;
+    sbInit(#b, 256);
+    if (root != null) {
+        xmlWriteNode(#b, root, indent, 0, false);
+        if (indent > 0) {
+            sbPutByte(#b, 10);
+        }
+    }
+    return sbFinishInto(doc, #b);
+    eof: pass;
+}
+
+//  Reads `path` and parses it. The error convention is `value.ax`'s: null means
+//  failure, `docError` says why (including "cannot open" for the file itself).
+function xmlParseFile(ptr Doc doc, string path):ptr XmlNode {
+    string text = docReadFile(doc, path);
+    if (docFailed(doc)) {
+        return null;
+    }
+    return xmlParse(doc, text);
+    eof: pass;
+}

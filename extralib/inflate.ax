@@ -1,0 +1,700 @@
+//  inflate.ax -- DEFLATE decompression, the zlib and gzip containers.
+//
+//      function import (return:(inflate));
+//
+//      Doc d = docNew(0);
+//      ptr InflateResult r = gzipDecompress(#d, compressedBytes, compressedLength);
+//      if (r == null) { print(docError(#d)); }     // e.g. "dictionary missing"
+//      else { string text = inflateText(r); }
+//      docFree(#d);
+//
+//  ── why this exists ──────────────────────────────────────────────────────
+//
+//  HTTP servers gzip response bodies by default. A client that cannot inflate has to ask
+//  for `Accept-Encoding: identity`, which many CDNs ignore -- so `http.ax` must be able
+//  to inflate it. The 10-byte gzip header and the CRC-32 check also live in this file.
+//
+//  ── what is implemented ──────────────────────────────────────────────────
+//
+//  All of RFC 1951's **decoding** side: stored / fixed Huffman / dynamic Huffman blocks,
+//  the length and distance code tables, and bit reads that cross byte boundaries.
+//
+//  No compression (the search strategy that needs is another scale of problem, and no
+//  write path in the library needs it). No streaming API like `InflateBack`: the input
+//  here is one block of bytes (an HTTP body or a file), so one-shot into the arena wins.
+//
+//  ── output size ──────────────────────────────────────────────────────────
+//
+//  1000:1 is possible (a block of zeros), so output **must** be bounded or a 1 MB bomb
+//  eats the process. The bound is a parameter (`limit`, 64 MB by default in
+//  `gzipDecompress`), and exceeding it is an error, not a truncation: half a file is worse.
+
+//  depends: sha256, value
+
+module "inflate" version "0.1.0";
+
+//  It lets a package manager judge compatibility and answer "which version of this
+//  module do I have". Name must match the file name (the compiler checks), version
+//  must be MAJOR.MINOR.PATCH; 0.1.0 means unreleased -- API may change, not a placeholder.
+
+function import (return:(sha256));
+function import (return:(value));
+
+comptime int kInflateDefaultLimit = 64 * 1024 * 1024;
+
+//  Output goes into a growable buffer. `data` comes from the arena; a doubling leaves the
+//  old block behind, so waste is at most 2x the result -- the `Value` array trade again.
+struct InflateResult {
+    ptr unsigned int8 data;
+    int length;
+    int capacity;
+};
+
+struct InflateBits {
+    ptr unsigned int8 bytes;
+    int length;
+    int pos;          // current byte
+    int bit;          // bit within the byte (0 = lowest)
+    ptr Doc doc;
+    int limit;
+    bool failed;
+};
+
+//===--- bit reads -------------------------------------------------------===//
+
+//  Every multi-bit DEFLATE field is **low bit first**; Huffman codes are **high bit first**
+//  (the easiest thing to get backwards), so reads here are low-bit and Huffman reverses.
+function private inBitsReady(ptr InflateBits s, int count):bool {
+    return s->pos < s->length;
+    eof: pass;
+}
+
+function private inReadBits(ptr InflateBits s, int count):int {
+    int value = 0;
+    int got = 0;
+    while (got < count) {
+        if (s->pos >= s->length) {
+            s->failed = true;
+            docFail(s->doc, "unexpected end of compressed data", s->pos);
+            return 0;
+        }
+        int byte = @(s->bytes + s->pos) as int;
+        int bit = (byte >> s->bit) & 1;
+        value = value | (bit << got);
+        got = got + 1;
+        s->bit = s->bit + 1;
+        if (s->bit == 8) {
+            s->bit = 0;
+            s->pos = s->pos + 1;
+        }
+    }
+    return value;
+    eof: pass;
+}
+
+//  Discards the rest of the current byte. Stored blocks are byte-aligned.
+function private inAlignByte(ptr InflateBits s):void {
+    if (s->bit != 0) {
+        s->bit = 0;
+        s->pos = s->pos + 1;
+    }
+    eof: pass;
+}
+
+//===--- Huffman tables --------------------------------------------------===//
+
+//  A canonical Huffman table resolved by counting, exactly as RFC 1951 §3.2.2
+//  describes: `counts[len]` how many codes of each length, then the first code of
+//  each length, then each symbol's index within its length.
+//
+//  Decoding walks bit by bit and rebuilds the code, which is O(16) worst case per
+//  symbol and needs no lookup table. A table-driven decoder would be faster; this
+//  one is short enough to be obviously correct, which matters more for a
+//  decompressor that has to agree with every other implementation on the planet.
+struct Huffman {
+    int[17] counts;
+    int[288] symbols;
+};
+
+function private huffBuild(ptr Huffman h, ptr int lengths, int count):bool {
+    int i = 0;
+    while (i < 17) {
+        h->counts[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < count) {
+        int length = @(lengths + i);
+        if (length < 0 || length > 15) {
+            return false;
+        }
+        h->counts[length] = h->counts[length] + 1;
+        i = i + 1;
+    }
+    if (h->counts[0] == count) {
+        return true;      // no symbols: legal for a distance tree with no matches
+    }
+    // A complete code has exactly one more leaf than it has internal nodes; any
+    // over-subscribed set (a code with no room) is a corrupt stream.
+    int left = 1;
+    i = 1;
+    while (i < 16) {
+        left = (left << 1) - h->counts[i];
+        if (left < 0) {
+            return false;
+        }
+        i = i + 1;
+    }
+    // Offsets: where each length's symbols start in `symbols`.
+    int offsets[17] = {};
+    i = 1;
+    while (i < 16) {
+        offsets[i + 1] = offsets[i] + h->counts[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < count) {
+        int length = @(lengths + i);
+        if (length != 0) {
+            h->symbols[offsets[length]] = i;
+            offsets[length] = offsets[length] + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+    eof: pass;
+}
+
+function private huffDecode(ptr InflateBits s, ptr Huffman h):int {
+    int code = 0;
+    int first = 0;
+    int index = 0;
+    int length = 1;
+    while (length < 16) {
+        code = code | inReadBits(s, 1);
+        if (s->failed) {
+            return -1;
+        }
+        int count = h->counts[length];
+        if (code - first < count) {
+            return h->symbols[index + (code - first)];
+        }
+        index = index + count;
+        first = (first + count) << 1;
+        code = code << 1;
+        length = length + 1;
+    }
+    docFail(s->doc, "invalid Huffman code", s->pos);
+    s->failed = true;
+    return -1;
+    eof: pass;
+}
+
+//===--- output buffer ---------------------------------------------------===//
+
+function private inEnsure(ptr InflateBits s, ptr InflateResult out, int extra):bool {
+    if (out->length + extra <= out->capacity) {
+        return true;
+    }
+    if (out->length + extra > s->limit) {
+        docFail(s->doc, "decompressed size exceeds the limit of " + itoa(s->limit, 10) +
+                             " bytes", s->pos);
+        s->failed = true;
+        return false;
+    }
+    int cap = out->capacity < 4096 ? 4096 : out->capacity;
+    while (cap < out->length + extra) {
+        cap = cap * 2;
+    }
+    if (cap > s->limit) {
+        cap = s->limit;
+    }
+    ptr unsigned int8 grown = arenaTake(#s->doc->arena, cap) as ptr unsigned int8;
+    if (grown == null) {
+        docFail(s->doc, "out of memory", 0);
+        s->failed = true;
+        return false;
+    }
+    if (out->length > 0) {
+        memcpy(grown as ptr void, out->data as ptr void, out->length);
+    }
+    out->data = grown;
+    out->capacity = cap;
+    return true;
+    eof: pass;
+}
+
+function private inPutByte(ptr InflateBits s, ptr InflateResult out, int value):bool {
+    if (out->length >= out->capacity) {
+        if (!inEnsure(s, out, 1)) {
+            return false;
+        }
+    }
+    @(out->data + out->length) = (value & 255) as unsigned int8;
+    out->length = out->length + 1;
+    return true;
+    eof: pass;
+}
+
+//===--- main loop -------------------------------------------------------===//
+
+//  Length codes 257..285 and distance codes 0..29: base value plus extra bits, RFC 1951 §3.2.5.
+global int InflateLengthBase[30] = {
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0
+};
+global int InflateLengthExtra[30] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, 0
+};
+global int InflateDistBase[30] = {
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577
+};
+global int InflateDistExtra[30] = {
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+};
+
+//  The order the code lengths for the code-length alphabet are transmitted in.
+global int InflateLengthOrder[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+//  One DEFLATE stream, from `bytes[0..length)`, until the last block.
+function private inflateRawInto(ptr InflateBits s, ptr InflateResult out):bool {
+    bool last = false;
+    while (!last) {
+        last = inReadBits(s, 1) != 0;
+        if (s->failed) {
+            return false;
+        }
+        int kind = inReadBits(s, 2);
+        if (s->failed) {
+            return false;
+        }
+
+        if (kind == 0) {
+            // Stored: byte-aligned, then LEN and its one's complement. The
+            // complement is the only integrity check a stored block has, so it is
+            // verified rather than skipped.
+            inAlignByte(s);
+            if (s->pos + 4 > s->length) {
+                docFail(s->doc, "truncated stored block header", s->pos);
+                s->failed = true;
+                return false;
+            }
+            int len = (@(s->bytes + s->pos) as int) | ((@(s->bytes + s->pos + 1) as int) << 8);
+            int nlen = (@(s->bytes + s->pos + 2) as int) | ((@(s->bytes + s->pos + 3) as int) << 8);
+            s->pos = s->pos + 4;
+            if ((len ^ 65535) != nlen) {
+                docFail(s->doc, "stored block length check failed", s->pos);
+                s->failed = true;
+                return false;
+            }
+            if (s->pos + len > s->length) {
+                docFail(s->doc, "truncated stored block", s->pos);
+                s->failed = true;
+                return false;
+            }
+            if (!inEnsure(s, out, len)) {
+                return false;
+            }
+            memcpy((out->data + out->length) as ptr void, (s->bytes + s->pos) as ptr void, len);
+            out->length = out->length + len;
+            s->pos = s->pos + len;
+            continue;
+        }
+
+        if (kind == 3) {
+            docFail(s->doc, "invalid block type 3", s->pos);
+            s->failed = true;
+            return false;
+        }
+
+        Huffman lit;
+        Huffman dist;
+        if (kind == 1) {
+            // Fixed Huffman: 288 symbols with a prescribed code length pattern.
+            int lengths[288] = {};
+            int i = 0;
+            while (i < 144) {
+                lengths[i] = 8;
+                i = i + 1;
+            }
+            while (i < 256) {
+                lengths[i] = 9;
+                i = i + 1;
+            }
+            while (i < 280) {
+                lengths[i] = 7;
+                i = i + 1;
+            }
+            while (i < 288) {
+                lengths[i] = 8;
+                i = i + 1;
+            }
+            huffBuild(#lit, #lengths[0], 288);
+            int distLengths[30] = {};
+            i = 0;
+            while (i < 30) {
+                distLengths[i] = 5;
+                i = i + 1;
+            }
+            huffBuild(#dist, #distLengths[0], 30);
+        } else {
+            // Dynamic Huffman: the lengths are themselves compressed with a
+            // third tree.
+            int hlit = inReadBits(s, 5) + 257;
+            int hdist = inReadBits(s, 5) + 1;
+            int hclen = inReadBits(s, 4) + 4;
+            if (s->failed) {
+                return false;
+            }
+            if (hlit > 286 || hdist > 30) {
+                docFail(s->doc, "too many length or distance symbols", s->pos);
+                s->failed = true;
+                return false;
+            }
+            int codeLengths[19] = {};
+            int i = 0;
+            while (i < hclen) {
+                codeLengths[InflateLengthOrder[i]] = inReadBits(s, 3);
+                i = i + 1;
+            }
+            Huffman lengthTree;
+            if (!huffBuild(#lengthTree, #codeLengths[0], 19)) {
+                docFail(s->doc, "invalid code-length tree", s->pos);
+                s->failed = true;
+                return false;
+            }
+            int lengths[320] = {};
+            int total = hlit + hdist;
+            i = 0;
+            while (i < total) {
+                int symbol = huffDecode(s, #lengthTree);
+                if (s->failed) {
+                    return false;
+                }
+                if (symbol < 16) {
+                    lengths[i] = symbol;
+                    i = i + 1;
+                    continue;
+                }
+                int repeat = 0;
+                int value = 0;
+                if (symbol == 16) {
+                    if (i == 0) {
+                        docFail(s->doc, "repeat code with no previous length", s->pos);
+                        s->failed = true;
+                        return false;
+                    }
+                    value = lengths[i - 1];
+                    repeat = 3 + inReadBits(s, 2);
+                } else if (symbol == 17) {
+                    repeat = 3 + inReadBits(s, 3);
+                } else {
+                    repeat = 11 + inReadBits(s, 7);
+                }
+                if (s->failed) {
+                    return false;
+                }
+                if (i + repeat > total) {
+                    docFail(s->doc, "code length repeat runs past the table", s->pos);
+                    s->failed = true;
+                    return false;
+                }
+                int k = 0;
+                while (k < repeat) {
+                    lengths[i] = value;
+                    i = i + 1;
+                    k = k + 1;
+                }
+            }
+            // A literal/length tree must have at least one distance code; a stream
+            // with 256 lengths and nothing else is corrupt in a way that would
+            // otherwise show up as a mysterious decode failure later.
+            if (lengths[256] == 0) {
+                docFail(s->doc, "missing end-of-block code", s->pos);
+                s->failed = true;
+                return false;
+            }
+            if (!huffBuild(#lit, #lengths[0], hlit)) {
+                docFail(s->doc, "invalid literal/length tree", s->pos);
+                s->failed = true;
+                return false;
+            }
+            if (!huffBuild(#dist, #lengths[hlit], hdist)) {
+                docFail(s->doc, "invalid distance tree", s->pos);
+                s->failed = true;
+                return false;
+            }
+        }
+
+        // ── symbols ──
+        while (true) {
+            int symbol = huffDecode(s, #lit);
+            if (s->failed) {
+                return false;
+            }
+            if (symbol < 256) {
+                if (!inPutByte(s, out, symbol)) {
+                    return false;
+                }
+                continue;
+            }
+            if (symbol == 256) {
+                break;      // end of block
+            }
+            int index = symbol - 257;
+            if (index >= 29) {
+                docFail(s->doc, "invalid length code " + itoa(symbol, 10), s->pos);
+                s->failed = true;
+                return false;
+            }
+            int length = InflateLengthBase[index] + inReadBits(s, InflateLengthExtra[index]);
+            if (s->failed) {
+                return false;
+            }
+            int dcode = huffDecode(s, #dist);
+            if (s->failed) {
+                return false;
+            }
+            if (dcode < 0 || dcode >= 30) {
+                docFail(s->doc, "invalid distance code", s->pos);
+                s->failed = true;
+                return false;
+            }
+            int distance = InflateDistBase[dcode] + inReadBits(s, InflateDistExtra[dcode]);
+            if (s->failed) {
+                return false;
+            }
+            if (distance > out->length) {
+                docFail(s->doc, "distance " + itoa(distance, 10) +
+                                     " reaches before the start of the output", s->pos);
+                s->failed = true;
+                return false;
+            }
+            // Overlapping copy: a match may reference bytes it is producing, so
+            // this has to be a byte loop, not `memcpy`.
+            if (!inEnsure(s, out, length)) {
+                return false;
+            }
+            int k = 0;
+            while (k < length) {
+                int source = out->length - distance;
+                @(out->data + out->length) = @(out->data + source);
+                out->length = out->length + 1;
+                k = k + 1;
+            }
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+//===--- public entry ----------------------------------------------------===//
+
+function private inflateNew(ptr Doc d, int limit):ptr InflateResult {
+    if (limit <= 0) {
+        limit = kInflateDefaultLimit;
+    }
+    ptr InflateResult out = arenaTake(#d->arena, sizeof(InflateResult)) as ptr InflateResult;
+    if (out == null) {
+        docFail(d, "out of memory", 0);
+        return null;
+    }
+    out->data = null;
+    out->length = 0;
+    out->capacity = 0;
+    return out;
+    eof: pass;
+}
+
+//  A raw DEFLATE stream (RFC 1951), with no container header.
+function inflateRaw(ptr Doc doc, ptr unsigned int8 bytes, int length, int limit):ptr InflateResult {
+    ptr InflateResult out = inflateNew(doc, limit);
+    if (out == null) {
+        return null;
+    }
+    InflateBits s;
+    s.bytes = bytes;
+    s.length = length;
+    s.pos = 0;
+    s.bit = 0;
+    s.doc = doc;
+    s.limit = limit <= 0 ? kInflateDefaultLimit : limit;
+    s.failed = false;
+    if (!inflateRawInto(#s, out)) {
+        return null;
+    }
+    return out;
+    eof: pass;
+}
+
+//  A zlib stream (RFC 1950): 2-byte header, deflate data, Adler-32 trailer.
+//  The header's check bits and the trailer's checksum are both verified -- a
+//  wrong checksum means the bytes were corrupted somewhere, and returning them
+//  anyway would hide that.
+function zlibDecompress(ptr Doc doc, ptr unsigned int8 bytes, int length, int limit):ptr InflateResult {
+    if (length < 6) {
+        docFail(doc, "zlib stream is too short", 0);
+        return null;
+    }
+    int cmf = @(bytes) as int;
+    int flg = @(bytes + 1) as int;
+    if ((cmf & 15) != 8) {
+        docFail(doc, "zlib: compression method is not deflate", 0);
+        return null;
+    }
+    if (((cmf << 8) | flg) % 31 != 0) {
+        docFail(doc, "zlib: header check bits are wrong", 0);
+        return null;
+    }
+    if ((flg & 32) != 0) {
+        docFail(doc, "zlib: a preset dictionary is not supported", 0);
+        return null;
+    }
+    ptr InflateResult out = inflateRaw(doc, bytes + 2, length - 6, limit);
+    if (out == null) {
+        return null;
+    }
+    // Adler-32 over the output, compared with the big-endian trailer.
+    unsigned int a = 1;
+    unsigned int b = 0;
+    int i = 0;
+    while (i < out->length) {
+        a = (a + (@(out->data + i) as unsigned int)) % 65521u32;
+        b = (b + a) % 65521u32;
+        i = i + 1;
+    }
+    unsigned int computed = (b << 16) | a;
+    int at = length - 4;
+    unsigned int stored = ((@(bytes + at) as unsigned int) << 24) |
+                          ((@(bytes + at + 1) as unsigned int) << 16) |
+                          ((@(bytes + at + 2) as unsigned int) << 8) |
+                          (@(bytes + at + 3) as unsigned int);
+    if (computed != stored) {
+        docFail(doc, "zlib: Adler-32 mismatch", at);
+        return null;
+    }
+    return out;
+    eof: pass;
+}
+
+//  A gzip stream (RFC 1952): 10-byte header, optional name/comment/extra fields,
+//  deflate data, then CRC-32 and the uncompressed size.
+function gzipDecompress(ptr Doc doc, ptr unsigned int8 bytes, int length, int limit):ptr InflateResult {
+    if (length < 18) {
+        docFail(doc, "gzip stream is too short", 0);
+        return null;
+    }
+    if (@(bytes) as int != 31 || @(bytes + 1) as int != 139) {
+        docFail(doc, "not a gzip stream (bad magic)", 0);
+        return null;
+    }
+    if (@(bytes + 2) as int != 8) {
+        docFail(doc, "gzip: compression method is not deflate", 2);
+        return null;
+    }
+    int flags = @(bytes + 3) as int;
+    if ((flags & 224) != 0) {
+        docFail(doc, "gzip: reserved header flags are set", 3);
+        return null;
+    }
+    int at = 10;
+    if ((flags & 4) != 0) {
+        // FEXTRA: 2-byte length, then that many bytes.
+        if (at + 2 > length) {
+            docFail(doc, "gzip: truncated extra field", at);
+            return null;
+        }
+        int extra = (@(bytes + at) as int) | ((@(bytes + at + 1) as int) << 8);
+        at = at + 2 + extra;
+    }
+    if ((flags & 8) != 0) {
+        // FNAME: NUL-terminated. Bounded by the stream length.
+        while (at < length && @(bytes + at) as int != 0) {
+            at = at + 1;
+        }
+        at = at + 1;
+    }
+    if ((flags & 16) != 0) {
+        while (at < length && @(bytes + at) as int != 0) {
+            at = at + 1;
+        }
+        at = at + 1;
+    }
+    if ((flags & 2) != 0) {
+        at = at + 2;      // FHCRC
+    }
+    if (at + 8 > length) {
+        docFail(doc, "gzip: truncated header", at);
+        return null;
+    }
+    ptr InflateResult out = inflateRaw(doc, bytes + at, length - at - 8, limit);
+    if (out == null) {
+        return null;
+    }
+    // Trailer: CRC-32 and ISIZE, both little-endian in gzip.
+    int trailer = length - 8;
+    unsigned int crcStored = (@(bytes + trailer) as unsigned int) |
+                             ((@(bytes + trailer + 1) as unsigned int) << 8) |
+                             ((@(bytes + trailer + 2) as unsigned int) << 16) |
+                             ((@(bytes + trailer + 3) as unsigned int) << 24);
+    unsigned int crcComputed = crc32(out->data, out->length);
+    if (crcStored != crcComputed) {
+        docFail(doc, "gzip: CRC-32 mismatch", trailer);
+        return null;
+    }
+    unsigned int sizeStored = (@(bytes + trailer + 4) as unsigned int) |
+                              ((@(bytes + trailer + 5) as unsigned int) << 8) |
+                              ((@(bytes + trailer + 6) as unsigned int) << 16) |
+                              ((@(bytes + trailer + 7) as unsigned int) << 24);
+    if (sizeStored != (out->length as unsigned int)) {
+        docFail(doc, "gzip: size in the trailer does not match", trailer + 4);
+        return null;
+    }
+    return out;
+    eof: pass;
+}
+
+//===--- convenience access ----------------------------------------------===//
+
+function inflateLength(ptr InflateResult r):int {
+    if (r == null) {
+        return 0;
+    }
+    return r->length;
+    eof: pass;
+}
+
+//  The output as a string without a copy: the bytes are already in the document's
+//  arena, so this only wraps them.
+function inflateText(ptr InflateResult r):string {
+    if (r == null || r->length == 0) {
+        return "";
+    }
+    string s = "";
+    ptr string ps = #s;
+    @(ps as ptr (ptr char)) = r->data as ptr char;
+    @(((ps as ptr int8) + 8) as ptr int64) = r->length as int64;
+    return s;
+    eof: pass;
+}
+
+//  Picks the container from the first bytes: gzip magic, zlib header, or raw
+//  deflate. Used by `http.ax`, which gets told the encoding by a header but cannot
+//  always trust it.
+function inflateAuto(ptr Doc doc, ptr unsigned int8 bytes, int length, int limit):ptr InflateResult {
+    if (length >= 2 && @(bytes) as int == 31 && @(bytes + 1) as int == 139) {
+        return gzipDecompress(doc, bytes, length, limit);
+    }
+    if (length >= 2) {
+        int cmf = @(bytes) as int;
+        int flg = @(bytes + 1) as int;
+        if ((cmf & 15) == 8 && (((cmf << 8) | flg) % 31) == 0) {
+            return zlibDecompress(doc, bytes, length, limit);
+        }
+    }
+    return inflateRaw(doc, bytes, length, limit);
+    eof: pass;
+}
