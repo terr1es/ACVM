@@ -1197,3 +1197,67 @@ bool VM::trap(std::string& error, TrapKind kind, const std::string& detail) {
 }
 
 } // namespace acvm
+
+namespace acvm {
+
+//===--- bridge for generated code ---------------------------------------===//
+//
+// The three operations the JIT is allowed. Each one mirrors an interpreter path exactly;
+// if these disagree with VMStep.cpp the differential test reports it as a difference in
+// program output, which is the point.
+
+bool VM::JitBridge::loadSlot(VM& vm, std::uint64_t address, int typeIndex,
+                             std::int64_t& out) {
+    Value value;
+    if (!vm.loadScalar(address, typeIndex, value)) {
+        return false;
+    }
+    // Only 64 bit integers reach here: the lowering refuses anything wider, so a wider
+    // value would mean the two sides disagree about what was compiled.
+    if (value.tag() == Value::Tag::Float) {
+        return false;
+    }
+    out = static_cast<std::int64_t>(value.asInt());
+    return true;
+}
+
+bool VM::JitBridge::storeSlot(VM& vm, std::uint64_t address, int typeIndex,
+                              std::int64_t value) {
+    return vm.storeScalar(address, typeIndex, Value::fromInt(static_cast<Int128>(value)));
+}
+
+bool VM::JitBridge::loadThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
+                                       std::int64_t& out) {
+    if (address == 0) {
+        return false;
+    }
+    Value value;
+    if (!vm.loadScalar(address, typeIndex, value) || value.tag() == Value::Tag::Float) {
+        return false;
+    }
+    out = static_cast<std::int64_t>(value.asInt());
+    return true;
+}
+
+bool VM::JitBridge::storeThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
+                                        std::int64_t value) {
+    if (address == 0) {
+        return false;
+    }
+    return vm.storeScalar(address, typeIndex, Value::fromInt(static_cast<Int128>(value)));
+}
+
+void VM::JitBridge::returnToCaller(void* process, bool hasResult, std::int64_t result) {
+    auto& p = *static_cast<Process*>(process);
+    if (p.frames.empty()) {
+        return;
+    }
+    const std::uint64_t callerBase = p.frames.back().base;
+    p.frames.pop_back();
+    p.stackTop = callerBase;
+    if (hasResult) {
+        p.stack.push_back(Value::fromInt(static_cast<Int128>(result)));
+    }
+}
+
+} // namespace acvm

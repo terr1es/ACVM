@@ -725,6 +725,7 @@ int Driver::runSource(const std::string& path, const DriverOptions& options) {
 
     VM vm(m_out, m_err);
     vm.setAssertionsEnabled(options.assertions);
+    vm.setJitMode(options.jit ? JitMode::On : JitMode::Off);
     vm.setProgramArgs(m_programArgs);
     vm.setLibrarySearchPath(std::vector<std::string>{
         std::filesystem::path(path).parent_path().generic_string(),
@@ -757,6 +758,14 @@ void Driver::reportStats(const VM& vm, const Module& module) {
     }
     m_err << "stats: " << vm.instructionCount() << " instructions, " << module.functions.size()
           << " function(s), " << codeBytes << " bytes of code\n";
+    if (vm.jitMode() == JitMode::On) {
+        m_err << "jit: " << vm.jitCompiledCount() << " compiled, " << vm.jitRefusedCount()
+              << " refused";
+        if (!vm.jitRefusal().empty()) {
+            m_err << " (first refusal: " << vm.jitRefusal() << ')';
+        }
+        m_err << '\n';
+    }
 
     if (m_statsDetail) {
         struct Entry {
@@ -845,6 +854,7 @@ int Driver::runBytecode(const std::string& path, const DriverOptions& options) {
     }
 
     VM vm(m_out, m_err);
+    vm.setJitMode(options.jit ? JitMode::On : JitMode::Off);
     vm.setProgramArgs(m_programArgs);
     vm.setLibrarySearchPath(std::vector<std::string>{
         std::filesystem::path(path).parent_path().generic_string(),

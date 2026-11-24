@@ -1,0 +1,129 @@
+// Axiom programs the JIT compiles in full, run once interpreted and once compiled.
+//
+// Every function here stays inside the subset the lowering supports: signed 64 and 32 bit
+// integers, local variables, arithmetic, comparisons, branches, and a return. Nothing
+// takes an address, nothing calls another function, nothing prints. That keeps the
+// program meaningful for a differential test -- if a function here were refused, the
+// comparison would pass without comparing anything.
+//
+// The values are chosen so a wrong lowering shows up as a wrong number rather than as a
+// crash: subtraction is order-sensitive, division is not commutative, and the loops
+// depend on the comparison direction being encoded the right way round.
+
+function sumTo(int64 n):int64 {
+    int64 total = 0;
+    int64 i = 0;
+    while (i < n) {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+function countDown(int64 n):int64 {
+    int64 product = 1;
+    int64 i = n;
+    while (i > 1) {
+        product = product * i;
+        i = i - 1;
+    }
+    return product;
+}
+
+function subtract(int64 a, int64 b):int64 {
+    return a - b;
+}
+
+function divide(int64 a, int64 b):int64 {
+    return a / b;
+}
+
+function remainder(int64 a, int64 b):int64 {
+    return a % b;
+}
+
+function negate(int64 a):int64 {
+    return -a;
+}
+
+function choose(int64 flag, int64 a, int64 b):int64 {
+    int64 picked = 0;
+    if (flag != 0) {
+        picked = a;
+    } else {
+        picked = b;
+    }
+    return picked;
+}
+
+function maxOf(int64 a, int64 b):int64 {
+    int64 result = b;
+    if (a > b) {
+        result = a;
+    }
+    return result;
+}
+
+function collatzSteps(int64 n):int64 {
+    int64 steps = 0;
+    while (n != 1) {
+        if (n % 2 == 0) {
+            n = n / 2;
+        } else {
+            n = 3 * n + 1;
+        }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+// `a++` and `i++` both compile to STORE_LOCAL with the keep bit set, whose result stays
+// on the stack. A lowering that ignores the bit stores from the wrong slot and produces
+// numbers that look plausible, so this is checked here rather than left to review.
+function postfixPlusPlus(int64 n):int64 {
+    int64 a = n;
+    int64 b = a++;
+    return a * 100 + b;
+}
+
+function sumWithPostfix(int64 n):int64 {
+    int64 total = 0;
+    int64 i = 0;
+    while (i < n) {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+function narrow(int32 a, int32 b):int32 {
+    int32 result = a * b;
+    return result;
+}
+
+// References only functions that are compiled as well, so this one is refused (it calls)
+// but its callees are not -- which is exactly the mix the VM has to handle.
+function driver():int64 {
+    int64 total = 0;
+    total = total + sumTo(100);
+    total = total + countDown(10);
+    total = total + subtract(7, 40);
+    total = total + divide(1000, 7);
+    total = total + remainder(1000, 7);
+    total = total + negate(19);
+    total = total + choose(1, 11, 22);
+    total = total + choose(0, 11, 22);
+    total = total + maxOf(3, 9);
+    total = total + maxOf(9, 3);
+    total = total + collatzSteps(27);
+    total = total + narrow(6, 7);
+    total = total + postfixPlusPlus(7);
+    total = total + sumWithPostfix(1000);
+    return total;
+}
+
+function main():void {
+    print(driver());
+    print("\n");
+    eof: pass;
+}

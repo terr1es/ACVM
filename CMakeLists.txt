@@ -106,14 +106,22 @@ add_library(acvm_ir STATIC
     src/IR/Optimize.cpp)
 target_link_libraries(acvm_ir PUBLIC acvm_sema)
 
+# Machine code generation. No dependency on the VM: the only thing this layer knows
+# is how to make a page executable and how to spell an x86-64 instruction.
+add_library(acvm_jit STATIC
+    src/JIT/ExecutableMemory.cpp
+    src/JIT/X64Assembler.cpp)
+target_include_directories(acvm_jit PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 add_library(acvm_vm STATIC
     src/VM/VM.cpp
     src/VM/VMStep.cpp
     src/VM/VMBuiltins.cpp
+    src/VM/Jit.cpp
     # Standard library, implemented in C. Compiled as C, not C++: the point of
     # this file is that an outside implementation needs no knowledge of the VM.
     stdlib/algorithm.c)
-target_link_libraries(acvm_vm PUBLIC acvm_ir)
+target_link_libraries(acvm_vm PUBLIC acvm_ir acvm_jit)
 # The VM's BUILTIN implementations call into the stdlib modules' C code.
 target_include_directories(acvm_vm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stdlib)
 
@@ -327,6 +335,13 @@ if(ACVM_BUILD_TESTS)
     acvm_add_test(test_e2e)
     acvm_add_test(test_cli)
 
+    # The encoder is linked without the VM: a failure here is an encoding bug, never a
+    # consequence of something the interpreter did.
+    add_executable(test_jit_assembler tests/test_jit_assembler.cpp)
+    target_include_directories(test_jit_assembler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(test_jit_assembler PRIVATE acvm_jit)
+    add_test(NAME test_jit_assembler COMMAND test_jit_assembler)
+
     # Script checks come in two flavours.
     #
     # Most call stdlib/test.ax, which traps on failure -- the process exit code is
@@ -433,6 +448,25 @@ if(ACVM_BUILD_TESTS)
                      -DACVM=$<TARGET_FILE:acvm>
                      -DPROGRAM=${CMAKE_CURRENT_SOURCE_DIR}/tests/adb_passthrough.ax
                      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_adb_passthrough.cmake)
+
+    # Differential check for the JIT: every program below is run interpreted and then
+    # compiled, and the two must agree byte for byte. Only programs with no dependence on
+    # the clock or the environment are listed -- those differ between two runs of the
+    # *same* mode, so they cannot say anything about the JIT.
+    function(acvm_add_jit_diff_check name)
+        add_test(NAME ${name}_jitdiff
+                 COMMAND ${CMAKE_COMMAND}
+                         -DACVM=$<TARGET_FILE:acvm>
+                         -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/${name}.ax
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/compare_jit.cmake)
+    endfunction()
+
+    foreach(checked
+            jit_check ternary_check generics_check union_check generic_struct_check
+            methods_check int128_check astl_check algorithm_check
+            sync_check address_assign_check)
+        acvm_add_jit_diff_check(${checked})
+    endforeach()
 
     # Passing arguments is the point of this one, so it runs with some.
     acvm_add_script_check(args_check -- alpha beta "two words")

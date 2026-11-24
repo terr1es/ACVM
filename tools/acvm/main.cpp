@@ -42,6 +42,7 @@ void printUsage(std::ostream& out) {
         << "  --no-assert        Disable 'assert' checks (and their arguments)\n"
         << "  --stats            Report how many instructions the program executed\n"
         << "  --stats-detail     Also break the count down per opcode\n"
+        << "  --jit               Compile qualifying functions to machine code\n"
         << "  --adb              Run under the Axiom Debugger (interactive prompt)\n"
         << "  --break <spec>     Breakpoint: 'main', 'main:12', 'prog.ax:42', ':42'\n"
         << "  --adb-script <f>   Read debugger commands from a file (implies --adb)\n"
@@ -157,6 +158,8 @@ int main(int argc, char** argv) {
             options.assertions = false;
         } else if (arg == "--stats") {
             options.stats = true;
+        } else if (arg == "--jit") {
+            options.jit = true;
         } else if (arg == "--adb") {
             options.adb = true;
         } else if (arg == "--break") {

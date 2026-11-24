@@ -21,6 +21,10 @@ struct DriverOptions {
     bool dumpAst = false;
     bool dumpIr = false;
     bool assertions = true;
+    /// Compile hot-qualifying functions to machine code. Off by default: the JIT is
+    /// opt-in until a differential run has shown it agrees with the interpreter on
+    /// everything the test suite covers.
+    bool jit = false;
     /// Print retired instruction count after a run (performance work).
     bool stats = false;
     /// Also print the per-opcode breakdown.

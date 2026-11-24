@@ -1091,6 +1091,24 @@ VM::Step VM::step(Process& process, std::string& error) {
                 // loop so the snapshot at the top is taken again for the callee.
                 frame.ip = ip;
                 process.frames.push_back(Frame{&callee, 0, frameBase});
+
+                // Compiled code takes over here, after the frame exists and its parameters
+                // are in place. It also performs the callee's `Ret`, so on success the frame
+                // is already gone and there is nothing left to interpret. Anything the
+                // lowering refused falls through to the interpreter below, which is why the
+                // frame has to be set up first rather than inside the compiled body.
+                if (m_jit.mode == JitMode::On) {
+                    const std::size_t calleeIndex = static_cast<std::size_t>(inst.a);
+                    if (JitFunction native =
+                            m_jit.entryFor(*m_module, calleeIndex, m_jitRefusal)) {
+                        const bool ok = native(this, &process, frameBase, &error);
+                        if (!ok) {
+                            return Step::Trap;
+                        }
+                        return Step::Continue;
+                    }
+                }
+
                 reload = true;
                 break;
             }

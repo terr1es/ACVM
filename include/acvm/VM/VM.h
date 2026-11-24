@@ -2,6 +2,7 @@
 #pragma once
 
 #include "acvm/IR/Bytecode.h"
+#include "acvm/VM/Jit.h"
 #include "acvm/VM/DebugApi.h"
 
 #include <cstdint>
@@ -37,6 +38,16 @@ public:
     bool run(const Module& module, std::string& error);
 
     void setAssertionsEnabled(bool enabled) { m_assertions = enabled; }
+
+    /// Turns code generation on. `Compare` runs both implementations and traps on any
+    /// difference, which is how the lowering is validated.
+    void setJitMode(JitMode mode) { m_jit.mode = mode; }
+    [[nodiscard]] JitMode jitMode() const { return m_jit.mode; }
+    /// Functions that produced machine code, and functions that were refused.
+    [[nodiscard]] std::size_t jitCompiledCount() const { return m_jit.compiledCount(); }
+    [[nodiscard]] std::size_t jitRefusedCount() const { return m_jit.refusedCount(); }
+    /// Why the most recently refused function was refused. Empty when none was.
+    [[nodiscard]] const std::string& jitRefusal() const { return m_jitRefusal; }
 
     /// Command-line arguments the host passes to the program, i.e. everything
     /// after `--`. Held here rather than read from the process because the
@@ -113,6 +124,25 @@ public:
     static constexpr std::uint64_t kMaxMemoryBytes = 256ull * 1024 * 1024;
 
     [[nodiscard]] bool memoryExhausted() const;
+
+    /// Bridge for generated code: the entire surface the JIT is allowed to use. It is
+    /// public because `Process` is a private nested type -- living here is what lets
+    /// these three functions name it without making the whole process state public.
+    ///
+    /// Each one mirrors an interpreter path exactly. If they ever disagree, the
+    /// differential test reports it as a difference in program output, which is the
+    /// point of having it.
+    struct JitBridge {
+        static bool loadSlot(VM& vm, std::uint64_t address, int typeIndex,
+                             std::int64_t& out);
+        static bool storeSlot(VM& vm, std::uint64_t address, int typeIndex,
+                              std::int64_t value);
+        static bool loadThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
+                                       std::int64_t& out);
+        static bool storeThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
+                                        std::int64_t value);
+        static void returnToCaller(void* process, bool hasResult, std::int64_t result);
+    };
 
 private:
     struct Frame {
@@ -197,6 +227,8 @@ private:
     bool evaluateEvents(Process& current, std::string& error);
 
     bool executeBuiltin(Process& process, const Instruction& inst, std::string& error, Step& step);
+
+
     bool trap(std::string& error, TrapKind kind, const std::string& detail);
 
     const Module* m_module = nullptr;
@@ -247,6 +279,12 @@ private:
     std::vector<void*> m_externalSymbols;
     /// 1 when the entry above holds a resolved symbol.
     std::vector<char> m_externalResolved;
+
+    /// Compiled code, per module. Kept here rather than in the module so the cache
+    /// dies with the VM, which is the lifetime the executable blocks need.
+    JitCache m_jit;
+    /// Reason the last function refused to compile, for `--jit=compare` diagnostics.
+    std::string m_jitRefusal;
 
     std::vector<bool> m_eventWasTrue;
     bool m_insideEvent = false;
