@@ -44,6 +44,12 @@ void X64Assembler::emitU64(std::uint64_t value) {
     }
 }
 
+void X64Assembler::emitOperandSize(Width width) {
+    if (width == Width::Word) {
+        emitByte(0x66);
+    }
+}
+
 void X64Assembler::emitRex(bool w, int regField, int indexField, int rmField,
                            bool force) {
     const int b = (rmField >> 3) & 1;
@@ -87,6 +93,21 @@ void X64Assembler::emitModRm(std::size_t regField, Reg rm, bool isMemory,
     }
 }
 
+void X64Assembler::emitModRmSib(std::size_t regField, const MemIndex& operand) {
+    int scaleBits = 0;
+    switch (operand.scale) {
+    case 1: scaleBits = 0; break;
+    case 2: scaleBits = 1; break;
+    case 4: scaleBits = 2; break;
+    default: scaleBits = 3; break;   // 8
+    }
+    emitByte(static_cast<std::uint8_t>(kModDisp32 | ((regField & 7) << 3) | 0x04));
+    emitByte(static_cast<std::uint8_t>((scaleBits << 6) |
+                                       ((regNumber(operand.index) & 7) << 3) |
+                                       (regNumber(operand.base) & 7)));
+    emitU32(static_cast<std::uint32_t>(operand.disp));
+}
+
 //===--- data movement ---------------------------------------------------===//
 
 void X64Assembler::movImm(Reg dst, Width width, std::int64_t imm) {
@@ -113,6 +134,7 @@ void X64Assembler::mov(Reg dst, Reg src, Width width) {
     const bool w = width == Width::Qword;
     const bool byte = width == Width::Byte;
     // 0x89 /r is `MOV r/m, r`, so the source goes in the reg field.
+    emitOperandSize(width);
     emitRex(w, regNumber(src), 0, regNumber(dst),
             byte && (byteRegisterNeedsRex(regNumber(src)) ||
                     byteRegisterNeedsRex(regNumber(dst))));
@@ -122,6 +144,7 @@ void X64Assembler::mov(Reg dst, Reg src, Width width) {
 
 void X64Assembler::mov(Reg dst, const Mem& src, Width width) {
     const bool w = width == Width::Qword;
+    emitOperandSize(width);
     emitRex(w, regNumber(dst), 0, regNumber(src.base),
             width == Width::Byte && byteRegisterNeedsRex(regNumber(dst)));
     emitByte(width == Width::Byte ? 0x8A : 0x8B);
@@ -130,13 +153,46 @@ void X64Assembler::mov(Reg dst, const Mem& src, Width width) {
 
 void X64Assembler::mov(const Mem& dst, Reg src, Width width) {
     const bool w = width == Width::Qword;
+    emitOperandSize(width);
     emitRex(w, regNumber(src), 0, regNumber(dst.base),
             width == Width::Byte && byteRegisterNeedsRex(regNumber(src)));
     emitByte(width == Width::Byte ? 0x88 : 0x89);
     emitModRm(static_cast<std::size_t>(regNumber(src)), dst.base, true, dst.disp);
 }
 
+void X64Assembler::mov(Reg dst, const MemIndex& src, Width width) {
+    emitOperandSize(width);
+    emitRex(width == Width::Qword, regNumber(dst), regNumber(src.index),
+            regNumber(src.base));
+    emitByte(width == Width::Byte ? 0x8A : 0x8B);
+    emitModRmSib(static_cast<std::size_t>(regNumber(dst)), src);
+}
+
+void X64Assembler::mov(const MemIndex& dst, Reg src, Width width) {
+    emitOperandSize(width);
+    emitRex(width == Width::Qword, regNumber(src), regNumber(dst.index),
+            regNumber(dst.base));
+    emitByte(width == Width::Byte ? 0x88 : 0x89);
+    emitModRmSib(static_cast<std::size_t>(regNumber(src)), dst);
+}
+
+void X64Assembler::lea(Reg dst, const MemIndex& src) {
+    emitRex(true, regNumber(dst), regNumber(src.index), regNumber(src.base));
+    emitByte(0x8D);
+    emitModRmSib(static_cast<std::size_t>(regNumber(dst)), src);
+}
+
 void X64Assembler::movzx(Reg dst, const Mem& src, Width srcWidth) {
+    // There is no `movzx r64, r/m32`: a 32 bit load into a 32 bit register already clears
+    // the upper half, so that case is a plain `mov`. Encoding it as the 16 bit form -- the
+    // else branch here before -- read only the low two bytes of a four byte value.
+    if (srcWidth == Width::Dword) {
+        emitRex(false, regNumber(dst), 0, regNumber(src.base));
+        emitByte(0x8B);
+        emitModRm(static_cast<std::size_t>(regNumber(dst)), src.base, true, src.disp);
+        return;
+    }
+    emitOperandSize(srcWidth);
     emitRex(true, regNumber(dst), 0, regNumber(src.base));
     emitByte(0x0F);
     emitByte(srcWidth == Width::Byte ? 0xB6 : 0xB7);
@@ -144,6 +200,14 @@ void X64Assembler::movzx(Reg dst, const Mem& src, Width srcWidth) {
 }
 
 void X64Assembler::movzx(Reg dst, Reg src, Width srcWidth) {
+    if (srcWidth == Width::Dword) {
+        // `mov r32, r32` clears the upper half, which is exactly zero-extension.
+        emitRex(false, regNumber(src), 0, regNumber(dst));
+        emitByte(0x89);
+        emitModRm(static_cast<std::size_t>(regNumber(src)), dst, false, 0);
+        return;
+    }
+    emitOperandSize(srcWidth);
     emitRex(true, regNumber(dst), 0, regNumber(src));
     emitByte(0x0F);
     emitByte(srcWidth == Width::Byte ? 0xB6 : 0xB7);
@@ -151,6 +215,15 @@ void X64Assembler::movzx(Reg dst, Reg src, Width srcWidth) {
 }
 
 void X64Assembler::movsx(Reg dst, const Mem& src, Width srcWidth) {
+    // A 32 bit sign-extending load is `movsxd` (0x63), a separate opcode from the 8 and 16
+    // bit `0F BE`/`0F BF` pair.
+    if (srcWidth == Width::Dword) {
+        emitRex(true, regNumber(dst), 0, regNumber(src.base));
+        emitByte(0x63);
+        emitModRm(static_cast<std::size_t>(regNumber(dst)), src.base, true, src.disp);
+        return;
+    }
+    emitOperandSize(srcWidth);
     emitRex(true, regNumber(dst), 0, regNumber(src.base));
     emitByte(0x0F);
     emitByte(srcWidth == Width::Byte ? 0xBE : 0xBF);
@@ -158,6 +231,11 @@ void X64Assembler::movsx(Reg dst, const Mem& src, Width srcWidth) {
 }
 
 void X64Assembler::movsx(Reg dst, Reg src, Width srcWidth) {
+    if (srcWidth == Width::Dword) {
+        movsxd(dst, src);
+        return;
+    }
+    emitOperandSize(srcWidth);
     emitRex(true, regNumber(dst), 0, regNumber(src));
     emitByte(0x0F);
     emitByte(srcWidth == Width::Byte ? 0xBE : 0xBF);
@@ -292,6 +370,24 @@ void X64Assembler::shr(Reg dst, std::uint8_t count, Width width) {
     emitByte(0xC1);
     emitModRm(5, dst, false, 0);
     emitByte(count);
+}
+
+void X64Assembler::shlCl(Reg dst, Width width) {
+    emitRex(width == Width::Qword, 0, 0, regNumber(dst));
+    emitByte(0xD3);
+    emitModRm(4, dst, false, 0);
+}
+
+void X64Assembler::sarCl(Reg dst, Width width) {
+    emitRex(width == Width::Qword, 0, 0, regNumber(dst));
+    emitByte(0xD3);
+    emitModRm(7, dst, false, 0);
+}
+
+void X64Assembler::shrCl(Reg dst, Width width) {
+    emitRex(width == Width::Qword, 0, 0, regNumber(dst));
+    emitByte(0xD3);
+    emitModRm(5, dst, false, 0);
 }
 
 void X64Assembler::cqo() {

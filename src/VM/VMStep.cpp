@@ -638,6 +638,11 @@ VM::Step VM::step(Process& process, std::string& error) {
         if (process.frames.empty()) {
             return Step::Finished;
         }
+        if (process.frames.size() < m_frameFloor) {
+            // Set by the JIT while it runs an interpreted callee: stop at the moment that
+            // frame returns rather than continuing into the compiled caller's bytecode.
+            return Step::Finished;
+        }
 
         Frame& frame = process.frames.back();
         const Function& function = *frame.function;
@@ -1101,9 +1106,17 @@ VM::Step VM::step(Process& process, std::string& error) {
                     const std::size_t calleeIndex = static_cast<std::size_t>(inst.a);
                     if (JitFunction native =
                             m_jit.entryFor(*m_module, calleeIndex, m_jitRefusal)) {
-                        const bool ok = native(this, &process, frameBase, &error);
-                        if (!ok) {
+                        const std::int64_t outcome =
+                            native(this, &process, frameBase, &error);
+                        if (outcome == 0) {
                             return Step::Trap;
+                        }
+                        if (outcome == 2) {
+                            // The compiled body reached a safe point with more than one
+                            // process runnable, and wrote its own resume ip back. Handing
+                            // back Step::SafePoint is exactly what the interpreter's own
+                            // SAFE_POINT handler does.
+                            return Step::SafePoint;
                         }
                         return Step::Continue;
                     }

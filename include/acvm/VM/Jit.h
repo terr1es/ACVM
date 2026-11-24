@@ -37,8 +37,10 @@ enum class JitMode {
 /// `process` is opaque here on purpose: `VM::Process` is a private nested type and the
 /// code generator has no business reading it. Everything it needs from the process goes
 /// through the bridge helpers below.
-using JitFunction = bool (*)(VM* vm, void* process, std::uint64_t frameBase,
-                             std::string* error);
+/// Returns 0 for a trap, 1 for a normal finish, 2 for "yielded at a safe point". An int
+/// rather than a bool because the third outcome exists and has to survive a nested call.
+using JitFunction = std::int64_t (*)(VM* vm, void* process, std::uint64_t frameBase,
+                                     std::string* error);
 
 /// Per-module cache of compiled functions.
 ///
@@ -104,7 +106,55 @@ bool storeThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
                          std::int64_t value);
 
 /// Pops the frame and pushes the result, exactly as the interpreter's `Ret` does.
-void returnToCaller(void* process, bool hasResult, std::int64_t result);
+/// `resultIsPtr` matters: a string and a pointer share the same 64 bit payload but not the
+/// same tag, and printing a string that arrived as an integer prints nothing. The tag is
+/// known at compile time from the function's return type, so it is carried here rather than
+/// guessed.
+void returnToCaller(void* process, bool hasResult, std::int64_t result,
+                    bool resultIsPtr = false);
+
+/// Host pointers for every memory page `[frameBase, frameBase + frameSize)` touches.
+///
+/// Pages are never reclaimed or moved once allocated, which is what makes this sound: a
+/// compiled function can hold these for its whole lifetime. Returns the count written, or
+/// 0 if the frame needs more than `maxPages` (or a page could not be created).
+/// Reads eight raw bytes with no type interpretation. Needed for the rare frame slot that
+/// straddles a page boundary and holds a pointer: the slot's type index describes what the
+/// pointer points at, not the pointer itself, so passing it to `loadSlot` would interpret
+/// the address as data.
+bool readRaw64(VM& vm, std::uint64_t address, std::int64_t& out);
+
+int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
+                  void** out, int maxPages);
+
+/// Performs a full CALL: pushes the arguments onto the interpreter's value stack, sets up
+/// the callee's frame, and runs it -- through its compiled entry when it has one, through
+/// the interpreter when it does not. Pops the frame on return and leaves any result on the
+/// value stack, exactly as the interpreter's CALL does.
+bool callFunction(VM& vm, void* process, int functionIndex, int argc,
+                  std::string* error);
+
+/// Moves the value stack's top into `out` and pops it. Used after a call returns.
+bool popResult(void* process, std::int64_t* out, bool isPtr = false);
+
+/// Pushes one value onto the interpreter's stack. Compiled code keeps its values in
+/// native slots, but CALL reads its arguments from `process.stack`, so this is how the two
+/// representations meet.
+bool pushValue(void* process, std::int64_t value, bool isPtr = false);
+
+/// A safe point from compiled code. Records where the interpreter should resume and says
+/// whether the scheduler has to run now.
+///
+/// A safe point is where the interpreter hands control back so other processes can run.
+/// With one process there is nothing to hand control to, so the compiled path continues --
+/// which is why a single-process program never pays for this. With more than one it yields
+/// exactly where the interpreter would.
+bool safePoint(VM& vm, void* process, std::uint64_t nextIp);
+
+/// Charges `amount` instructions against the runaway-loop budget and reports whether it is
+/// exhausted. Called from compiled loop back edges, so an infinite loop still stops with a
+/// diagnosable trap rather than hanging.
+bool consumeBudget(VM& vm, std::uint64_t amount);
 
 } // namespace jitbridge
 

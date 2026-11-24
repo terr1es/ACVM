@@ -96,6 +96,39 @@ function sumWithPostfix(int64 n):int64 {
     return total;
 }
 
+// Unsigned arithmetic wraps at its declared width instead of trapping. Leaving a 64 bit
+// sum in place makes a 32 bit LCG produce a different sequence, which is exactly the kind
+// of difference that only a differential run finds.
+function lcg(unsigned int32 seed, int count):unsigned int32 {
+    unsigned int32 state = seed;
+    int i = 0;
+    while (i < count) {
+        state = state * 1664525u32 + 1013904223u32;
+        i = i + 1;
+    }
+    return state;
+}
+
+// An array indexed through a computed address: the pointer lives in a frame slot, so this
+// covers the pinned-page path and the element load behind it.
+function fillArray(ptr int data, int count):void {
+    int i = 0;
+    while (i < count) {
+        data[i] = (i * 37) % 1000 - 500;
+        i = i + 1;
+    }
+}
+
+function sumArray(ptr int data, int count):int {
+    int total = 0;
+    int i = 0;
+    while (i < count) {
+        total = total + data[i];
+        i = i + 1;
+    }
+    return total;
+}
+
 function narrow(int32 a, int32 b):int32 {
     int32 result = a * b;
     return result;
@@ -119,11 +152,24 @@ function driver():int64 {
     total = total + narrow(6, 7);
     total = total + postfixPlusPlus(7);
     total = total + sumWithPostfix(1000);
+    // Narrowed to 16 bits first, so the value always fits the signed conversion: the LCG's
+    // 32 bit result can exceed INT32_MAX and `as int` rightly refuses that.
+    total = total + (lcg(12345u32, 50) & 0xFFFFu32) as int;
     return total;
+}
+
+function arrayDriver():int {
+    // 5000 elements spans several 64 KB pages, which is what exercises the page table
+    // rather than a single pinned page.
+    int data[5000] = {0};
+    fillArray(#data[0], 5000);
+    return sumArray(#data[0], 5000) + data[0] + data[4999];
 }
 
 function main():void {
     print(driver());
+    print(" ");
+    print(arrayDriver());
     print("\n");
     eof: pass;
 }

@@ -141,7 +141,17 @@ public:
                                        std::int64_t& out);
         static bool storeThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
                                         std::int64_t value);
-        static void returnToCaller(void* process, bool hasResult, std::int64_t result);
+        static void returnToCaller(void* process, bool hasResult, std::int64_t result,
+                                   bool resultIsPtr = false);
+        static bool readRaw64(VM& vm, std::uint64_t address, std::int64_t& out);
+        static int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
+                                 void** out, int maxPages);
+        static bool callFunction(VM& vm, void* process, int functionIndex, int argc,
+                                 std::string* error);
+        static bool popResult(void* process, std::int64_t* out, bool isPtr = false);
+        static bool pushValue(void* process, std::int64_t value, bool isPtr = false);
+        static bool safePoint(VM& vm, void* process, std::uint64_t nextIp);
+        static bool consumeBudget(VM& vm, std::uint64_t amount);
     };
 
 private:
@@ -290,6 +300,11 @@ private:
     bool m_insideEvent = false;
     bool m_assertions = true;
     std::uint64_t m_budget = 0;
+    /// `step()` returns as soon as the frame stack drops below this depth. Zero normally,
+    /// which nothing can fall below; raised by the JIT while it runs an interpreted callee,
+    /// so that the run stops when *that* frame returns instead of carrying on into the
+    /// caller's bytecode -- which is compiled, so interpreting it would execute it twice.
+    std::size_t m_frameFloor = 0;
     std::uint64_t m_instructions = 0;
     std::uint64_t m_opcodeCounts[64] = {};
 };

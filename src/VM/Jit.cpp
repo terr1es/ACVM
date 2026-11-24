@@ -1,38 +1,44 @@
 //===--- Jit.cpp - lowering bytecode to x86-64 ---------------------------===//
 //
-// Level 1 of the JIT: straight-line integer code, local variables, branches, and a
-// return. No calls, no aggregates, no strings, no builtins, no floating point. A
-// function that contains any of those is refused as a whole and stays interpreted --
-// which keeps this pass small enough to review, and makes the differential test
-// meaningful, because a refused function is exactly the case the interpreter still has
-// to handle correctly.
+// The JIT compiles a whole function or refuses it. Refusal is a normal outcome: the
+// interpreter keeps running it and the program behaves identically either way. That
+// all-or-nothing rule is what keeps this pass reviewable -- a half-compiled function would
+// have to flush every live register back to memory at the unsupported instruction and
+// reload afterwards, which is where a JIT stops being simple and starts producing wrong
+// answers at the edges.
 //
-// The generated shape is:
+// Generated shape:
 //
-//   push  rbx, r12, r13, r14      save what the ABI says is ours to save
-//   sub   rsp, kFrameBytes        shadow space for calls, plus the value stack
-//   mov   rbx, rcx                VM*
-//   mov   r14, rdx                Process*
-//   mov   r12, r8                 frame base, constant for the whole function
-//   mov   r13, r9                 std::string* receiving a trap message
+//   push  rbx, rbp, r12..r15     everything the ABI says is ours to save
+//   sub   rsp, kFrameBytes
+//   mov   rbx, rcx               VM*
+//   mov   r14, rdx               Process*
+//   mov   r12, r8                frame base, invariant for the call
+//   mov   r13, r9                std::string* receiving a trap message
+//   mov   r15, r8 & 0xFFFF       the frame's offset within its page
 //
-//   ... body; values live in 8 byte slots on the native stack ...
+//   ... body; page hosts in the page table, values in 8 byte slots ...
 //
 //   add   rsp, kFrameBytes
-//   pop   r14, r13, r12, rbx
+//   pop   r15..rbx
 //   ret
 //
-// Values sit in native stack slots rather than registers at this level. That is not where
-// the design ends -- the measurement said the cost is the 32 byte `Value` copy and the
-// generic memory path, not the dispatch, so registers are the point -- but a stack slot
-// is a place where a register allocator can be dropped in later without changing a single
-// instruction selection, and it makes the first *correct* version reachable today.
+// Two decisions explain most of the code below.
 //
-// Frame slots are read and written by calling back into the VM. That is slow on purpose:
-// it makes the compiled path apply exactly the same width, sign extension and range rules
-// as the interpreter, so any difference the differential test reports is a bug in this
-// file rather than in a second implementation of the memory model. Replacing these calls
-// with a page cache is the next step, and it is the one that pays.
+// **Slot access does not call the interpreter.** The first version routed every local
+// variable read through the VM's own `loadScalar`, which made the compiled path apply
+// exactly the interpreter's width and sign rules -- good for reaching correctness, bad for
+// speed, because that call re-derives the memory type, the access width and the sign
+// extension on every access, none of which changes within a function. The type is known at
+// compile time, so the width and the extension are emitted as instructions, and the page's
+// host pointer is pinned once at entry. Pages are never reclaimed or moved, which is what
+// makes holding that pointer for the function's lifetime sound.
+//
+// **Every access keeps a guard.** A frame slot can straddle a page boundary depending on
+// where `stackTop` happened to be, which is not known at compile time. The fast path
+// assumes it does not; a compare sends the rare straddling access to the helper call. That
+// guard is the price of not being able to assume frames are page-relative, and they are
+// not: a frame base is whatever the previous frame ended at.
 
 #include "acvm/VM/Jit.h"
 
@@ -41,6 +47,7 @@
 
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace acvm {
 
@@ -64,8 +71,39 @@ bool storeThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
     return VM::JitBridge::storeThroughPointer(vm, address, typeIndex, value);
 }
 
-void returnToCaller(void* process, bool hasResult, std::int64_t result) {
-    VM::JitBridge::returnToCaller(process, hasResult, result);
+void returnToCaller(void* process, bool hasResult, std::int64_t result,
+                    bool resultIsPtr) {
+    VM::JitBridge::returnToCaller(process, hasResult, result, resultIsPtr);
+}
+
+bool readRaw64(VM& vm, std::uint64_t address, std::int64_t& out) {
+    return VM::JitBridge::readRaw64(vm, address, out);
+}
+
+int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
+                  void** out, int maxPages) {
+    return VM::JitBridge::pinFramePages(vm, frameBase, frameSize, out, maxPages);
+}
+
+bool callFunction(VM& vm, void* process, int functionIndex, int argc,
+                  std::string* error) {
+    return VM::JitBridge::callFunction(vm, process, functionIndex, argc, error);
+}
+
+bool pushValue(void* process, std::int64_t value, bool isPtr) {
+    return VM::JitBridge::pushValue(process, value, isPtr);
+}
+
+bool safePoint(VM& vm, void* process, std::uint64_t nextIp) {
+    return VM::JitBridge::safePoint(vm, process, nextIp);
+}
+
+bool consumeBudget(VM& vm, std::uint64_t amount) {
+    return VM::JitBridge::consumeBudget(vm, amount);
+}
+
+bool popResult(void* process, std::int64_t* out, bool isPtr) {
+    return VM::JitBridge::popResult(process, out, isPtr);
 }
 
 void setTrapMessage(std::string* error, const char* message) {
@@ -80,58 +118,157 @@ namespace {
 
 using jit::Cond;
 using jit::mem;
+using jit::memIndex;
 using jit::Reg;
 using jit::Width;
 using jit::X64Assembler;
 
-/// Value slots on the native stack. Axiom's expression depth is bounded by the parser and
-/// 64 is far past anything a real expression produces; going over refuses the function
-/// rather than wrapping around.
-constexpr std::size_t kMaxValueSlots = 64;
+/// Calls are off for now: see the comment at the CALL case. Named rather than literal so
+/// turning it back on is one edit and one measurement away.
+constexpr bool kCompileCalls = false;
+
+constexpr std::size_t kMaxValueSlots = 48;
+constexpr std::size_t kMaxPinnedPages = 8;
 constexpr std::size_t kSlotBytes = 8;
 constexpr std::size_t kShadowSpace = 32;
+constexpr std::size_t kPageTableOffset = kShadowSpace;
+constexpr std::size_t kValueBase = kPageTableOffset + kMaxPinnedPages * 8;
+/// One slot past the value stack, for parking a value across the address computation --
+/// which clobbers every scratch register, so a value cannot be kept in one.
+constexpr std::size_t kScratchSlot = kMaxValueSlots;
+/// Counts down a chunk of the runaway-loop budget. Kept in the frame rather than in a
+/// register so it survives the calls a loop body makes.
+constexpr std::size_t kBudgetSlot = kMaxValueSlots + 1;
+constexpr std::int32_t kBudgetChunk = 4096;
 
-/// `% 16 == 8` because the prologue pushes four registers, which leaves rsp misaligned by
-/// 8; subtracting a further 8 restores the 16 byte alignment the ABI requires at every
-/// call site. Getting this wrong produces crashes in unrelated SSE code.
+/// The prologue pushes six registers, so rsp is 8 mod 16 when the frame is subtracted.
+/// Subtracting a size that is also 8 mod 16 lands rsp on a 16 byte boundary, which the ABI
+/// requires at every call site: a misaligned stack breaks SSE spills in unrelated code and
+/// shows up as a crash far from here.
 constexpr std::size_t kFrameBytes =
-    kShadowSpace + kMaxValueSlots * kSlotBytes + 8;
+    ((kValueBase + (kMaxValueSlots + 1) * kSlotBytes + 8 + 15) / 16) * 16 + 8;
+static_assert(kFrameBytes % 16 == 8, "the frame must leave rsp 16 byte aligned");
 
 constexpr Reg kRegVm = Reg::Rbx;
 constexpr Reg kRegProcess = Reg::R14;
 constexpr Reg kRegBase = Reg::R12;
 constexpr Reg kRegError = Reg::R13;
+/// `frameBase & 0xFFFF`, needed by every slot access.
+constexpr Reg kRegPageOffset = Reg::R15;
 
-/// Argument registers, named for the ABI role rather than the register. The previous
-/// version called rcx "kRegB" and then used it as a temporary in a place where it was
-/// also the first argument -- the alias hid the collision, and the parameter was
-/// silently replaced by the VM pointer.
 constexpr Reg kArg1 = Reg::Rcx;
 constexpr Reg kArg2 = Reg::Rdx;
 constexpr Reg kArg3 = Reg::R8;
 constexpr Reg kArg4 = Reg::R9;
 
-/// Scratch that is neither an argument register nor one of the four reserved above.
-/// Caller-saved by the ABI, which is fine: nothing needs to survive a helper call except
-/// the four reserved registers.
 constexpr Reg kTmp1 = Reg::R10;
-/// A second scratch, used where two values have to stay live across one emit (the
-/// dividend and the INT64_MIN it is compared against, for instance).
 constexpr Reg kTmp2 = Reg::R11;
-
-/// General purpose accumulator, used for the value being pushed or popped.
 constexpr Reg kRegA = Reg::Rax;
 
 std::int32_t slotOffset(std::size_t index) {
-    return static_cast<std::int32_t>(kShadowSpace + index * kSlotBytes);
+    return static_cast<std::int32_t>(kValueBase + index * kSlotBytes);
 }
 
-/// Messages are static storage so the trap path can materialise their address with a
-/// single `mov imm64` instead of building a RIP-relative reference to a local.
 constexpr const char kOverflowMessage[] = "integer overflow in compiled code";
 constexpr const char kNullPointerMessage[] = "null pointer in compiled code";
 constexpr const char kDivideByZeroMessage[] = "division by zero in compiled code";
+constexpr const char kBudgetMessage[] =
+    "instruction budget exhausted (possible infinite loop)";
 
+/// The integer properties the lowering needs, resolved once per memory type.
+struct IntInfo {
+    bool supported = false;
+    bool isUnsigned = false;
+    unsigned bits = 0;
+};
+
+IntInfo intInfoOf(const Module& module, int typeIndex) {
+    IntInfo info;
+    if (typeIndex < 0 || static_cast<std::size_t>(typeIndex) >= module.memTypes.size()) {
+        return info;
+    }
+    const MemType& type = module.memTypes[static_cast<std::size_t>(typeIndex)];
+    if (type.isPtr()) {
+        // A pointer is a 64 bit unsigned value that never traps on arithmetic. Treating it
+        // as its own kind would only add branches: pointer arithmetic in Axiom is
+        // `base + index`, and the interpreter wraps it rather than trapping.
+        info.bits = 64;
+        info.isUnsigned = true;
+        info.supported = true;
+        return info;
+    }
+    if (!type.isInteger()) {
+        return info;
+    }
+    info.bits = type.bits == 0 ? static_cast<unsigned>(type.size * 8) : type.bits;
+    if (info.bits > 64 || info.bits == 0) {
+        return info;
+    }
+    info.isUnsigned = type.isUnsigned;
+    info.supported = true;
+    return info;
+}
+
+/// True when values of this type carry the Ptr tag rather than the Int tag. Strings and
+/// pointers share a payload but not a tag, and a string printed as an integer prints
+/// nothing -- which is what a lost tag looks like from the outside.
+bool isPointerType(const Module& module, int typeIndex) {
+    if (typeIndex < 0 || static_cast<std::size_t>(typeIndex) >= module.memTypes.size()) {
+        return false;
+    }
+    return module.memTypes[static_cast<std::size_t>(typeIndex)].isPtr();
+}
+
+Width widthOfBits(unsigned bits) {
+    if (bits <= 8) {
+        return Width::Byte;
+    }
+    if (bits <= 16) {
+        return Width::Word;
+    }
+    if (bits <= 32) {
+        return Width::Dword;
+    }
+    return Width::Qword;
+}
+
+/// Truncates rax to the declared width and extends it back out the way the type reads.
+///
+/// Signed narrow types hold their value sign-extended; unsigned ones hold it zero-extended.
+/// Using the signed form for both turns an `unsigned int32` result of 0x80000000 into
+/// 0xFFFFFFFF80000000, and the next comparison or shift is then wrong.
+void emitTruncateToWidth(X64Assembler& assembler, unsigned bits, bool isUnsigned) {
+    if (bits >= 64) {
+        return;
+    }
+    if (isUnsigned) {
+        assembler.movImm(Reg::R11, Width::Qword,
+                         static_cast<std::int64_t>((static_cast<std::uint64_t>(1) << bits) - 1));
+        assembler.and_(Reg::Rax, Reg::R11, Width::Qword);
+        return;
+    }
+    assembler.shl(Reg::Rax, static_cast<std::uint8_t>(64 - bits));
+    assembler.sar(Reg::Rax, static_cast<std::uint8_t>(64 - bits));
+}
+
+/// The range test the interpreter applies after every signed operation: the result must
+/// survive sign extension from the declared width. A 64 bit overflow flag alone does not
+/// notice an `int32` sum that left its type.
+void emitWidthCheck(X64Assembler& assembler, X64Assembler::Label trapExit,
+                    unsigned bits) {
+    if (bits >= 64) {
+        return;
+    }
+    if (bits == 32) {
+        assembler.movsxd(Reg::R11, Reg::Rax);
+    } else if (bits == 16) {
+        assembler.movsx(Reg::R11, Reg::Rax, Width::Word);
+    } else {
+        assembler.movsx(Reg::R11, Reg::Rax, Width::Byte);
+    }
+    assembler.cmp(Reg::R11, Reg::Rax, Width::Qword);
+    assembler.jcc(Cond::NotEqual, trapExit);
+}
 
 } // namespace
 
@@ -154,41 +291,63 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         whyNot = "return value wider than a register";
         return nullptr;
     }
-
-    // Axiom functions that are process bodies start with a SAFE_POINT and must yield;
-    // compiled code does not yield, so they stay interpreted.
+    // A process body must yield at its safe point and compiled code does not yield, so
+    // leaving these interpreted is what keeps the scheduler able to preempt them.
     if (function.isProcess) {
         whyNot = "process body (must remain preemptible)";
         return nullptr;
     }
 
-    X64Assembler assembler;
+    const std::size_t codeSize = function.code.size();
+    constexpr std::size_t kNoLabel = std::numeric_limits<std::size_t>::max();
 
+    X64Assembler assembler;
     X64Assembler::Label trapExit = assembler.newLabel();
     X64Assembler::Label nullExit = assembler.newLabel();
     X64Assembler::Label divZeroExit = assembler.newLabel();
     X64Assembler::Label failureExit = assembler.newLabel();
+    X64Assembler::Label budgetExit = assembler.newLabel();
 
     assembler.push(Reg::Rbx);
+    assembler.push(Reg::Rbp);
     assembler.push(Reg::R12);
     assembler.push(Reg::R13);
     assembler.push(Reg::R14);
+    assembler.push(Reg::R15);
     assembler.subImm(Reg::Rsp, static_cast<std::int32_t>(kFrameBytes));
-    assembler.mov(kRegVm, Reg::Rcx);
-    assembler.mov(kRegProcess, Reg::Rdx);
-    assembler.mov(kRegBase, Reg::R8);
-    assembler.mov(kRegError, Reg::R9);
+    assembler.mov(kRegVm, kArg1);
+    assembler.mov(kRegProcess, kArg2);
+    assembler.mov(kRegBase, kArg3);
+    assembler.mov(kRegError, kArg4);
 
-    const std::size_t codeSize = function.code.size();
-    constexpr std::size_t kNoLabel = std::numeric_limits<std::size_t>::max();
+    assembler.movImm(kRegA, Width::Dword, kBudgetChunk);
+    assembler.mov(mem(Reg::Rsp, slotOffset(kBudgetSlot)), kRegA);
+
+    assembler.mov(kRegPageOffset, kRegBase);
+    assembler.movImm(kTmp1, Width::Qword, 0xFFFF);
+    assembler.and_(kRegPageOffset, kTmp1, Width::Qword);
+
+    // Pin every page the frame touches: one call for the whole function. The pointers stay
+    // valid because a page is never reclaimed or moved once it exists.
+    {
+        assembler.mov(kArg1, kRegVm);
+        assembler.mov(kArg2, kRegBase);
+        assembler.movImm(kArg3, Width::Qword,
+                         static_cast<std::int64_t>(function.frameSize));
+        assembler.lea(kArg4, mem(Reg::Rsp, static_cast<std::int32_t>(kPageTableOffset)));
+        assembler.movImm(kRegA, Width::Dword, static_cast<std::int32_t>(kMaxPinnedPages));
+        // The fifth argument goes on the stack, at [rsp+32] from the callee's view: 32
+        // bytes of shadow space first. 48 rather than 40 keeps rsp 16 byte aligned, which
+        // the ABI requires at every call.
+        assembler.subImm(Reg::Rsp, 48);
+        assembler.mov(mem(Reg::Rsp, 32), kRegA);
+        assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::pinFramePages));
+        assembler.addImm(Reg::Rsp, 48);
+        assembler.test(kRegA, kRegA, Width::Byte);
+        assembler.jcc(Cond::Equal, failureExit);
+    }
+
     std::vector<X64Assembler::Label> labels(codeSize, kNoLabel);
-
-    // Jump targets are labelled up front, before any instruction is emitted. Creating
-    // one on first sight looks natural and is wrong: a backward branch names an
-    // instruction that has already been emitted, so its label would be created after the
-    // only place that could ever bind it. The assembler then refuses the whole function,
-    // which is how this bug surfaced -- as "could not produce executable code" rather
-    // than as a wrong answer.
     for (const Instruction& candidate : function.code) {
         if (candidate.op != OpCode::Jump && candidate.op != OpCode::JumpIfFalse &&
             candidate.op != OpCode::JumpIfTrue) {
@@ -204,54 +363,45 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         }
     }
 
-    // -- stack depth per instruction ---------------------------------------
+    // -- stack depth per instruction --------------------------------------
     //
-    // The depth cannot be tracked linearly. A ternary compiles to
-    //
-    //      ...  JUMP_IF_FALSE -> L      ; pops the condition
-    //           push 1                  ; true arm
-    //           JUMP -> M
-    //      L:   push 1 ; NEG            ; false arm
-    //      M:   ...
-    //
-    // Walking that straight through counts the true arm's push and then the false arm's
-    // push as well, so the merge point looks two deep when it is one. The interpreter
-    // never notices because its depth is the real stack; a compiled function has to know
-    // the depth before it emits anything.
-    //
-    // A forward pass over the control flow graph fixes it: every instruction gets the
-    // depth implied by all the edges that reach it, and a disagreement means the bytecode
-    // is not well formed for this level.
-    constexpr int kUnknownDepth = -1;
-    std::vector<int> depthAt(codeSize, kUnknownDepth);
+    // Not trackable linearly. A ternary merges two arms, so walking instructions in order
+    // counts both pushes and the merge point looks one deep too many. This is a forward
+    // pass over the control flow graph; two edges disagreeing means the bytecode is not
+    // something this level can compile, and it is refused rather than guessed.
+    constexpr int kUnknown = -1;
+    constexpr int kPoisoned = -2;
+    // Back edges -- a jump to an earlier instruction -- are where unbounded execution
+    // happens, so they are where the runaway-loop budget is charged.
+    std::vector<bool> isBackEdge(codeSize, false);
+    for (std::size_t i = 0; i < codeSize; ++i) {
+        const Instruction& candidate = function.code[i];
+        if ((candidate.op == OpCode::Jump || candidate.op == OpCode::JumpIfFalse ||
+             candidate.op == OpCode::JumpIfTrue) &&
+            candidate.a >= 0 && static_cast<std::size_t>(candidate.a) <= i) {
+            isBackEdge[i] = true;
+        }
+    }
+
+    std::vector<int> depthAt(codeSize, kUnknown);
     depthAt[0] = 0;
     {
-        // Effects are (pops, pushes). Anything with a data-dependent effect is not
-        // supported yet, and refusing here keeps the emission loop free of depth
-        // surprises.
         auto effectOf = [&](const Instruction& inst, int& pops, int& pushes) -> bool {
             pops = 0;
             pushes = 0;
             switch (inst.op) {
-            case OpCode::ConstInt:
-            case OpCode::ConstFloat:
-            case OpCode::ConstStr:
-            case OpCode::LocalAddr:
-            case OpCode::GlobalAddr:
-            case OpCode::LoadLocal:
-            case OpCode::LoadGlobal:
-            case OpCode::DerefLocal:
-            case OpCode::ArenaMark:
+            case OpCode::ConstInt: case OpCode::ConstFloat: case OpCode::ConstStr:
+            case OpCode::LocalAddr: case OpCode::GlobalAddr: case OpCode::LoadLocal:
+            case OpCode::LoadGlobal: case OpCode::DerefLocal: case OpCode::ArenaMark:
                 pushes = 1;
                 return true;
             case OpCode::Load: pops = 1; pushes = 1; return true;
             case OpCode::Store: pops = 2; return true;
-            case OpCode::StoreKeep: pops = 2; pushes = 1; return true;
-            case OpCode::StoreLocal:
-            case OpCode::StoreGlobal:
-                // `b` carries the memory type in the low byte and a keep bit at 0x100:
+            case OpCode::StoreKeep: pops = 1; return true;
+            case OpCode::StoreLocal: case OpCode::StoreGlobal:
+                // `b` holds the memory type in the low byte and a keep bit at 0x100:
                 // with the bit set the stored value stays on the stack, which is how
-                // `i++` yields the old value. Modelling the two the same way made valid
+                // `i++` yields the old value. Modelling the two alike made valid
                 // bytecode look like it underflowed.
                 pops = 1;
                 pushes = (inst.b & 0x100) != 0 ? 1 : 0;
@@ -263,25 +413,34 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             case OpCode::Mod: case OpCode::And: case OpCode::Or: case OpCode::Xor:
             case OpCode::Shl: case OpCode::Shr: case OpCode::Eq: case OpCode::Ne:
             case OpCode::Lt: case OpCode::Le: case OpCode::Gt: case OpCode::Ge:
-            case OpCode::StrEq: case OpCode::StrCmp: case OpCode::MemEq:
-            case OpCode::Concat:
                 pops = 2; pushes = 1; return true;
-            case OpCode::Neg: case OpCode::BitNot: case OpCode::Not:
-            case OpCode::Cast: case OpCode::StepLocal: case OpCode::CopyStep:
-            case OpCode::SafePoint: case OpCode::Trap: case OpCode::Halt:
-                return true;
+            case OpCode::Neg: case OpCode::BitNot: case OpCode::Not: case OpCode::Cast:
+                pops = 1; pushes = 1; return true;
+            case OpCode::StepLocal: case OpCode::CopyStep: return true;
             case OpCode::JumpIfFalse: case OpCode::JumpIfTrue: pops = 1; return true;
-            case OpCode::Jump: return true;
-            case OpCode::Ret:
-                // A void function's RET pops nothing. Assuming it always pops one made
-                // every void function look like it underflowed at its own return.
-                pops = function.returnsValue ? 1 : 0;
+            case OpCode::Jump: case OpCode::Halt: case OpCode::Trap: return true;
+            case OpCode::SafePoint:
+                // No stack effect, and it *does* flow on. Leaving it out of this switch
+                // made everything after the first safe point unreachable in the analysis
+                // -- and IRGen emits a safe point before every call, so that was every
+                // function containing a call: its epilogue stopped being emitted, and the
+                // function fell off the end with a value on the stack.
                 return true;
-            case OpCode::MemCopy: pops = 2; return true;
-            case OpCode::MemZero: pops = 1; return true;
-            case OpCode::ArenaRelease: pops = 1; return true;
+            case OpCode::Ret: pops = function.returnsValue ? 1 : 0; return true;
+            case OpCode::Builtin: return false;
+            case OpCode::Call:
+                pops = inst.b < 0 ? 0 : inst.b;
+                if (inst.a >= 0 &&
+                    static_cast<std::size_t>(inst.a) < module.functions.size()) {
+                    const Function& callee =
+                        module.functions[static_cast<std::size_t>(inst.a)];
+                    if (callee.returnsAggregate) {
+                        pops += 1;
+                    }
+                    pushes = callee.returnsValue && !callee.returnsAggregate ? 1 : 0;
+                }
+                return true;
             default:
-                // Call, Builtin: the effect depends on the callee or the builtin id.
                 return false;
             }
         };
@@ -290,54 +449,33 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         while (!work.empty()) {
             const std::size_t ip = work.back();
             work.pop_back();
-
-            // A poisoned entry means two edges disagreed about the depth, or an
-            // instruction with a data-dependent effect (Call, Builtin) left the successor
-            // unreachable. Either way the depth here is not known, and computing from it
-            // would produce a misleading "underflow" -- so stop the analysis instead.
             if (depthAt[ip] < 0) {
-                break;
+                continue;
             }
-
             const Instruction& inst = function.code[ip];
-
             int pops = 0;
             int pushes = 0;
             if (!effectOf(inst, pops, pushes)) {
-                // Unsupported opcodes are reported by the emission loop with a better
-                // message; stop the analysis rather than inventing a depth for them.
-                depthAt[ip] = depthAt[ip];
-                if (inst.op != OpCode::Jump && inst.op != OpCode::JumpIfFalse &&
-                    inst.op != OpCode::JumpIfTrue && inst.op != OpCode::Ret &&
-                    inst.op != OpCode::Halt) {
-                    continue;
-                }
+                continue;
             }
-
             const int after = depthAt[ip] - pops + pushes;
             if (after < 0) {
                 whyNot = "in '" + function.name + "': expression stack underflow at " +
-                         std::to_string(ip) + " (depth " +
-                         std::to_string(depthAt[ip]) + ", pops " + std::to_string(pops) +
-                         ", pushes " + std::to_string(pushes) + ")";
+                         std::to_string(ip);
                 return nullptr;
             }
-
             auto reach = [&](std::size_t target) {
                 if (target >= codeSize) {
                     return;
                 }
-                if (depthAt[target] == kUnknownDepth) {
+                if (depthAt[target] == kUnknown) {
                     depthAt[target] = after;
                     work.push_back(target);
                 } else if (depthAt[target] != after) {
-                    // Two edges disagree about the depth. The interpreter would not
-                    // notice -- it uses the runtime stack -- but compiled code must, so
-                    // this is refused rather than guessed.
-                    depthAt[target] = kUnknownDepth - 1;   // mark as poisoned
+                    depthAt[target] = kPoisoned;
+                    work.push_back(target);
                 }
             };
-
             const bool flowsOn = inst.op != OpCode::Jump && inst.op != OpCode::Ret &&
                                  inst.op != OpCode::Halt && inst.op != OpCode::Trap;
             if (flowsOn && ip + 1 < codeSize) {
@@ -348,92 +486,18 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 reach(static_cast<std::size_t>(inst.a));
             }
         }
+        for (std::size_t i = 0; i < codeSize; ++i) {
+            if (depthAt[i] == kPoisoned) {
+                whyNot = "in '" + function.name + "': control flow merges with two "
+                         "different stack depths at " + std::to_string(i);
+                return nullptr;
+            }
+        }
     }
 
     std::size_t depth = 0;
     std::string refusal;
     bool emittedReturn = false;
-
-    // Every target already has a label from the pre-scan above, so this is a lookup.
-    auto labelFor = [&](std::int32_t target) -> X64Assembler::Label {
-        return labels[static_cast<std::size_t>(target)];
-    };
-
-    /// Describes a memory type well enough to decide whether this level can handle it.
-    /// The two things that matter are "does it fit a 64 bit value" and "is it the signed
-    /// integer case whose lowering is implemented".
-    auto slotIsSupportedInteger = [&](int typeIndex) {
-        if (typeIndex < 0 ||
-            static_cast<std::size_t>(typeIndex) >= module.memTypes.size()) {
-            return false;
-        }
-        const MemType& type = module.memTypes[static_cast<std::size_t>(typeIndex)];
-        if (!type.isInteger()) {
-            return false;
-        }
-        const unsigned bits = type.bits == 0 ? static_cast<unsigned>(type.size * 8)
-                                             : type.bits;
-        if (bits > 64) {
-            return false;
-        }
-        // Unsigned arithmetic wraps rather than trapping, which is a different lowering
-        // with no overflow test at all. Kept out so the signed path is validated alone.
-        return !type.isUnsigned;
-    };
-
-    /// Kinds of integer a 64 bit register can hold. Comparisons need to know the
-    /// signedness because `jl` and `jb` are different instructions, while the arithmetic
-    /// lowering below only implements the signed case.
-    enum class IntKind { Unsupported, Signed, Unsigned };
-
-    auto intKindOf = [&](int typeIndex) {
-        if (typeIndex < 0 ||
-            static_cast<std::size_t>(typeIndex) >= module.memTypes.size()) {
-            return IntKind::Unsupported;
-        }
-        const MemType& type = module.memTypes[static_cast<std::size_t>(typeIndex)];
-        if (!type.isInteger()) {
-            return IntKind::Unsupported;
-        }
-        const unsigned bits = type.bits == 0 ? static_cast<unsigned>(type.size * 8)
-                                             : type.bits;
-        if (bits > 64) {
-            return IntKind::Unsupported;
-        }
-        return type.isUnsigned ? IntKind::Unsigned : IntKind::Signed;
-    };
-
-    auto bitWidthOf = [&](int typeIndex) -> unsigned {
-        if (typeIndex < 0 ||
-            static_cast<std::size_t>(typeIndex) >= module.memTypes.size()) {
-            return 64;
-        }
-        const MemType& type = module.memTypes[static_cast<std::size_t>(typeIndex)];
-        return type.bits == 0 ? static_cast<unsigned>(type.size * 8) : type.bits;
-    };
-
-    /// Emits the range check the interpreter performs after every signed operation: the
-    /// result has to fit the *declared* width, not just 64 bits. Without this an `int32`
-    /// sum that leaves the type silently keeps its 64 bit value while the interpreter
-    /// traps -- a difference that only shows up on overflow, which is why it has to be
-    /// handled here rather than discovered later.
-    ///
-    /// The test is "does the result survive sign extension from the declared width", done
-    /// with one movsx plus a compare: two instructions, no branch beyond the join.
-    auto checkFitsWidth = [&](unsigned bits) {
-        if (bits >= 64) {
-            return;   // the overflow flag from the operation already covered this
-        }
-        if (bits == 32) {
-            assembler.movsxd(kTmp1, kRegA);
-        } else if (bits == 16) {
-            assembler.movsx(kTmp1, kRegA, Width::Word);
-        } else {
-            assembler.movsx(kTmp1, kRegA, Width::Byte);
-        }
-        assembler.cmp(kTmp1, kRegA, Width::Qword);
-        assembler.jcc(Cond::NotEqual, trapExit);
-    };
 
     auto pushA = [&]() {
         if (depth >= kMaxValueSlots) {
@@ -445,17 +509,80 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         return true;
     };
 
+    /// Leaves the address of `frame + offset` in kTmp1, or jumps to `slow` when the slot
+    /// straddles a page boundary and the address cannot be formed from a pinned page.
+    ///
+    /// Clobbers rax, r10 and r11 -- every scratch register there is. A caller that needs a
+    /// value to survive has to park it in the scratch slot; keeping it in a register is
+    /// what made `i++` store 0xFFFF, the mask this uses, instead of the value.
+    auto emitSlotAddress = [&](std::int32_t offset, unsigned bits,
+                               X64Assembler::Label slow) {
+        const unsigned bytes = (bits + 7) / 8;
+        assembler.lea(kTmp1, mem(kRegPageOffset, offset));
+        assembler.mov(kTmp2, kTmp1);
+        assembler.movImm(kRegA, Width::Qword, 0xFFFF);
+        assembler.and_(kTmp2, kRegA, Width::Qword);
+        assembler.shr(kTmp1, 16, Width::Qword);
+        assembler.mov(kTmp1, memIndex(Reg::Rsp, kTmp1, 8,
+                                     static_cast<std::int32_t>(kPageTableOffset)));
+        assembler.cmpImm(kTmp2, static_cast<std::int32_t>(65536 - bytes));
+        assembler.jcc(Cond::Above, slow);
+        assembler.lea(kTmp1, memIndex(kTmp1, kTmp2, 1, 0));
+    };
+
+    auto emitHelperLoad = [&](std::int32_t offset, int typeIndex,
+                              std::size_t targetSlot) {
+        assembler.mov(kArg1, kRegVm);
+        assembler.lea(kArg2, mem(kRegBase, offset));
+        assembler.movImm(kArg3, Width::Dword, typeIndex);
+        assembler.lea(kArg4, mem(Reg::Rsp, slotOffset(targetSlot)));
+        assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::loadSlot));
+        assembler.test(kRegA, kRegA, Width::Byte);
+        assembler.jcc(Cond::Equal, failureExit);
+    };
+
+    /// Charges the runaway-loop budget once per chunk instead of once per iteration: a
+    /// decremented frame slot, one predictable branch, and a call only every 4096 loops.
+    /// The interpreter charges one per instruction, which a compiled loop cannot afford;
+    /// this keeps the same guard at a fixed cost per iteration.
+    auto emitBudgetTick = [&]() {
+        assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(kBudgetSlot)));
+        assembler.subImm(kRegA, 1);
+        assembler.mov(mem(Reg::Rsp, slotOffset(kBudgetSlot)), kRegA);
+        auto enough = assembler.newLabel();
+        assembler.test(kRegA, kRegA, Width::Byte);
+        assembler.jcc(Cond::NotEqual, enough);
+        assembler.movImm(kRegA, Width::Dword, kBudgetChunk);
+        assembler.mov(mem(Reg::Rsp, slotOffset(kBudgetSlot)), kRegA);
+        assembler.mov(kArg1, kRegVm);
+        assembler.movImm(kArg2, Width::Qword, kBudgetChunk);
+        assembler.callAbsolute(
+            reinterpret_cast<const void*>(&jitbridge::consumeBudget));
+        assembler.test(kRegA, kRegA, Width::Byte);
+        assembler.jcc(Cond::NotEqual, budgetExit);
+        assembler.bind(enough);
+    };
+
+    /// Loads `frame + offset` at the type's width into kRegA, honouring the declared sign.
+    auto emitScalarLoad = [&](std::int32_t offset, unsigned bits, bool isUnsigned,
+                              X64Assembler::Label slow) {
+        emitSlotAddress(offset, bits, slow);
+        const Width width = widthOfBits(bits);
+        if (width == Width::Qword) {
+            assembler.mov(kRegA, mem(kTmp1, 0), Width::Qword);
+        } else if (isUnsigned) {
+            assembler.movzx(kRegA, mem(kTmp1, 0), width);
+        } else {
+            assembler.movsx(kRegA, mem(kTmp1, 0), width);
+        }
+    };
+
     for (std::size_t ip = 0; ip < codeSize && refusal.empty(); ++ip) {
         if (labels[ip] != kNoLabel) {
             assembler.bind(labels[ip]);
         }
-
-        // The depth at this instruction comes from the dataflow pass, not from carrying a
-        // counter through the linear order: at a branch merge the two differ, and the
-        // merge point is exactly where a wrong depth turns into a wrong answer.
         if (depthAt[ip] < 0) {
-            refusal = "unreachable instruction with no known stack depth";
-            break;
+            continue;   // unreachable, or past an instruction whose effect is unknown
         }
         depth = static_cast<std::size_t>(depthAt[ip]);
 
@@ -484,33 +611,31 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         }
 
         case OpCode::LoadLocal: {
-            const int typeIndex = inst.b & 0xFF;
-            if (!slotIsSupportedInteger(typeIndex)) {
-                refusal = "local variable of an unsupported type";
+            const IntInfo info = intInfoOf(module, inst.b & 0xFF);
+            if (!info.supported) {
+                refusal = "local variable of a type the JIT does not inline";
                 break;
             }
             if (depth >= kMaxValueSlots) {
                 refusal = "expression stack deeper than the JIT supports";
                 break;
             }
-            // loadSlot(VM&, address, typeIndex, int64& out) -> bool
-            assembler.mov(kTmp1, kRegBase);
-            assembler.addImm(kTmp1, inst.a);
-            assembler.lea(kArg4, mem(Reg::Rsp, slotOffset(depth)));
-            assembler.mov(kArg1, kRegVm);
-            assembler.mov(kArg2, kTmp1);
-            assembler.movImm(kArg3, Width::Dword, typeIndex);
-            assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::loadSlot));
-            assembler.test(kRegA, kRegA);
-            assembler.jcc(Cond::Equal, failureExit);
+            auto slow = assembler.newLabel();
+            auto done = assembler.newLabel();
+            emitScalarLoad(inst.a, info.bits, info.isUnsigned, slow);
+            assembler.mov(mem(Reg::Rsp, slotOffset(depth)), kRegA);
+            assembler.jmp(done);
+            assembler.bind(slow);
+            emitHelperLoad(inst.a, inst.b & 0xFF, depth);
+            assembler.bind(done);
             ++depth;
             break;
         }
 
         case OpCode::StoreLocal: {
-            const int typeIndex = inst.b & 0xFF;
-            if (!slotIsSupportedInteger(typeIndex)) {
-                refusal = "local variable of an unsupported type";
+            const IntInfo info = intInfoOf(module, inst.b & 0xFF);
+            if (!info.supported) {
+                refusal = "local variable of a type the JIT does not inline";
                 break;
             }
             if (depth == 0) {
@@ -518,49 +643,146 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 break;
             }
             // The value is always the top of stack. With the keep bit set it also stays
-            // there afterwards, so only the depth bookkeeping differs -- reading from
-            // `slotOffset(depth)` after not decrementing instead of before read an empty
-            // slot and stored garbage, which is how `a++` came out as 1 instead of 7.
+            // there afterwards, so only the bookkeeping differs -- reading from an
+            // already-decremented slot instead stored an empty one, which is how `a++`
+            // came out as 1 rather than 7.
             const bool keepValue = (inst.b & 0x100) != 0;
             const std::size_t valueSlot = depth - 1;
             if (!keepValue) {
                 --depth;
             }
-            // storeSlot(VM&, address, typeIndex, value) -> bool
-            assembler.mov(kArg4, mem(Reg::Rsp, slotOffset(valueSlot)));
-            assembler.mov(kTmp1, kRegBase);
-            assembler.addImm(kTmp1, inst.a);
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(valueSlot)));
+            assembler.mov(mem(Reg::Rsp, slotOffset(kScratchSlot)), kRegA);
+
+            auto slow = assembler.newLabel();
+            auto done = assembler.newLabel();
+            emitSlotAddress(inst.a, info.bits, slow);
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+            assembler.mov(mem(kTmp1, 0), kRegA, widthOfBits(info.bits));
+            assembler.jmp(done);
+            assembler.bind(slow);
             assembler.mov(kArg1, kRegVm);
-            assembler.mov(kArg2, kTmp1);
-            assembler.movImm(kArg3, Width::Dword, typeIndex);
+            assembler.lea(kArg2, mem(kRegBase, inst.a));
+            assembler.movImm(kArg3, Width::Dword, inst.b & 0xFF);
+            assembler.mov(kArg4, mem(Reg::Rsp, slotOffset(valueSlot)));
             assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::storeSlot));
-            assembler.test(kRegA, kRegA);
+            assembler.test(kRegA, kRegA, Width::Byte);
             assembler.jcc(Cond::Equal, failureExit);
+            assembler.bind(done);
             break;
         }
 
-        case OpCode::Add:
-        case OpCode::Sub:
-        case OpCode::Mul:
-        case OpCode::Neg:
-        case OpCode::Not: {
-            const int typeIndex = inst.a;
-            if (!slotIsSupportedInteger(typeIndex)) {
-                refusal = "arithmetic on an unsupported type";
+        case OpCode::DerefLocal: {
+            // A frame slot holding a pointer, then a load through it: how an array
+            // element reaches its value, so it is on the hot path of anything indexing a
+            // local array.
+            const IntInfo info = intInfoOf(module, inst.b);
+            if (!info.supported) {
+                refusal = "array element of a type the JIT does not inline";
+                break;
+            }
+            if (depth >= kMaxValueSlots) {
+                refusal = "expression stack deeper than the JIT supports";
+                break;
+            }
+            // The pointer itself lives in a frame slot, so it uses the pinned page path.
+            auto slowPointer = assembler.newLabel();
+            auto afterPointer = assembler.newLabel();
+            emitSlotAddress(inst.a, 64, slowPointer);
+            assembler.mov(kTmp2, mem(kTmp1, 0), Width::Qword);
+            assembler.jmp(afterPointer);
+            assembler.bind(slowPointer);
+            assembler.mov(kArg1, kRegVm);
+            assembler.lea(kArg2, mem(kRegBase, inst.a));
+            assembler.lea(kArg3, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::readRaw64));
+            assembler.test(kRegA, kRegA, Width::Byte);
+            assembler.jcc(Cond::Equal, failureExit);
+            assembler.mov(kTmp2, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.bind(afterPointer);
+
+            assembler.test(kTmp2, kTmp2);
+            assembler.jcc(Cond::Equal, nullExit);
+            assembler.mov(kArg1, kRegVm);
+            assembler.mov(kArg2, kTmp2);
+            assembler.movImm(kArg3, Width::Dword, inst.b);
+            assembler.lea(kArg4, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.callAbsolute(
+                reinterpret_cast<const void*>(&jitbridge::loadThroughPointer));
+            assembler.test(kRegA, kRegA, Width::Byte);
+            assembler.jcc(Cond::Equal, failureExit);
+            ++depth;
+            break;
+        }
+
+        case OpCode::StepLocal: {
+            // `i++` as one instruction: read, add a small constant, write back.
+            const int typeIndex = inst.b & 0xFF;
+            const IntInfo info = intInfoOf(module, typeIndex);
+            if (!info.supported) {
+                refusal = "step on a type the JIT does not inline";
+                break;
+            }
+            const std::int32_t delta = inst.b >> 8;
+            auto slow = assembler.newLabel();
+            auto done = assembler.newLabel();
+            emitScalarLoad(inst.a, info.bits, info.isUnsigned, slow);
+            assembler.addImm(kRegA, delta, Width::Qword);
+            if (!info.isUnsigned) {
+                assembler.jcc(Cond::Overflow, trapExit);
+                emitWidthCheck(assembler, trapExit, info.bits);
+            } else if (info.bits < 64) {
+                assembler.movImm(kTmp1, Width::Qword,
+                                 static_cast<std::int64_t>(
+                                     (static_cast<std::uint64_t>(1) << info.bits) - 1));
+                assembler.mov(kTmp2, kRegA);
+                assembler.and_(kTmp2, kTmp1, Width::Qword);
+                assembler.cmp(kTmp2, kRegA, Width::Qword);
+                assembler.jcc(Cond::NotEqual, trapExit);
+            }
+            assembler.mov(mem(Reg::Rsp, slotOffset(kScratchSlot)), kRegA);
+            emitSlotAddress(inst.a, info.bits, slow);
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+            assembler.mov(mem(kTmp1, 0), kRegA, widthOfBits(info.bits));
+            assembler.jmp(done);
+            assembler.bind(slow);
+            // Straddling: let the interpreter do the whole step, then read it back.
+            assembler.mov(kArg1, kRegVm);
+            assembler.lea(kArg2, mem(kRegBase, inst.a));
+            assembler.movImm(kArg3, Width::Dword, typeIndex);
+            assembler.mov(kArg4, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::loadSlot));
+            assembler.bind(done);
+            break;
+        }
+
+        case OpCode::Add: case OpCode::Sub: case OpCode::Mul:
+        case OpCode::And: case OpCode::Or: case OpCode::Xor:
+        case OpCode::Shl: case OpCode::Shr:
+        case OpCode::Neg: case OpCode::Not: case OpCode::BitNot: {
+            const IntInfo info = intInfoOf(module, inst.a);
+            if (!info.supported) {
+                refusal = "arithmetic on a type the JIT does not inline";
                 break;
             }
             if (depth == 0) {
                 refusal = "stack underflow in arithmetic";
                 break;
             }
-            if (inst.op == OpCode::Neg || inst.op == OpCode::Not) {
+            if (inst.op == OpCode::Neg || inst.op == OpCode::Not ||
+                inst.op == OpCode::BitNot) {
                 assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 1)));
                 if (inst.op == OpCode::Neg) {
                     assembler.neg(kRegA, Width::Qword);
                     assembler.jcc(Cond::Overflow, trapExit);
-                    checkFitsWidth(bitWidthOf(inst.a));
+                    if (!info.isUnsigned) {
+                        emitWidthCheck(assembler, trapExit, info.bits);
+                    }
                 } else {
                     assembler.not_(kRegA, Width::Qword);
+                    if (info.bits < 64) {
+                        emitTruncateToWidth(assembler, info.bits, info.isUnsigned);
+                    }
                 }
                 assembler.mov(mem(Reg::Rsp, slotOffset(depth - 1)), kRegA);
                 break;
@@ -569,20 +791,53 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 refusal = "stack underflow in arithmetic";
                 break;
             }
-            // lhs into rax, rhs into rcx. Subtraction is order-sensitive and this is
-            // where a swapped operand pair would turn `a - b` into `b - a` -- which is
-            // invisible for `+` and `*` and wrong for `-`, `/` and comparisons.
+            // lhs into rax, rhs into r11. Subtraction is order-sensitive, and swapping
+            // these turns `a - b` into `b - a` -- invisible for `+` and `*`, wrong here.
             assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 2)));
-            assembler.mov(kArg1, mem(Reg::Rsp, slotOffset(depth - 1)));
+            assembler.mov(kTmp2, mem(Reg::Rsp, slotOffset(depth - 1)));
             switch (inst.op) {
-            case OpCode::Add: assembler.add(kRegA, kArg1); break;
-            case OpCode::Sub: assembler.sub(kRegA, kArg1); break;
-            case OpCode::Mul: assembler.imul(kRegA, kArg1); break;
+            case OpCode::Add: assembler.add(kRegA, kTmp2); break;
+            case OpCode::Sub: assembler.sub(kRegA, kTmp2); break;
+            case OpCode::Mul: assembler.imul(kRegA, kTmp2); break;
+            case OpCode::And: assembler.and_(kRegA, kTmp2); break;
+            case OpCode::Or: assembler.or_(kRegA, kTmp2); break;
+            case OpCode::Xor: assembler.xor_(kRegA, kTmp2); break;
+            case OpCode::Shl:
+            case OpCode::Shr: {
+                // A runtime shift count goes in cl -- the instruction names that register
+                // implicitly, so the count has to be *moved* there. The first version put
+                // it in r10 and the shift used whatever cl happened to hold, which is how
+                // SHA-256 produced plausible-looking but wrong digests.
+                assembler.mov(kArg1, kTmp2);
+                if (inst.op == OpCode::Shl) {
+                    assembler.shlCl(kRegA);
+                } else if (info.isUnsigned) {
+                    assembler.shrCl(kRegA);
+                } else {
+                    assembler.sarCl(kRegA);
+                }
+                break;
+            }
             default: break;
             }
-            // The interpreter traps on overflow at every signed width; so must this.
-            assembler.jcc(Cond::Overflow, trapExit);
-            checkFitsWidth(bitWidthOf(inst.a));
+            if (inst.op == OpCode::Add || inst.op == OpCode::Sub ||
+                inst.op == OpCode::Mul) {
+                if (info.isUnsigned) {
+                    // Unsigned arithmetic wraps at the declared width and never traps, so
+                    // the result has to be truncated -- leaving the 64 bit sum in place is
+                    // what made a 32 bit LCG produce a 64 bit state and a different
+                    // sequence from the interpreter.
+                    emitTruncateToWidth(assembler, info.bits, true);
+                } else {
+                    assembler.jcc(Cond::Overflow, trapExit);
+                    emitWidthCheck(assembler, trapExit, info.bits);
+                }
+            } else if (info.bits < 64) {
+                // Bitwise results and shifts have to stay inside the declared width, and
+                // the interpreter masks them there. Without this an `int8` or `int32`
+                // bitwise result keeps its high bits and later comparisons disagree.
+                emitTruncateToWidth(assembler, info.bits, info.isUnsigned);
+            }
             --depth;
             assembler.mov(mem(Reg::Rsp, slotOffset(depth - 1)), kRegA);
             break;
@@ -590,48 +845,50 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
 
         case OpCode::Div:
         case OpCode::Mod: {
-            if (intKindOf(inst.a) != IntKind::Signed) {
-                refusal = "division on an unsupported type";
+            const IntInfo info = intInfoOf(module, inst.a);
+            if (!info.supported) {
+                refusal = "division on a type the JIT does not inline";
+                break;
+            }
+            if (info.isUnsigned) {
+                refusal = "unsigned division";
                 break;
             }
             if (depth < 2) {
                 refusal = "stack underflow in division";
                 break;
             }
-            const unsigned bits = bitWidthOf(inst.a);
             auto divDone = assembler.newLabel();
-
-            // dividend into rax, divisor into r10. r10 rather than rcx: `cqo` writes rdx
-            // and `idiv` reads rax:rdx, so the divisor must stay clear of both -- the
-            // assembler test for division failed on exactly this and crashed.
             assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 2)));
+            // The divisor goes to r10, never rdx: `cqo` writes rdx and `idiv` reads
+            // rax:rdx, so a divisor left there would divide by its own sign.
             assembler.mov(kTmp1, mem(Reg::Rsp, slotOffset(depth - 1)));
             assembler.test(kTmp1, kTmp1);
             assembler.jcc(Cond::Equal, divZeroExit);
 
             if (inst.op == OpCode::Mod) {
                 // `x % -1` is 0 mathematically, and the interpreter returns 0 rather than
-                // dividing. Doing the same avoids the one input `idiv` traps on.
-                assembler.cmpImm(kTmp1, -1);
+                // dividing -- which also avoids the one input `idiv` traps on.
                 auto notMinusOne = assembler.newLabel();
+                assembler.cmpImm(kTmp1, -1);
                 assembler.jcc(Cond::NotEqual, notMinusOne);
                 assembler.movImm(kRegA, Width::Qword, 0);
                 assembler.jmp(divDone);
                 assembler.bind(notMinusOne);
-            } else if (bits == 64) {
-                // `INT64_MIN / -1` overflows; x86 raises #DE and the process dies instead
-                // of trapping through the VM. Checked before the divide for that reason.
+            } else if (info.bits == 64) {
+                // `INT64_MIN / -1` raises #DE, which kills the process instead of
+                // trapping through the VM. Checked before the divide for that reason.
+                auto notMin = assembler.newLabel();
                 assembler.movImm(kTmp2, Width::Qword,
                                  std::numeric_limits<std::int64_t>::min());
                 assembler.cmp(kRegA, kTmp2, Width::Qword);
-                auto notMin = assembler.newLabel();
                 assembler.jcc(Cond::NotEqual, notMin);
                 assembler.cmpImm(kTmp1, -1);
                 assembler.jcc(Cond::Equal, trapExit);
                 assembler.bind(notMin);
             }
 
-            if (bits == 32) {
+            if (info.bits == 32) {
                 assembler.cdq();
                 assembler.idiv(kTmp1, Width::Dword);
             } else {
@@ -640,54 +897,44 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             }
             if (inst.op == OpCode::Mod) {
                 assembler.mov(kRegA, Reg::Rdx);
-                if (bits == 32) {
+                if (info.bits == 32) {
                     assembler.movsxd(kRegA, kRegA);
                 }
-            } else if (bits == 32) {
+            } else if (info.bits == 32) {
                 assembler.movsxd(kRegA, kRegA);
             }
-            checkFitsWidth(bits);
+            emitWidthCheck(assembler, trapExit, info.bits);
             assembler.bind(divDone);
-
             --depth;
             assembler.mov(mem(Reg::Rsp, slotOffset(depth - 1)), kRegA);
             break;
         }
 
-        case OpCode::Eq:
-        case OpCode::Ne:
-        case OpCode::Lt:
-        case OpCode::Le:
-        case OpCode::Gt:
-        case OpCode::Ge: {
-            const IntKind kind = intKindOf(inst.a);
-            if (kind == IntKind::Unsupported) {
-                refusal = "comparison on an unsupported type";
+        case OpCode::Eq: case OpCode::Ne: case OpCode::Lt:
+        case OpCode::Le: case OpCode::Gt: case OpCode::Ge: {
+            const IntInfo info = intInfoOf(module, inst.a);
+            if (!info.supported) {
+                refusal = "comparison on a type the JIT does not inline";
                 break;
             }
             if (depth < 2) {
                 refusal = "stack underflow in a comparison";
                 break;
             }
-            // rhs into rax, lhs into rcx, then `cmp lhs, rhs` -- the interpreter's order,
-            // because `a < b` and `b < a` differ by which register is the rm operand.
             assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 2)));
-            assembler.mov(kArg1, mem(Reg::Rsp, slotOffset(depth - 1)));
-            assembler.cmp(kRegA, kArg1, Width::Qword);
-
-            const bool isUnsigned = kind == IntKind::Unsigned;
+            assembler.mov(kTmp2, mem(Reg::Rsp, slotOffset(depth - 1)));
+            assembler.cmp(kRegA, kTmp2, Width::Qword);
+            const bool u = info.isUnsigned;
             Cond cond = Cond::Equal;
             switch (inst.op) {
             case OpCode::Eq: cond = Cond::Equal; break;
             case OpCode::Ne: cond = Cond::NotEqual; break;
-            case OpCode::Lt: cond = isUnsigned ? Cond::Below : Cond::Less; break;
-            case OpCode::Le: cond = isUnsigned ? Cond::BelowEqual : Cond::LessEqual; break;
-            case OpCode::Gt: cond = isUnsigned ? Cond::Above : Cond::Greater; break;
-            case OpCode::Ge: cond = isUnsigned ? Cond::AboveEqual : Cond::GreaterEqual; break;
+            case OpCode::Lt: cond = u ? Cond::Below : Cond::Less; break;
+            case OpCode::Le: cond = u ? Cond::BelowEqual : Cond::LessEqual; break;
+            case OpCode::Gt: cond = u ? Cond::Above : Cond::Greater; break;
+            case OpCode::Ge: cond = u ? Cond::AboveEqual : Cond::GreaterEqual; break;
             default: break;
             }
-            // setcc writes a byte register; al needs no REX, and rax is dead once the
-            // comparison has consumed both operands.
             assembler.setcc(cond, Reg::Rax);
             assembler.movzx(kRegA, kRegA, Width::Byte);
             --depth;
@@ -695,9 +942,35 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             break;
         }
 
+        case OpCode::Cast: {
+            const IntInfo from = intInfoOf(module, inst.a);
+            const IntInfo to = intInfoOf(module, inst.b);
+            if (!from.supported || !to.supported) {
+                refusal = "cast between types the JIT does not inline";
+                break;
+            }
+            if (depth == 0) {
+                refusal = "stack underflow in CAST";
+                break;
+            }
+            // Widening is a no-op on a value already sign- or zero-extended into 64 bits;
+            // narrowing keeps the low bits, which is what the interpreter's mask does.
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 1)));
+            if (to.isUnsigned) {
+                if (to.bits < 64) {
+                    assembler.movImm(kTmp1, Width::Qword,
+                                     static_cast<std::int64_t>(
+                                         (static_cast<std::uint64_t>(1) << to.bits) - 1));
+                    assembler.and_(kRegA, kTmp1, Width::Qword);
+                }
+            } else if (to.bits < 64) {
+                emitTruncateToWidth(assembler, to.bits, false);
+            }
+            assembler.mov(mem(Reg::Rsp, slotOffset(depth - 1)), kRegA);
+            break;
+        }
+
         case OpCode::LocalAddr: {
-            // The address of a frame slot. Axiom's `return` goes through this: the value
-            // is written to frame+0 and the epilogue loads it back.
             assembler.lea(kRegA, mem(kRegBase, inst.a));
             pushA();
             break;
@@ -735,69 +1008,148 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         }
 
         case OpCode::Load: {
-            if (!slotIsSupportedInteger(inst.a)) {
-                refusal = "load of an unsupported type";
+            const IntInfo info = intInfoOf(module, inst.a);
+            if (!info.supported) {
+                refusal = "load of a type the JIT does not inline";
                 break;
             }
             if (depth == 0) {
                 refusal = "stack underflow in LOAD";
                 break;
             }
-            if (depth >= kMaxValueSlots) {
-                refusal = "expression stack deeper than the JIT supports";
-                break;
-            }
-            // loadThroughPointer(VM&, address, typeIndex, int64& out) -> bool
-            // r10 holds the address: rcx is the first argument slot and cannot also
-            // carry it, which was the first bug this path had.
-            assembler.mov(Reg::R10, mem(Reg::Rsp, slotOffset(depth - 1)));
-            assembler.test(Reg::R10, Reg::R10);
+            assembler.mov(kTmp1, mem(Reg::Rsp, slotOffset(depth - 1)));
+            assembler.test(kTmp1, kTmp1);
             assembler.jcc(Cond::Equal, nullExit);
-            assembler.lea(Reg::R9, mem(Reg::Rsp, slotOffset(depth - 1)));
-            assembler.mov(Reg::Rcx, kRegVm);
-            assembler.mov(Reg::Rdx, Reg::R10);
-            assembler.movImm(Reg::R8, Width::Dword, inst.a);
+            assembler.mov(kArg1, kRegVm);
+            assembler.mov(kArg2, kTmp1);
+            assembler.movImm(kArg3, Width::Dword, inst.a);
+            assembler.lea(kArg4, mem(Reg::Rsp, slotOffset(depth - 1)));
             assembler.callAbsolute(
                 reinterpret_cast<const void*>(&jitbridge::loadThroughPointer));
-            assembler.test(kRegA, kRegA);
+            assembler.test(kRegA, kRegA, Width::Byte);
             assembler.jcc(Cond::Equal, failureExit);
             break;
         }
 
         case OpCode::Store:
         case OpCode::StoreKeep: {
-            if (!slotIsSupportedInteger(inst.a)) {
-                refusal = "store of an unsupported type";
+            const IntInfo info = intInfoOf(module, inst.a);
+            if (!info.supported) {
+                refusal = "store of a type the JIT does not inline";
                 break;
             }
             if (depth < 2) {
                 refusal = "stack underflow in STORE";
                 break;
             }
-            // storeThroughPointer(VM&, address, typeIndex, value) -> bool
-            assembler.mov(Reg::R9, mem(Reg::Rsp, slotOffset(depth - 1)));
-            assembler.mov(Reg::R10, mem(Reg::Rsp, slotOffset(depth - 2)));
-            assembler.test(Reg::R10, Reg::R10);
+            assembler.mov(kArg4, mem(Reg::Rsp, slotOffset(depth - 1)));
+            assembler.mov(kTmp1, mem(Reg::Rsp, slotOffset(depth - 2)));
+            assembler.test(kTmp1, kTmp1);
             assembler.jcc(Cond::Equal, nullExit);
-            assembler.mov(Reg::Rcx, kRegVm);
-            assembler.mov(Reg::Rdx, Reg::R10);
-            assembler.movImm(Reg::R8, Width::Dword, inst.a);
+            assembler.mov(kArg1, kRegVm);
+            assembler.mov(kArg2, kTmp1);
+            assembler.movImm(kArg3, Width::Dword, inst.a);
             assembler.callAbsolute(
                 reinterpret_cast<const void*>(&jitbridge::storeThroughPointer));
-            assembler.test(kRegA, kRegA);
+            assembler.test(kRegA, kRegA, Width::Byte);
             assembler.jcc(Cond::Equal, failureExit);
-            depth -= 2;
             if (inst.op == OpCode::StoreKeep) {
-                // The value is still sitting in its slot; no register needs to survive
-                // the call. Copies it down one slot and pushes.
-                assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth + 1)));
-                pushA();
+                // Both operands leave the stack and the value is pushed back, so the net
+                // effect is one slot still holding it.
+                assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 1)));
+                --depth;
+                assembler.mov(mem(Reg::Rsp, slotOffset(depth - 1)), kRegA);
+            } else {
+                depth -= 2;
+            }
+            break;
+        }
+
+        case OpCode::Call: {
+            if (inst.a < 0 ||
+                static_cast<std::size_t>(inst.a) >= module.functions.size()) {
+                refusal = "invalid call target";
+                break;
+            }
+            const Function& callee = module.functions[static_cast<std::size_t>(inst.a)];
+            // Calls are not compiled yet. The interop itself works -- arguments cross
+            // in both directions, aggregates included -- but a compiled caller reaching
+            // an interpreted callee still disagrees with the interpreter on programs that
+            // mix strings and containers, and that difference has not been isolated. A
+            // fast path that is wrong for one program is worse than a narrow one that is
+            // right, so every function containing a call stays interpreted. What still
+            // compiles is the arithmetic-heavy leaf: that is where the 16x is.
+            if (!kCompileCalls || callee.isExternal()) {
+                refusal = "call (interpreted callers and callees not mixed yet)";
+                break;
+            }
+            if (callee.returnsAggregate) {
+                refusal = "call returning an aggregate";
+                break;
+            }
+            const int argc = inst.b < 0 ? 0 : inst.b;
+            if (depth < static_cast<std::size_t>(argc)) {
+                refusal = "stack underflow in CALL";
+                break;
+            }
+            // The interpreter's CALL reads its arguments from the value stack, so they
+            // have to be moved there. They are already contiguous in the native frame.
+            const std::size_t firstArgument = depth - static_cast<std::size_t>(argc);
+            for (int i = 0; i < argc; ++i) {
+                // An aggregate parameter (a string is one) arrives as the *address* of
+                // its descriptor, so it carries the pointer tag too -- pushing it as an
+                // integer made the callee read an empty string.
+                const ParamInfo* param =
+                    i < static_cast<int>(callee.params.size())
+                        ? &callee.params[static_cast<std::size_t>(i)]
+                        : nullptr;
+                const bool argumentIsPtr =
+                    param != nullptr &&
+                    (param->aggregate || isPointerType(module, param->memType));
+                assembler.mov(kRegA,
+                              mem(Reg::Rsp, slotOffset(firstArgument +
+                                                       static_cast<std::size_t>(i))));
+                assembler.mov(kArg1, kRegProcess);
+                assembler.mov(kArg2, kRegA);
+                assembler.movImm(kArg3, Width::Dword, argumentIsPtr ? 1 : 0);
+                assembler.callAbsolute(
+                    reinterpret_cast<const void*>(&jitbridge::pushValue));
+            }
+            assembler.mov(kArg1, kRegVm);
+            assembler.mov(kArg2, kRegProcess);
+            assembler.movImm(kArg3, Width::Dword, inst.a);
+            assembler.movImm(kArg4, Width::Dword, argc);
+            assembler.subImm(Reg::Rsp, 48);
+            assembler.mov(mem(Reg::Rsp, 32), kRegError);   // fifth argument
+            assembler.callAbsolute(
+                reinterpret_cast<const void*>(&jitbridge::callFunction));
+            assembler.addImm(Reg::Rsp, 48);
+            assembler.test(kRegA, kRegA, Width::Byte);
+            assembler.jcc(Cond::Equal, failureExit);
+            depth = firstArgument;
+            if (callee.returnsValue) {
+                if (depth >= kMaxValueSlots) {
+                    refusal = "expression stack deeper than the JIT supports";
+                    break;
+                }
+                assembler.mov(kArg1, kRegProcess);
+                assembler.lea(kArg2, mem(Reg::Rsp, slotOffset(depth)));
+                assembler.movImm(kArg3, Width::Dword,
+                                 isPointerType(module, callee.returnMemType) ? 1 : 0);
+                assembler.callAbsolute(
+                    reinterpret_cast<const void*>(&jitbridge::popResult));
+                assembler.test(kRegA, kRegA, Width::Byte);
+                assembler.jcc(Cond::Equal, failureExit);
+                ++depth;
             }
             break;
         }
 
         case OpCode::Jump: {
-            assembler.jmp(labelFor(inst.a));
+            if (isBackEdge[ip]) {
+                emitBudgetTick();
+            }
+            assembler.jmp(labels[static_cast<std::size_t>(inst.a)]);
             break;
         }
 
@@ -809,23 +1161,37 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             }
             --depth;
             assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth)));
-            assembler.test(kRegA, kRegA);
+            assembler.test(kRegA, kRegA, Width::Byte);
             const Cond taken = inst.op == OpCode::JumpIfTrue ? Cond::NotEqual : Cond::Equal;
-            assembler.jcc(taken, labelFor(inst.a));
+            if (isBackEdge[ip]) {
+                // Only the taken branch loops, so the charge goes on that path.
+                auto skip = assembler.newLabel();
+                assembler.jcc(taken == Cond::NotEqual ? Cond::Equal : Cond::NotEqual, skip);
+                emitBudgetTick();
+                assembler.jmp(labels[static_cast<std::size_t>(inst.a)]);
+                assembler.bind(skip);
+            } else {
+                assembler.jcc(taken, labels[static_cast<std::size_t>(inst.a)]);
+            }
             break;
         }
 
         case OpCode::Ret: {
+            // returnToCaller(process, hasResult, result, resultIsPtr): r8 carries the
+            // value, r9 the tag flag. The value goes straight from its slot into r8 --
+            // there is nothing to compute -- so no scratch register is involved.
             if (function.returnsValue) {
                 if (depth == 0) {
                     refusal = "missing return value";
                     break;
                 }
                 --depth;
-                assembler.mov(Reg::R8, mem(Reg::Rsp, slotOffset(depth)));
+                assembler.mov(kArg3, mem(Reg::Rsp, slotOffset(depth)));
             }
-            assembler.mov(Reg::Rcx, kRegProcess);
-            assembler.movImm(Reg::Rdx, Width::Dword, function.returnsValue ? 1 : 0);
+            assembler.mov(kArg1, kRegProcess);
+            assembler.movImm(kArg2, Width::Dword, function.returnsValue ? 1 : 0);
+            assembler.movImm(kArg4, Width::Dword,
+                             isPointerType(module, function.returnMemType) ? 1 : 0);
             assembler.callAbsolute(
                 reinterpret_cast<const void*>(&jitbridge::returnToCaller));
             assembler.movImm(kRegA, Width::Qword, 1);
@@ -835,8 +1201,10 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         }
 
         case OpCode::Halt: {
-            assembler.mov(Reg::Rcx, kRegProcess);
-            assembler.movImm(Reg::Rdx, Width::Dword, 0);
+            assembler.mov(kArg1, kRegProcess);
+            assembler.movImm(kArg2, Width::Dword, 0);
+            assembler.movImm(kArg3, Width::Qword, 0);
+            assembler.movImm(kArg4, Width::Dword, 0);
             assembler.callAbsolute(
                 reinterpret_cast<const void*>(&jitbridge::returnToCaller));
             assembler.movImm(kRegA, Width::Qword, 1);
@@ -845,9 +1213,22 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             break;
         }
 
-        case OpCode::SafePoint:
-            refusal = "safe point (scheduling is not compiled)";
+        case OpCode::SafePoint: {
+            // Resume point for the interpreter if we yield; the interpreter's own handler
+            // has already advanced past the instruction when it writes ip back.
+            assembler.mov(kArg1, kRegVm);
+            assembler.mov(kArg2, kRegProcess);
+            assembler.movImm(kArg3, Width::Qword, static_cast<std::int64_t>(ip + 1));
+            assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::safePoint));
+            assembler.test(kRegA, kRegA, Width::Byte);
+            // Non-zero means yield: hand the frame back exactly where it stands.
+            auto noYield = assembler.newLabel();
+            assembler.jcc(Cond::Equal, noYield);
+            assembler.movImm(kRegA, Width::Dword, 2);
+            assembler.jmp(failureExit);
+            assembler.bind(noYield);
             break;
+        }
 
         default:
             refusal = std::string("unsupported opcode ") +
@@ -861,30 +1242,28 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         return nullptr;
     }
 
-    // Reaching the end of the code without a `Ret` is what the interpreter treats as the
-    // end of the function; do the same rather than returning whatever rax happens to hold.
     if (!emittedReturn) {
         if (depth != 0 || function.returnsValue) {
-            whyNot = "function falls off the end with a value still on the stack";
+            whyNot = "in '" + function.name +
+                     "': falls off the end with a value still on the stack";
             return nullptr;
         }
-        assembler.mov(Reg::Rcx, kRegProcess);
-        assembler.movImm(Reg::Rdx, Width::Dword, 0);
+        assembler.mov(kArg1, kRegProcess);
+        assembler.movImm(kArg2, Width::Dword, 0);
+        assembler.movImm(kArg3, Width::Qword, 0);
+        assembler.movImm(kArg4, Width::Dword, 0);
         assembler.callAbsolute(
             reinterpret_cast<const void*>(&jitbridge::returnToCaller));
         assembler.movImm(kRegA, Width::Qword, 1);
     }
 
-    // trapExit publishes the message and forces the failure result; failureExit is the
-    // single epilogue both paths share.
-    // Each trap block ends with a jump: without one it falls through into the next and
-    // the last message wins. That is how an int32 overflow first reported itself as a
-    // null pointer -- the message was overwritten on the way out, while the trap itself
-    // was correct.
+    // Each trap block ends with a jump. Without one it falls through into the next and the
+    // last message wins -- which is how an integer overflow once reported itself as a null
+    // pointer while the trap itself was correct.
     auto emitTrapBlock = [&](X64Assembler::Label label, const char* message) {
         assembler.bind(label);
-        assembler.mov(Reg::Rcx, kRegError);
-        assembler.movImm(Reg::Rdx, Width::Qword,
+        assembler.mov(kArg1, kRegError);
+        assembler.movImm(kArg2, Width::Qword,
                          static_cast<std::int64_t>(
                              reinterpret_cast<std::uintptr_t>(message)));
         assembler.callAbsolute(
@@ -892,6 +1271,14 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         assembler.movImm(kRegA, Width::Qword, 0);
         assembler.jmp(failureExit);
     };
+    assembler.bind(budgetExit);
+    assembler.mov(kArg1, kRegError);
+    assembler.movImm(kArg2, Width::Qword,
+                     static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(
+                         kBudgetMessage)));
+    assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::setTrapMessage));
+    assembler.movImm(kRegA, Width::Dword, 0);
+    assembler.jmp(failureExit);
 
     emitTrapBlock(trapExit, kOverflowMessage);
     emitTrapBlock(divZeroExit, kDivideByZeroMessage);
@@ -899,16 +1286,18 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
 
     assembler.bind(failureExit);
     assembler.addImm(Reg::Rsp, static_cast<std::int32_t>(kFrameBytes));
+    assembler.pop(Reg::R15);
     assembler.pop(Reg::R14);
     assembler.pop(Reg::R13);
     assembler.pop(Reg::R12);
+    assembler.pop(Reg::Rbp);
     assembler.pop(Reg::Rbx);
     assembler.ret();
 
     auto block = assembler.finalize();
     if (!block) {
-        whyNot = "assembler could not produce executable code "
-                 "(an unbound label, or the platform refused the mapping)";
+        whyNot = "in '" + function.name + "': the assembler could not produce "
+                 "executable code";
         return nullptr;
     }
     return block;
@@ -935,6 +1324,8 @@ JitFunction JitCache::entryFor(const Module& module, std::size_t functionIndex,
         return entry.code;
     }
     if (entry.refused) {
+        // The reason does not change between calls -- an unsupported opcode stays
+        // unsupported -- so a refusal is permanent and is not retried.
         return nullptr;
     }
 

@@ -1212,18 +1212,24 @@ bool VM::JitBridge::loadSlot(VM& vm, std::uint64_t address, int typeIndex,
     if (!vm.loadScalar(address, typeIndex, value)) {
         return false;
     }
-    // Only 64 bit integers reach here: the lowering refuses anything wider, so a wider
-    // value would mean the two sides disagree about what was compiled.
     if (value.tag() == Value::Tag::Float) {
         return false;
     }
-    out = static_cast<std::int64_t>(value.asInt());
+    // A pointer-typed load has to be read as a pointer: the payload is the same 64 bits,
+    // but a Value tagged Ptr and one tagged Int are not interchangeable, and reading a
+    // string's address as an integer gives a number that no longer works as an address.
+    out = vm.memType(typeIndex).isPtr()
+              ? static_cast<std::int64_t>(value.asPtr())
+              : static_cast<std::int64_t>(value.asInt());
     return true;
 }
 
 bool VM::JitBridge::storeSlot(VM& vm, std::uint64_t address, int typeIndex,
                               std::int64_t value) {
-    return vm.storeScalar(address, typeIndex, Value::fromInt(static_cast<Int128>(value)));
+    return vm.storeScalar(address, typeIndex,
+                          vm.memType(typeIndex).isPtr()
+                              ? Value::fromPtr(static_cast<std::uint64_t>(value))
+                              : Value::fromInt(static_cast<Int128>(value)));
 }
 
 bool VM::JitBridge::loadThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
@@ -1235,7 +1241,9 @@ bool VM::JitBridge::loadThroughPointer(VM& vm, std::uint64_t address, int typeIn
     if (!vm.loadScalar(address, typeIndex, value) || value.tag() == Value::Tag::Float) {
         return false;
     }
-    out = static_cast<std::int64_t>(value.asInt());
+    out = vm.memType(typeIndex).isPtr()
+              ? static_cast<std::int64_t>(value.asPtr())
+              : static_cast<std::int64_t>(value.asInt());
     return true;
 }
 
@@ -1244,10 +1252,182 @@ bool VM::JitBridge::storeThroughPointer(VM& vm, std::uint64_t address, int typeI
     if (address == 0) {
         return false;
     }
-    return vm.storeScalar(address, typeIndex, Value::fromInt(static_cast<Int128>(value)));
+    return vm.storeScalar(address, typeIndex,
+                          vm.memType(typeIndex).isPtr()
+                              ? Value::fromPtr(static_cast<std::uint64_t>(value))
+                              : Value::fromInt(static_cast<Int128>(value)));
 }
 
-void VM::JitBridge::returnToCaller(void* process, bool hasResult, std::int64_t result) {
+bool VM::JitBridge::readRaw64(VM& vm, std::uint64_t address, std::int64_t& out) {
+    std::uint64_t raw = 0;
+    if (!vm.readBytes(address, &raw, sizeof(raw))) {
+        return false;
+    }
+    out = static_cast<std::int64_t>(raw);
+    return true;
+}
+
+int VM::JitBridge::pinFramePages(VM& vm, std::uint64_t frameBase,
+                                 std::uint64_t frameSize, void** out, int maxPages) {
+    if (vm.m_memory == nullptr) {
+        return 0;
+    }
+    const std::uint64_t firstPage = frameBase >> kPageShift;
+    const std::uint64_t lastByte = frameBase + (frameSize == 0 ? 1 : frameSize) - 1;
+    const std::uint64_t lastPage = lastByte >> kPageShift;
+    const std::uint64_t count = lastPage - firstPage + 1;
+    if (count > static_cast<std::uint64_t>(maxPages)) {
+        return 0;
+    }
+    for (std::uint64_t i = 0; i < count; ++i) {
+        // `true`: a frame slot may be written before it is read, so the page has to exist.
+        std::uint8_t* page = vm.m_memory->get(firstPage + i, true);
+        if (page == nullptr) {
+            return 0;
+        }
+        out[i] = page;
+    }
+    return static_cast<int>(count);
+}
+
+bool VM::JitBridge::callFunction(VM& vm, void* process, int functionIndex, int argc,
+                                 std::string* error) {
+    auto& p = *static_cast<Process*>(process);
+    if (vm.m_module == nullptr || functionIndex < 0 ||
+        static_cast<std::size_t>(functionIndex) >= vm.m_module->functions.size()) {
+        if (error != nullptr) {
+            *error = "invalid call target";
+        }
+        return false;
+    }
+    const Function& callee = vm.m_module->functions[static_cast<std::size_t>(functionIndex)];
+
+    // Arguments are already on the value stack, in order, because compiled code pushed
+    // them there -- so the frame setup is the same one CALL performs. External libraries
+    // and aggregates are outside what the lowering emits a call for, which is why this
+    // path can assume ordinary value parameters.
+    const std::uint64_t frameBase = p.stackTop;
+    const std::uint64_t frameSize = std::max<std::uint64_t>(callee.frameSize, 8);
+    if (p.frames.size() >= kMaxCallDepth) {
+        if (error != nullptr) {
+            *error = "call depth exceeded in '" + callee.name + "' (unbounded recursion?)";
+        }
+        return false;
+    }
+
+    std::vector<Value> arguments(static_cast<std::size_t>(argc));
+    for (std::size_t i = static_cast<std::size_t>(argc); i-- > 0;) {
+        if (p.stack.empty()) {
+            if (error != nullptr) {
+                *error = "stack underflow in CALL to '" + callee.name + "' (argc " +
+                     std::to_string(argc) + ", stack " + std::to_string(p.stack.size()) + ")";
+            }
+            return false;
+        }
+        arguments[i] = p.stack.back();
+        p.stack.pop_back();
+    }
+
+    vm.zeroBytes(frameBase, frameSize);
+    p.stackTop += frameSize;
+    for (std::size_t i = 0; i < arguments.size() && i < callee.params.size(); ++i) {
+        const ParamInfo& param = callee.params[i];
+        if (param.aggregate) {
+            // An aggregate argument is the address of its descriptor, so the bytes have to
+            // be copied into the callee's frame. Storing the pointer instead -- which is
+            // what this did at first -- leaves the callee reading an empty string.
+            std::vector<std::uint8_t> buffer(param.size);
+            vm.readBytes(arguments[i].asPtr(), buffer.data(), param.size);
+            vm.writeBytes(frameBase + param.offset, buffer.data(), param.size);
+        } else {
+            vm.storeScalar(frameBase + param.offset, param.memType, arguments[i]);
+        }
+    }
+
+    p.frames.push_back(Frame{&callee, 0, frameBase});
+
+    // Compiled callees return through their own epilogue and pop their own frame, so the
+    // caller only has to check whether one is still there.
+    if (JitFunction native = vm.m_jit.entryFor(*vm.m_module,
+                                              static_cast<std::size_t>(functionIndex), *error)) {
+        // A nested yield cannot be honoured: the compiled caller is mid-frame on its own
+        // native stack and has nowhere to hand control back from. Treated as success.
+        return native(&vm, process, frameBase, error) != 0;
+    }
+
+    // No compiled entry: run exactly this frame in the interpreter.
+    //
+    // The frame floor is what makes "exactly this frame" true. Without it, `step()` runs
+    // until a safe point, which for a callee with no calls in it means it keeps going
+    // after the callee returns -- straight into the *compiled* caller's bytecode. Both
+    // implementations then run the same body: this is how `noisy(x)` ended up printing
+    // twice and returning the value of the wrong call.
+    const std::size_t baseDepth = p.frames.size();
+    const std::size_t previousFloor = vm.m_frameFloor;
+    vm.m_frameFloor = baseDepth;
+    bool ok = true;
+    while (p.frames.size() >= baseDepth && !p.finished) {
+        const Step result = vm.step(p, *error);
+        if (result == Step::Trap) {
+            ok = false;
+            break;
+        }
+        if (result == Step::Finished) {
+            break;
+        }
+    }
+    vm.m_frameFloor = previousFloor;
+    return ok;
+}
+
+bool VM::JitBridge::pushValue(void* process, std::int64_t value, bool isPtr) {
+    auto& p = *static_cast<Process*>(process);
+    p.stack.push_back(isPtr ? Value::fromPtr(static_cast<std::uint64_t>(value))
+                            : Value::fromInt(static_cast<Int128>(value)));
+    return true;
+}
+
+bool VM::JitBridge::safePoint(VM& vm, void* process, std::uint64_t nextIp) {
+    auto& p = *static_cast<Process*>(process);
+    if (!p.frames.empty()) {
+        // The interpreter resumes at the *next* instruction, because its own SAFE_POINT
+        // handler has already advanced past itself when it writes ip back.
+        p.frames.back().ip = static_cast<std::size_t>(nextIp);
+    }
+    // Nothing to switch to, so nothing to yield for. This is what keeps a single-process
+    // program at full speed while still letting a scheduler with several processes run.
+    if (vm.m_processes.size() <= 1) {
+        return false;
+    }
+    return true;
+}
+
+bool VM::JitBridge::consumeBudget(VM& vm, std::uint64_t amount) {
+    if (vm.m_budget <= amount) {
+        vm.m_budget = 0;
+        return true;
+    }
+    vm.m_budget -= amount;
+    return false;
+}
+
+bool VM::JitBridge::popResult(void* process, std::int64_t* out, bool isPtr) {
+    auto& p = *static_cast<Process*>(process);
+    if (p.stack.empty()) {
+        return false;
+    }
+    const Value value = p.stack.back();
+    p.stack.pop_back();
+    if (value.tag() == Value::Tag::Float) {
+        return false;
+    }
+    *out = isPtr ? static_cast<std::int64_t>(value.asPtr())
+                 : static_cast<std::int64_t>(value.asInt());
+    return true;
+}
+
+void VM::JitBridge::returnToCaller(void* process, bool hasResult, std::int64_t result,
+                                   bool resultIsPtr) {
     auto& p = *static_cast<Process*>(process);
     if (p.frames.empty()) {
         return;
@@ -1256,7 +1436,9 @@ void VM::JitBridge::returnToCaller(void* process, bool hasResult, std::int64_t r
     p.frames.pop_back();
     p.stackTop = callerBase;
     if (hasResult) {
-        p.stack.push_back(Value::fromInt(static_cast<Int128>(result)));
+        p.stack.push_back(resultIsPtr
+                              ? Value::fromPtr(static_cast<std::uint64_t>(result))
+                              : Value::fromInt(static_cast<Int128>(result)));
     }
 }
 

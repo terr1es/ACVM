@@ -49,6 +49,20 @@ struct Mem {
 
 [[nodiscard]] inline Mem mem(Reg base, std::int32_t disp = 0) { return Mem{base, disp}; }
 
+/// `[base + index*scale + disp]`, the form a table lookup needs. `scale` must be 1, 2, 4
+/// or 8 -- those are the only multipliers the encoding can express.
+struct MemIndex {
+    Reg base;
+    Reg index;
+    int scale;
+    std::int32_t disp;
+};
+
+[[nodiscard]] inline MemIndex memIndex(Reg base, Reg index, int scale,
+                                       std::int32_t disp = 0) {
+    return MemIndex{base, index, scale, disp};
+}
+
 /// Emits machine code into a growable buffer, then hands back an executable copy.
 ///
 /// The interface is deliberately close to the metal rather than instruction-shaped:
@@ -71,6 +85,9 @@ public:
     void mov(Reg dst, Reg src, Width width = Width::Qword);
     void mov(Reg dst, const Mem& src, Width width = Width::Qword);
     void mov(const Mem& dst, Reg src, Width width = Width::Qword);
+    void mov(Reg dst, const MemIndex& src, Width width = Width::Qword);
+    void mov(const MemIndex& dst, Reg src, Width width = Width::Qword);
+    void lea(Reg dst, const MemIndex& src);
 
     /// `movzx` / `movsx` from a narrow source into a 64 bit register.
     void movzx(Reg dst, const Mem& src, Width srcWidth);
@@ -104,6 +121,10 @@ public:
     /// Shifts. The count is an immediate because every shift the compiler emits either
     /// comes from a constant or is a 32 bit limb shift, both known at emission time.
     void shl(Reg dst, std::uint8_t count, Width width = Width::Qword);
+    /// Shift by cl, for a count that is only known at run time.
+    void shlCl(Reg dst, Width width = Width::Qword);
+    void sarCl(Reg dst, Width width = Width::Qword);
+    void shrCl(Reg dst, Width width = Width::Qword);
     void sar(Reg dst, std::uint8_t count, Width width = Width::Qword);
     void shr(Reg dst, std::uint8_t count, Width width = Width::Qword);
 
@@ -161,9 +182,15 @@ private:
     /// `spl`/`bpl`/`sil`/`dil` over `ah`/`ch`/`dh`/`bh`. Without it the same ModRM
     /// silently addresses a different register.
     void emitRex(bool w, int regField, int indexField, int rmField, bool force = false);
+    /// The 0x66 prefix, which is what makes an instruction operate on 16 bits. There is
+    /// no REX.W equivalent for it: 8, 32 and 64 bits are the encodable default widths.
+    void emitOperandSize(Width width);
     /// ModRM (+SIB when the base register requires it) for a register or memory
     /// operand in the `rm` position.
     void emitModRm(std::size_t regField, Reg rm, bool isMemory, std::int32_t disp);
+    /// `[base + index*scale + disp]`. Always uses mod=10 with a SIB byte, so the base's
+    /// low bits never change the meaning of the mod field.
+    void emitModRmSib(std::size_t regField, const MemIndex& operand);
 
     struct Patch {
         std::size_t offset;   ///< where the rel32 begins
