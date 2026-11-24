@@ -65,6 +65,7 @@ acvm run   examples/quicksort.ax               # readable quicksort
 acvm run   examples/quicksort_max.ax --stats-detail   # instruction-level counts
 acvm build examples/tour.ax                    # emit examples/tour.acvm
 acvm exec  examples/tour.acvm                  # execute the module
+acvm run   examples/quicksort_max.ax --jit     # compile hot functions to machine code
 acvm check examples/tour.ax                    # lex, parse and type-check only
 acvm ir    examples/tour.ax -O2                # disassemble after optimizing
 ```
@@ -166,6 +167,102 @@ original cross-engine run by applying the factor measured for the dispatch rewor
 single machine (1.23× at 50 000, 1.25× at 200 000, 1.29× at 1 000 000); the other three
 columns were not re-run, so they remain as measured together.
 
+## The JIT
+
+`--jit` compiles whole functions to x86-64 and runs the result. There are no tiers and no
+profiling: a function is compiled the first time it is called, or refused, and a refusal
+is permanent because the reason is a property of the code rather than of the run.
+
+```bash
+acvm run  prog.ax   --jit
+acvm exec prog.acvm --jit
+```
+
+Measured on the same machine as the table above, best of three:
+
+| Program | Interpreter | `--jit` | |
+|---|---:|---:|---|
+| 20 000 000 iteration loop | 3020 ms | 189 ms | 16× |
+| `examples/quicksort_max.ax` | 218 ms | 112 ms | 1.9× |
+| `examples/quicksort.ax` | 94 ms | 89 ms | 1.06× |
+
+The spread is the whole story: **a leaf function is where the 16× is.** `quicksort_max`
+now compiles all four of its functions including the recursive partition, but each call
+still goes through the interpreter's calling convention — arguments pushed onto the value
+stack one helper call at a time, a frame zeroed, the page table consulted — so the win
+there is bounded by call overhead rather than by arithmetic. `quicksort.ax` is dominated
+by startup and printing and gets almost nothing.
+
+**Compilation is all or nothing, per function.** A half-compiled body would have to flush
+every live register back to memory at the unsupported instruction and reload afterwards,
+which is where a JIT stops being simple and starts producing wrong answers at the edges.
+So anything the lowering does not handle refuses the whole function, and these are the
+refusals most likely to be met:
+
+| Refusal | Why |
+|---|---|
+| `unsupported opcode BUILTIN` | `print`, `eprint` and the other builtins call back into the interpreter |
+| `call` to a `library` function | the native call is marshalled by the interpreter |
+| a string literal (`CONST_STR`) | constants are materialised by the interpreter |
+| a global (`LOAD_GLOBAL`) | globals live in a different address space |
+| a struct returned by value | the caller supplies a destination slot |
+| `int128`, floats, constants past 64 bits | the lowering works in 64 bit registers |
+| unsigned division | no single x86-64 instruction matches the interpreter's rules |
+| a `process` body | deliberate: compiled code cannot yield, so it could not be preempted |
+
+The first row is the one most often met in practice, and it is also the one that limits the
+measured speedup: a function is refused for containing a single `print`, so programs that
+report their own progress stay interpreted however much arithmetic they do.
+
+Recursion and ordinary calls *are* compiled. Two bugs made that look false for a while,
+both now covered by `tests/jit_call_check.ax`: `!x` was lowered as a bitwise complement
+(so every negated condition took the wrong branch, and it was already wrong for leaf
+functions), and a safe point with call arguments already pushed yielded, after which the
+interpreter resumed from a value stack that did not have them.
+
+Calls work in both directions. `tests/jit_mixed_call_check.ax` holds down the one the other
+tests could not reach — a compiled function calling one that was refused — since every
+function in `jit_call_check.ax` compiles, so the "compiled into interpreted" boundary was
+never crossed. It also covers mutual recursion and arguments past the fourth, which is where
+the x64 ABI stops passing them in registers.
+
+`--stats` reports what happened:
+
+```
+jit: 4 compiled, 0 refused                                    (quicksort_max.ax)
+jit: 4 compiled, 1 refused (first refusal: in 'printRun': unsupported opcode BUILTIN)
+```
+
+The refusal names the function and the instruction, so a function that quietly stayed
+interpreted can be recognised from a single run.
+
+Under `--jit` the instruction count in `--stats` is not comparable to an interpreted run:
+a compiled body executes as one native block, so the count only covers what still ran as
+bytecode. Compare wall clock, not instructions.
+
+The backend targets x86-64 with no run-time CPU probe, because a 64-bit x86 CPU lacking
+the handful of instructions used here does not exist. On any other architecture `--jit`
+is an error rather than a silent fallback, since a silent fallback reads as "the JIT made
+no difference" instead of "this platform has no JIT". The JIT tests are skipped on those
+hosts for the same reason: the encoder test calls the bytes it emits, and the differential
+tests would fail on the flag rather than on anything the programs do.
+
+Correctness rests on differential testing: thirteen programs are run interpreted and then
+compiled, and the two outputs must match byte for byte (`tests/compare_jit.cmake`). A
+fourteenth test covers the encoder on its own, without the VM.
+
+Two properties of those tests are worth spelling out, because both were wrong at first and
+both made the suite look stronger than it was:
+
+- **Agreeing is not passing.** A program whose own checks all fail exits non-zero in *both*
+  modes, so the two runs agree perfectly and a comparison-only test passes. The harness now
+  also requires the interpreted run to exit zero, which is what lets a failing assertion
+  fail the test. `EXPECT_RC` overrides it for a program meant to fail.
+- **A minimum compiled count.** A program where every function is refused still agrees with
+  the interpreter, so the tests written to exercise compiled code assert a floor on how many
+  functions were compiled. `jit_mixed_call_check.ax` pins the exact number, since one of its
+  functions exists only to be refused.
+
 ## Can it do anything real?
 
 Yes — the standard library and the extra modules are written in Axiom and tested:
@@ -230,6 +327,10 @@ The ones most likely to be noticed:
   its maximum does not fit the VM's signed 128-bit cell.
 - `doubleA.B` is accepted syntactically but stored as binary64.
 - Aggregate `<` is rejected. `==` / `!=` compare storage bytes.
+- The JIT (`--jit`) compiles a subset. String literals, globals and aggregates are not
+  lowered, so a function containing any of them stays interpreted in full — including the
+  arithmetic around it. The interpreter is always the fallback and always the definition
+  of correct behaviour.
 
 Not implemented at all: tagged variants (`union` + automatic tag + `match`), operator
 overloading, and constraints on generic type parameters (`T: Comparable`).

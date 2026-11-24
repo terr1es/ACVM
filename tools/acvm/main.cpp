@@ -1,6 +1,7 @@
 //===--- main.cpp - The acvm command line driver -----------------------===//
 #include "acvm/Driver/CommandLine.h"
 #include "acvm/Driver/Driver.h"
+#include "acvm/VM/Jit.h"
 
 #include <cstdio>
 #include <iostream>
@@ -182,6 +183,14 @@ int main(int argc, char** argv) {
         } else {
             positional.push_back(arg);
         }
+    }
+
+    // Asking for the JIT on a host that cannot run its output is an error, not a silent
+    // fallback: the fallback would look like "the JIT made no difference" rather than
+    // "this platform has no JIT".
+    if (options.jit && !acvm::kTargetIsX64) {
+        return usageError("'--jit' compiles to x86-64 machine code and this host is not "
+                          "x86-64; drop the flag to run under the interpreter");
     }
 
     // Every command takes exactly one input path, so positional arguments that

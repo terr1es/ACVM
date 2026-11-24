@@ -24,6 +24,25 @@ enum class JitMode {
     On,    ///< compile a function when it qualifies, and run the result
 };
 
+/// True when this host can execute the code the lowering emits.
+///
+/// The backend targets x86-64 and nothing checks the CPU at run time -- there is no
+/// CPUID probe, because a 64 bit x86 CPU missing the handful of instructions the
+/// lowering uses does not exist. Everywhere else the *encoder* would still produce
+/// bytes happily (it is portable C++), the block would be allocated executable, and the
+/// process would immediately run something that is not its own program. The guard
+/// therefore has to sit in front of `compileFunction`, not in the assembler.
+///
+/// Refusing to compile is what keeps the interpreter the whole implementation on those
+/// hosts. The CLI turns an explicit `--jit` there into an error rather than a silent
+/// fallback, because asking for the JIT and silently getting the interpreter reads as
+/// "the JIT made no difference".
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
+inline constexpr bool kTargetIsX64 = true;
+#else
+inline constexpr bool kTargetIsX64 = false;
+#endif
+
 /// The calling convention shared by the VM and generated code.
 ///
 /// Four arguments, all in registers on the x64 ABI, and one boolean result: `false` means

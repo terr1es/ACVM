@@ -123,9 +123,10 @@ using jit::Reg;
 using jit::Width;
 using jit::X64Assembler;
 
-/// Calls are off for now: see the comment at the CALL case. Named rather than literal so
-/// turning it back on is one edit and one measurement away.
-constexpr bool kCompileCalls = false;
+/// Compiling calls is what turns the JIT from a leaf-function accelerator into something
+/// that covers a real program; the two bugs that kept it switched off are described at
+/// the SafePoint and Not cases below, and `tests/jit_call_check.ax` holds both down.
+constexpr bool kCompileCalls = true;
 
 constexpr std::size_t kMaxValueSlots = 48;
 constexpr std::size_t kMaxPinnedPages = 8;
@@ -275,6 +276,12 @@ void emitWidthCheck(X64Assembler& assembler, X64Assembler::Label trapExit,
 std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                                                      const Function& function,
                                                      std::string& whyNot) {
+    if (!kTargetIsX64) {
+        // First check, so the reason names the real cause on any non-x86-64 host. Every
+        // other refusal below would be about the program rather than about the machine.
+        whyNot = "no JIT for this architecture (x86-64 only)";
+        return nullptr;
+    }
     if (function.isExternal()) {
         whyNot = "function lives in a shared library";
         return nullptr;
@@ -778,6 +785,15 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                     if (!info.isUnsigned) {
                         emitWidthCheck(assembler, trapExit, info.bits);
                     }
+                } else if (inst.op == OpCode::Not) {
+                    // Logical negation, not a bitwise complement: the interpreter pushes
+                    // `truthy ? 0 : 1`, so the result is always exactly 0 or 1. Sharing the
+                    // BitNot path here made `!x` return ~x -- nonzero for every false x, so
+                    // `if (!ok)` took the wrong branch and the JIT silently disagreed with
+                    // the interpreter on every program that negated a condition.
+                    assembler.test(kRegA, kRegA, Width::Qword);
+                    assembler.setcc(Cond::Equal, kRegA);
+                    assembler.movzx(kRegA, kRegA, Width::Byte);
                 } else {
                     assembler.not_(kRegA, Width::Qword);
                     if (info.bits < 64) {
@@ -1072,15 +1088,18 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 break;
             }
             const Function& callee = module.functions[static_cast<std::size_t>(inst.a)];
-            // Calls are not compiled yet. The interop itself works -- arguments cross
-            // in both directions, aggregates included -- but a compiled caller reaching
-            // an interpreted callee still disagrees with the interpreter on programs that
-            // mix strings and containers, and that difference has not been isolated. A
-            // fast path that is wrong for one program is worse than a narrow one that is
-            // right, so every function containing a call stays interpreted. What still
-            // compiles is the arithmetic-heavy leaf: that is where the 16x is.
+            // Arguments cross through the interpreter's value stack: recorded here into
+            // `process.stack`, popped by `callFunction`, which then dispatches to the
+            // callee's compiled entry when it has one and to `step()` when it does not.
+            // The interop carries aggregates (a string arrives as the address of its
+            // descriptor, which is why the push below tags it) -- getting that tag wrong
+            // is what made a callee read an empty string.
+            //
+            // A `library` function is the one case left out: its arguments are marshalled
+            // and the call made by the interpreter's external-call path, which the bridge
+            // does not reproduce.
             if (!kCompileCalls || callee.isExternal()) {
-                refusal = "call (interpreted callers and callees not mixed yet)";
+                refusal = "call into a library function";
                 break;
             }
             if (callee.returnsAggregate) {
@@ -1214,6 +1233,20 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         }
 
         case OpCode::SafePoint: {
+            // A yield is only safe with an empty expression stack. The compiled body keeps
+            // its operands in frame slots, but the interpreter resumes at `ip + 1` from
+            // `process.stack` -- which knows nothing about them. IRGen emits a safe point
+            // before *every* call, precisely where the arguments are already pushed, so
+            // yielding there handed the interpreter an empty value stack and the CALL it
+            // resumed on popped from it: "stack underflow in CALL". A single-process
+            // program never yielded, which is why this only appeared once calls were
+            // compiled inside a program that also ran a second process.
+            //
+            // Skipping the yield costs preemption granularity only: the function reaches
+            // the next safe point with an empty stack, or returns.
+            if (depth != 0) {
+                break;
+            }
             // Resume point for the interpreter if we yield; the interpreter's own handler
             // has already advanced past the instruction when it writes ip back.
             assembler.mov(kArg1, kRegVm);

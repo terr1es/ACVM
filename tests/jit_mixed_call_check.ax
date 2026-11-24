@@ -1,0 +1,116 @@
+//  jit_mixed_call_check.ax -- the call directions the other JIT tests never reach.
+//
+//  `jit_call_check.ax` covers calls between two *compilable* functions, in both the
+//  nested and the recursive shape. What it cannot cover is a compiled function calling one
+//  the JIT refused, because every function in it compiles. That is the interesting
+//  boundary: the caller's arguments are in native slots, the callee expects them on the
+//  interpreter's value stack, and the return value has to come back the other way.
+//
+//  Three more shapes here, each one a place where an argument-passing mistake would be
+//  invisible in the leaf-only tests:
+//
+//  1. **Compiled caller, interpreted callee.** `compiledSum` is compiled;
+//     `interpretedWorker` is refused because it reads a global (`LOAD_GLOBAL`, which the
+//     lowering does not handle). A global is used rather than a string literal so the
+//     refusal is a deliberate, stable property of the function rather than a side effect
+//     of how it prints.
+//
+//  2. **More arguments than there are argument registers.** The x64 ABI passes the first
+//     four integer arguments in registers and the rest on the stack. Nothing else in the
+//     suite calls anything with more than three, so a stack-passed argument had no test.
+//
+//  3. **Mutual recursion.** `isEven` and `isOdd` call each other. A single recursive
+//     function can be right by accident -- its own frame is reused -- while two frames
+//     that alternate exercise the same save-and-restore twice in a row.
+//
+//  Everything returns an integer bitmask or a number for `main` to check, and no function
+//  under test contains a string literal: `CONST_STR` refuses the whole function, which
+//  would quietly move the code under test back into the interpreter. That mistake is easy
+//  to make and leaves a test that passes while testing nothing -- `jit_call_check.ax` was
+//  written that way first. `EXPECT_COMPILED=4` in CMakeLists is what holds it down: if any
+//  of these slipped back to the interpreter, the count would drop and the test would fail.
+
+function import (return:(test));
+
+//  A global is how this function gets refused. The value is what the caller's arguments
+//  are expected to survive as, so the callee also checks that they arrived intact.
+global int gBias = 7;
+
+function interpretedWorker(int a, int b):int {
+    return a * 10 + b + gBias;
+    eof: pass;
+}
+
+//  Compiled, and its only statement that matters is a call into the refused function
+//  above. The loop makes the call happen more than once, so a bad save/restore cannot be
+//  missed by a single lucky first iteration.
+function compiledSum(int rounds):int {
+    int total = 0;
+    for (int i = 0; i < rounds; i++) {
+        total = total + interpretedWorker(i, i + 1);
+    }
+    return total;
+    eof: pass;
+}
+
+//  Six parameters: the fifth and sixth arrive on the stack.
+function sixArgs(int a, int b, int c, int d, int e, int f):int {
+    return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6;
+    eof: pass;
+}
+
+//  Calls itself with six arguments, so the stack-passed ones survive a real frame.
+//  The two calls deliberately pass the same values in opposite order: the weights in
+//  `sixArgs` are not symmetric, so the two sums differ (91 and 56). An expectation that
+//  was symmetric would still hold if every argument arrived shifted by one, which is the
+//  failure mode this is here to catch.
+function sixArgsTwice(int a, int b, int c, int d, int e, int f):int {
+    return sixArgs(a, b, c, d, e, f) + sixArgs(f, e, d, c, b, a);
+    eof: pass;
+}
+
+function isEven(int n):bool {
+    if (n == 0) {
+        return true;
+    }
+    return isOdd(n - 1);
+    eof: pass;
+}
+
+function isOdd(int n):bool {
+    if (n == 0) {
+        return false;
+    }
+    return isEven(n - 1);
+    eof: pass;
+}
+
+//  Mutual recursion behind a call, several frames deep.
+function alternatingDepth(int n):int {
+    if (isEven(n)) {
+        return n / 2;
+    }
+    return (n + 1) / 2;
+    eof: pass;
+}
+
+function main():void {
+    testGroup("jit mixed calls");
+
+    //  rounds=4, bias=7: sum over i in 0..3 of (i*10 + (i+1) + 7) = 0+10+20+30 + 1+2+3+4 + 28
+    checkInt(compiledSum(4), 98, "compiled caller into interpreted callee");
+
+    //  1 + 2*2 + 3*3 + 4*4 + 5*5 + 6*6
+    checkInt(sixArgs(1, 2, 3, 4, 5, 6), 91, "six arguments, two on the stack");
+
+    //  91 from the ascending order, 56 from the descending one -- see the note on
+    //  `sixArgsTwice` for why the two are not meant to be equal.
+    checkInt(sixArgsTwice(1, 2, 3, 4, 5, 6), 147, "six arguments through a nested call");
+
+    //  Both branches have to be taken or only one direction of the mutual pair is tested.
+    checkInt(alternatingDepth(10), 5, "mutual recursion, even branch");
+    checkInt(alternatingDepth(9), 5, "mutual recursion, odd branch");
+
+    testFinish();
+    eof: pass;
+}

@@ -1,0 +1,168 @@
+//  jit_call_check.ax -- the two ways compiling calls went wrong, kept as a regression.
+//
+//  Both were invisible for the same reason: functions that contain a call used to be
+//  refused wholesale, so the compiled path never ran the code that was wrong. Turning
+//  calls on exposed them, and each one needed a different program shape to show up.
+//
+//  1. **`!x` was a bitwise complement.** The lowering filed `Not` with `BitNot`, so
+//     `!true` produced 0xFFFF...FE instead of 0. `negMask` below contains no call at
+//     all, which is what proves this one was never about calls -- it was already wrong
+//     for every function the JIT accepted.
+//
+//  2. **A safe point with operands pending yielded.** IRGen puts a safe point before
+//     every call, exactly where the arguments are already on the stack. Compiled code
+//     returns 2 ("yielded") there, and the interpreter resumes at the next instruction
+//     from `process.stack`, which knows nothing about the compiled frame's slots -- so
+//     the CALL it resumes on pops from an empty stack. A single process never yields,
+//     so this needs a second process to be runnable at the same time.
+//
+//  ── why the assertions look like this ───────────────────────────────────────
+//
+//  Every function returns an integer bitmask of what went wrong; `main` does the
+//  checking. Three constraints shaped that, all of them learned the hard way:
+//
+//  * A string literal is `CONST_STR`, which the JIT does not lower -- a function
+//    containing one is refused. Writing `check(..., "label")` inside the function under
+//    test would quietly move it to the interpreter and the test would pass while
+//    testing nothing. This file was written that way first, and the refusal list showed
+//    every function in it refused.
+//  * `bool` cannot be compared with `int` here, so a negation cannot be checked by
+//    value. The bug made `!true` truthy, which is exactly what a branch observes: the
+//    decisive assertions are all "this branch must not be taken".
+//  * `!x` cannot be used on a bool that the test itself computed, or a broken `!`
+//    would corrupt the assertion as well as the thing it asserts.
+
+function import (return:(test));
+function import (return:(sync));
+
+global int gSpinnerDone = 0;
+global int gSpinnerSum = 0;
+
+//  Exists to keep a second process runnable while the checks below call each other.
+function process spinner():void {
+    int i = 0;
+    while (i < 200) {
+        atomicAdd(#gSpinnerSum, 1);
+        i = i + 1;
+    }
+    atomicStore(#gSpinnerDone, 1);
+    return;
+    eof: pass;
+}
+
+function isPositive(int x):bool {
+    return x > 0;
+    eof: pass;
+}
+
+function returnsTrue():bool {
+    return true;
+    eof: pass;
+}
+
+//  No call anywhere: this isolates the `Not` lowering. `one` and `zero` are parameters
+//  so that nothing can be folded away before the JIT sees the instruction.
+function negMask(int one, int zero):int {
+    int bad = 0;
+
+    //  !(true) is false, so neither branch below may be taken. The bug made both
+    //  conditions truthy and both branches ran.
+    if (!(one == 1)) { bad = bad + 1; }
+    if (!(zero == 0)) { bad = bad + 2; }
+
+    //  !(false) is true, so this branch must be taken. The bitwise version also takes
+    //  it, so this is not what catches the bug -- it catches the opposite regression,
+    //  a "fix" that makes `!` return zero unconditionally.
+    bool seen = false;
+    if (!(one == 2)) { seen = true; }
+    if (seen == false) { bad = bad + 4; }
+
+    return bad;
+    eof: pass;
+}
+
+//  The failure shape from the map library: a call result negated in a condition.
+function negCallMask(int x):int {
+    int bad = 0;
+
+    //  x is positive, so !isPositive(x) is false and this branch must not be taken.
+    if (!isPositive(x)) { bad = bad + 1; }
+
+    //  returnsTrue() is true, so this branch must not be taken either.
+    if (!returnsTrue()) { bad = bad + 2; }
+
+    //  x - 100 is negative, so this one must be taken.
+    bool seen = false;
+    if (!isPositive(x - 100)) { seen = true; }
+    if (seen == false) { bad = bad + 4; }
+
+    return bad;
+    eof: pass;
+}
+
+//  Calls whose arguments are themselves calls: argument slots and the safe point that
+//  precedes each call, in one function.
+function nestedMask(int x):int {
+    int bad = 0;
+    if (sum2(1, 2) != 3) { bad = bad + 1; }
+    if (sum3(1, 2, 3) != 6) { bad = bad + 2; }
+    if (sum2(sum3(1, 2, 3), sum3(4, 5, 6)) != 21) { bad = bad + 4; }
+    if (cmp2(sum2(x, x), 6) == false) { bad = bad + 8; }
+    if (fact(6) != 720) { bad = bad + 16; }
+    if (fib(15) != 610) { bad = bad + 32; }
+    return bad;
+    eof: pass;
+}
+
+function sum2(int a, int b):int {
+    return a + b;
+    eof: pass;
+}
+
+function sum3(int a, int b, int c):int {
+    return a + b + c;
+    eof: pass;
+}
+
+function cmp2(int a, int b):bool {
+    return a == b;
+    eof: pass;
+}
+
+function fact(int n):int {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * fact(n - 1);
+    eof: pass;
+}
+
+function fib(int n):int {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+    eof: pass;
+}
+
+function main():void {
+    //  The spinner is a process, so it is already runnable when the first statement
+    //  runs: every safe point below is a real yield opportunity rather than the
+    //  single-process short circuit. Waiting for it also keeps output stable.
+    while (atomicLoad(#gSpinnerDone) == 0) {
+    }
+
+    testGroup("jit calls");
+
+    checkInt(atomicLoad(#gSpinnerSum), 200, "spinner ran");
+    checkInt(negMask(1, 0), 0, "logical not, no calls");
+    checkInt(negCallMask(5), 0, "logical not on call results");
+    checkInt(nestedMask(3), 0, "nested and recursive calls");
+
+    // Without this the assertions above are decorative: `checkInt` only records a
+    // failure, and `trap()` inside `testFinish` is the one thing that turns it into a
+    // non-zero exit status. A differential test compares two runs against each other,
+    // so a program that fails identically both ways looks like a pass.
+    testFinish();
+    eof: pass;
+}

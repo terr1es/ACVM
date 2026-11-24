@@ -24,6 +24,24 @@ endif()
 option(ACVM_BUILD_TESTS "Build the ACVM test suite" ON)
 option(ACVM_WERROR "Treat compiler warnings as errors" OFF)
 
+# Does this host execute the code the JIT emits?
+#
+# The backend targets x86-64 and the assembler is portable C++ that would happily produce
+# those bytes anywhere, so the architecture has to be checked explicitly wherever the
+# output is going to be run: `compileFunction` refuses at run time (the CLI turns `--jit`
+# into an error), and the JIT tests are skipped here rather than reported as failures on
+# hardware that was never a target.
+#
+# Three spellings because the value comes from the platform rather than from CMake:
+# Windows/MSVC and some MinGW builds report `AMD64`, Linux and macOS report `x86_64`, and
+# `x64` shows up from a few generators.
+string(TOUPPER "${CMAKE_SYSTEM_PROCESSOR}" ACVM_PROCESSOR_UPPER)
+if(ACVM_PROCESSOR_UPPER MATCHES "^(X86_64|AMD64|X64|EM64T)$")
+    set(ACVM_HOST_IS_X64 TRUE CACHE INTERNAL "Host executes x86-64 (JIT target)")
+else()
+    set(ACVM_HOST_IS_X64 FALSE CACHE INTERNAL "Host executes x86-64 (JIT target)")
+endif()
+
 if(MSVC)
     add_compile_options(/W3 /utf-8 /permissive-)
     if(ACVM_WERROR)
@@ -337,10 +355,24 @@ if(ACVM_BUILD_TESTS)
 
     # The encoder is linked without the VM: a failure here is an encoding bug, never a
     # consequence of something the interpreter did.
-    add_executable(test_jit_assembler tests/test_jit_assembler.cpp)
-    target_include_directories(test_jit_assembler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    target_link_libraries(test_jit_assembler PRIVATE acvm_jit)
-    add_test(NAME test_jit_assembler COMMAND test_jit_assembler)
+    #
+    # Guarded by target architecture. The assembler is portable C++ that emits x86-64
+    # bytes either way, so it builds anywhere -- but this test *calls* what it emits, so on
+    # a non-x86-64 host it would jump into machine code the CPU does not have. The runtime
+    # guard in compileFunction cannot help here: that test exercises the encoder directly,
+    # below the VM. `acvm --jit` refuses on such a host and the differential tests below
+    # would then fail on the error, so the whole group is skipped rather than reported as
+    # broken on hardware that was never a target.
+    if(ACVM_HOST_IS_X64)
+        add_executable(test_jit_assembler tests/test_jit_assembler.cpp)
+        target_include_directories(test_jit_assembler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(test_jit_assembler PRIVATE acvm_jit)
+        add_test(NAME test_jit_assembler COMMAND test_jit_assembler)
+    else()
+        message(STATUS
+            "Skipping JIT tests: this host is ${CMAKE_SYSTEM_PROCESSOR}, and the JIT emits "
+            "x86-64 machine code only")
+    endif()
 
     # Script checks come in two flavours.
     #
@@ -458,15 +490,40 @@ if(ACVM_BUILD_TESTS)
                  COMMAND ${CMAKE_COMMAND}
                          -DACVM=$<TARGET_FILE:acvm>
                          -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/${name}.ax
+                         ${ARGN}
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/compare_jit.cmake)
     endfunction()
 
-    foreach(checked
-            jit_check ternary_check generics_check union_check generic_struct_check
-            methods_check int128_check astl_check algorithm_check
-            sync_check address_assign_check)
-        acvm_add_jit_diff_check(${checked})
-    endforeach()
+    # Skipped with the assembler test above, and for the same reason: `--jit` is an error
+    # on a host that cannot execute the output, so these would fail on the flag rather
+    # than on anything the programs do.
+    if(ACVM_HOST_IS_X64)
+        foreach(checked
+                jit_check ternary_check generics_check union_check generic_struct_check
+                methods_check int128_check astl_check algorithm_check
+                sync_check address_assign_check)
+            acvm_add_jit_diff_check(${checked})
+        endforeach()
+
+        # This one exists to exercise compiled *calls*, not just compiled arithmetic, so it
+        # also asserts that the compiled path was actually taken: every function in it could
+        # be refused and the output would still match the interpreter.
+        acvm_add_jit_diff_check(jit_call_check -DEXPECT_COMPILED=6)
+
+        # A compiled function calling one the JIT refused. The direction matters: every
+        # other program here calls only compilable functions, so the "compiled into
+        # interpreted" path was unexercised. `jit_mixed_call_check` also covers mutual
+        # recursion, arguments past the fourth (the point where the x64 ABI stops passing
+        # them in registers) and a recursion depth that spans several frames.
+        #
+        # The count is this file's six compilable functions, so a regression that moves one
+        # of them back to the interpreter fails here instead of quietly turning the program
+        # into another all-interpreted comparison. If the lowering later learns to read a
+        # global, `interpretedWorker` starts compiling too -- the count rises and this line
+        # needs revisiting, which is the intended signal: the file then no longer contains a
+        # refused callee and its whole point has to be re-established.
+        acvm_add_jit_diff_check(jit_mixed_call_check -DEXPECT_COMPILED=6)
+    endif()
 
     # Passing arguments is the point of this one, so it runs with some.
     acvm_add_script_check(args_check -- alpha beta "two words")
