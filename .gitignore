@@ -38,6 +38,18 @@ bench/build/
 # a committed .vsix is a binary blob that goes stale silently.
 *.vsix
 
+# Icon and logo binaries.
+#
+# A generated .ico is a build artifact: it cannot be reviewed in a diff, it changes
+# wholesale when the geometry changes, and a stale one is indistinguishable from a current
+# one. So the binaries stay out, and the one file that is worth keeping is the vector
+# source -- `brand/axiom-logo.svg`, which is 647 bytes of readable path data, shows up in a
+# diff as a real change, and can be re-rendered to any size by whoever needs one.
+*.ico
+
+# Other images are not blocked. A screenshot in the documentation is content rather than an
+# artifact: it is written by hand, reviewed as a picture, and replaced deliberately.
+
 # Temporary files that should never have been committed
 *.bak
 *.orig

@@ -68,11 +68,38 @@
 #
 # Not needed. `.ax` is not claimed by any other language in the database.
 #
-# ── before submitting ──────────────────────────────────────────────────────
+# ── before submitting: the volume threshold ───────────────────────────────
 #
-# linguist asks that the language be used by a real, public project -- this repository
-# once it is published -- and that the extension not collide with an existing language.
-# Both are true here. The submission is a YAML block and a short justification, not code.
+# This is the part that stops a submission today, and it is policy rather than quality.
+# From linguist's CONTRIBUTING.md:
+#
+#   "We will only add new extensions once they have sufficient usage on GitHub."
+#   "we do not accept PRs for very new or hobby languages"
+#
+# The number: **at least 2000 files per extension indexed in the last year, excluding
+# forks**, spread across enough distinct owners that no single account dominates. Axiom
+# currently has 134 `.ax` files, all in one repository. A pull request would be closed on
+# that ground alone, so opening one now spends effort on a guaranteed result.
+#
+# ── .ax is a contested extension ──────────────────────────────────────────
+#
+# GitHub indexes 11,888 files with the `.ax` extension (measured, excluding this
+# repository), and the bulk belong to **Anya** (`NyanSatan/Anya`), an unrelated language
+# that also chose `.ax`. Neither language is in linguist, so the extension is formally
+# unclaimed -- but a submission would have to argue that `.ax` means Axiom when a
+# comparable volume of it means something else.
+#
+# That leaves three honest options:
+#
+#   1. Revisit registration when Axiom has that volume itself. Nothing to do until then.
+#   2. Make `.axiom` the canonical extension and keep `.ax` as an accepted alias. The
+#      name is unambiguous and self-describing, which permanently removes the contention
+#      -- but a new extension starts at zero volume, so the threshold still applies.
+#   3. Do nothing. Every young language lives here; V, Zig and Mojo all shipped for years
+#      without appearing in the language bar.
+#
+# Option 1 is the default. Option 2 is a language-design decision, not a packaging one:
+# it changes what files are called, and should be made deliberately or not at all.
 #
 # ── what to expect until then ──────────────────────────────────────────────
 #

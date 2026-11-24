@@ -17,6 +17,7 @@
 *.cmake  text
 *.yml    text
 *.txt    text
+*.svg    text
 
 # Windows batch and shell scripts need their own endings to run at all.
 *.bat    text eol=crlf
@@ -25,7 +26,9 @@
 
 # Binary assets. Without this, git treats them as text and a checkout on a machine with
 # different line-ending settings silently corrupts them.
-*.ico    binary
+#
+# `.ico` is absent on purpose: the raster icons are not tracked here (see .gitignore).
+# Listing a pattern for a file type that cannot be committed only suggests it might be.
 *.png    binary
 *.vsix   binary
 *.dll    binary
@@ -56,9 +59,14 @@
 # counted as ASP.NET -- which is what the repository reported before this file existed.
 # The override is what stops that, once Axiom is a registered language.
 
-# Samples, fixtures and examples are not part of the implementation. Excluding them keeps
-# the percentages on the repository page describing the compiler and its libraries rather
-# than the test data. They still highlight; this only affects statistics.
+# Everything written in Axiom counts. Test programs and examples are Axiom source too --
+# excluding them would describe the repository as a C++ project with a small language
+# attached, which is the opposite of what it is. An earlier version of this file did
+# exclude them, and the arithmetic is worth recording: with tests and examples counted,
+# Axiom is the largest language at ~49% of the tree; without them it drops to ~39% and
+# falls behind C++. Whether a repository's tests are part of it is a judgement call; here
+# they are, because the standard library is verified by programs written in the language.
+#
+# Only the grammar sample is excluded, since it is a fixture for the highlighter rather
+# than part of the implementation.
 editors/samples/*  linguist-documentation
-tests/**           linguist-detectable=false
-examples/**        linguist-detectable=false

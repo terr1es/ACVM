@@ -20,6 +20,14 @@ source .ax ──► Lexer ──► Parser ──► Sema ──► IRGen ─�
   (arena) allocation, single-exit functions via `eof`, and cooperative scheduling with
   compiler-inserted safe points.
 
+Axiom is the largest language in this repository — roughly 32,000 of its 66,000 lines,
+against 24,000 of C++. GitHub does not show that yet: its language detection knows only
+the languages in [linguist's database](https://github.com/github-linguist/linguist/blob/main/lib/linguist/languages.yml),
+and Axiom is not one of them, so `.ax` files appear under no language at all. Registering
+it needs a minimum volume of use across repositories that a new language has not reached.
+The grammar in [`editors/`](editors/) is what makes the code readable in an editor today.
+
+
 ## Building
 
 Requires CMake ≥ 3.20 and any C++20 compiler. Tested with clang 23 (llvm-mingw) on
@@ -194,7 +202,7 @@ tests/        Script tests, C++ unit tests, differential harnesses, fixtures
 examples/     Runnable programs
 tools/        verify_tutorial.py and the acvm wrapper
 editors/      A TextMate grammar for syntax highlighting, and sample files
-brand/        Icon sources and the generator that produces the .ico files
+brand/        The logo as SVG, for anyone who needs it at another size
 .gitattributes  Line endings, and telling GitHub that .ax/.axd are Axiom
 ```
 
