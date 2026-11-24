@@ -204,6 +204,7 @@ set(ACVM_STDLIB_MODULES
     os          # environment, process control, machine information
     parallel    # OS threads over plain data
     threadpool  # persistent workers plus real OS locks
+    adb         # the Axiom Debugger: breakpoints, stepping, capture
 )
 
 # The official extra modules. Same shape as a stdlib module, different promise:
@@ -412,6 +413,26 @@ if(ACVM_BUILD_TESTS)
                             ternary_check int128_check methods_check ${ACVM_EXTRALIB_CHECKS})
         acvm_add_script_check(${check_name})
     endforeach()
+
+    # The debugger's test is a transcript: a scripted session is run and its
+    # output is compared with the expected file. `adb` is a stdlib module, so the
+    # check exists whenever the module and its library do.
+    add_test(NAME adb_check
+             COMMAND ${CMAKE_COMMAND}
+                     -DACVM=$<TARGET_FILE:acvm>
+                     -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/tests/adb_check.txt
+                     -DPROGRAM=${CMAKE_CURRENT_SOURCE_DIR}/tests/adb_check.ax
+                     -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/adb_check.expected
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_adb_transcript.cmake)
+
+    # A debugger that changes the program's behaviour is worse than no debugger.
+    # Running the same program with and without the hook must produce identical
+    # output, which also proves the hook costs nothing when it is not a stop.
+    add_test(NAME adb_no_interference
+             COMMAND ${CMAKE_COMMAND}
+                     -DACVM=$<TARGET_FILE:acvm>
+                     -DPROGRAM=${CMAKE_CURRENT_SOURCE_DIR}/tests/adb_passthrough.ax
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_adb_passthrough.cmake)
 
     # Passing arguments is the point of this one, so it runs with some.
     acvm_add_script_check(args_check -- alpha beta "two words")

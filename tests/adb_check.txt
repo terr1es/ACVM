@@ -1,0 +1,39 @@
+# A scripted debugging session: every line is a command the prompt would accept.
+# ctest diffs the transcript against adb_check.expected.
+#
+# The first stop is automatic. A debugger that could only stop at a breakpoint
+# could never be told where to put one.
+
+# 1. capture a window with a breakpoint in the middle of it
+capture on
+b inner
+continue
+capture dump
+capture off
+
+# 2. the backtrace shows the four frames that led here
+bt
+
+# 3. stepping is refused in a script: there is nobody to answer the next prompt
+step
+next
+
+# 4. the line table: a statement breakpoint fires once per visit, not once per
+#    instruction. Line 48 is `int first = outer(3);`, which compiles to several.
+delete
+b adb_check.ax:48
+continue
+
+# 5. a line inside a loop body: four visits, four stops
+delete
+b adb_check.ax:36
+continue
+continue
+continue
+continue
+
+# 6. the trap path. The division by zero ends the run and the debugger says why.
+delete
+b divide
+continue
+continue

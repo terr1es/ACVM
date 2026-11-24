@@ -1,6 +1,7 @@
 //===--- VM.cpp - Memory, scheduling and the interpreter loop ----------===//
 #include "acvm/VM/VM.h"
 
+#include "acvm/IR/Disassembler.h"
 #include "acvm/Sema/Builtin.h"
 #include "VMInternal.h"
 
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -176,15 +178,12 @@ VM::VM(std::ostream& out, std::ostream& err)
 // `library "x";` in a .ax file turns its bodyless functions into external ones.
 // The .acvm records the library name and the symbol, and this is where they are
 // resolved -- at run time, so adding a C function needs a new .dll/.so rather
-// than a new compiler.
+// than a new compiler (docs/NATIVE.md).
 //
 // A module that uses no external functions never reaches this code, which is
 // what keeps the common case self contained.
 
-namespace {
-
-/// Opaque handle wrappers, so the platform headers stay in this file.
-void* openLibrary(const std::string& name) {
+void* vmOpenLibrary(const std::string& name) {
 #if defined(_WIN32)
     return reinterpret_cast<void*>(::LoadLibraryA(name.c_str()));
 #else
@@ -192,7 +191,7 @@ void* openLibrary(const std::string& name) {
 #endif
 }
 
-void* lookupSymbol(void* handle, const std::string& symbol) {
+void* vmLookupSymbol(void* handle, const std::string& symbol) {
     if (handle == nullptr) {
         return nullptr;
     }
@@ -203,7 +202,7 @@ void* lookupSymbol(void* handle, const std::string& symbol) {
 #endif
 }
 
-void closeLibrary(void* handle) {
+void vmCloseLibrary(void* handle) {
     if (handle == nullptr) {
         return;
     }
@@ -213,6 +212,8 @@ void closeLibrary(void* handle) {
     ::dlclose(handle);
 #endif
 }
+
+namespace {
 
 std::string loaderError() {
 #if defined(_WIN32)
@@ -256,26 +257,23 @@ std::vector<std::string> libraryFileNames(const std::string& name) {
 VM::~VM() {
     for (void* handle : m_libraryHandles) {
         if (handle != nullptr) {
-            // Ask the library to clean up before unloading it.
+            // 卸载之前先问库要不要收拾自己。
             //
-            // Not politeness -- it is required. `parallel` caches a resident thread
-            // pool whose workers sit inside `SleepConditionVariableCS` / `Sleep`.
-            // After `FreeLibrary` their code pages are unmapped, so the next time a
-            // worker wakes up and returns, its PC points at released memory.
-            // Measured: the crash reports `access=execute` with the target inside a
-            // MEM_FREE region at an address like 0x7FF9... (the base range Windows
-            // uses for system DLLs). It happened roughly once every dozen runs.
+            // 这不是礼貌，是必需：`parallel` 会缓存一个常驻线程池，worker 在
+            // `SleepConditionVariableCS` / `Sleep` 里长眠。`FreeLibrary` 之后它们
+            // 的代码页被解除映射，下一次醒来返回时 PC 就指向已释放的地址 ——
+            // 实测崩溃报 `access=execute`、目标落在 MEM_FREE 区、地址形如
+            // 0x7FF9...（系统 DLL 的基址段）。每十几次运行出一次。
             //
-            // The hook is optional: a library that does not export it is skipped,
-            // and ordinary libraries are unaffected.
+            // 钩子是可选的：库没导出就跳过，普通库不受影响。
             using ShutdownFn = void (*)();
             auto shutdown = reinterpret_cast<ShutdownFn>(
-                lookupSymbol(handle, "acvm_stdlib_shutdown"));
+                vmLookupSymbol(handle, "acvm_stdlib_shutdown"));
             if (shutdown != nullptr) {
                 shutdown();
             }
         }
-        closeLibrary(handle);
+        vmCloseLibrary(handle);
     }
 }
 
@@ -312,7 +310,7 @@ void* VM::resolveExternal(const Function& function, std::size_t functionIndex,
             // toolchain's), then the platform loader path.
             bool opened = false;
             for (const std::string& directory : m_libraryPath) {
-                void* handle = openLibrary(directory + "/" + candidate);
+                void* handle = vmOpenLibrary(directory + "/" + candidate);
                 if (handle != nullptr) {
                     m_libraryHandles[static_cast<std::size_t>(library)] = handle;
                     opened = true;
@@ -322,7 +320,7 @@ void* VM::resolveExternal(const Function& function, std::size_t functionIndex,
             if (opened) {
                 break;
             }
-            void* handle = openLibrary(candidate);
+            void* handle = vmOpenLibrary(candidate);
             if (handle != nullptr) {
                 m_libraryHandles[static_cast<std::size_t>(library)] = handle;
                 break;
@@ -337,7 +335,7 @@ void* VM::resolveExternal(const Function& function, std::size_t functionIndex,
     }
 
     void* handle = m_libraryHandles[static_cast<std::size_t>(library)];
-    void* symbol = lookupSymbol(handle, function.externalSymbol);
+    void* symbol = vmLookupSymbol(handle, function.externalSymbol);
     if (symbol == nullptr) {
         error = "library '" + m_module->externalLibraries[static_cast<std::size_t>(library)] +
                 "' does not export '" + function.externalSymbol +
@@ -356,6 +354,117 @@ void* VM::resolveExternal(const Function& function, std::size_t functionIndex,
         m_externalResolved[functionIndex] = 1;
     }
     return symbol;
+}
+
+//===----------------------------------------------------------------------===//
+// Debugger attachment
+//===----------------------------------------------------------------------===//
+
+void VM::setDebugHooks(const DebugHooks* hooks) {
+    if (hooks == nullptr || hooks->apiVersion != kDebugApiVersion) {
+        m_debugHooks = DebugHooks{};
+        m_debugAttached = false;
+        m_debugAborted = false;
+        return;
+    }
+    m_debugHooks = *hooks;
+    m_debugAttached = true;
+    m_debugAborted = false;
+    refreshDebugInfo();
+}
+
+void VM::refreshDebugInfo() {
+    // Rebuilt whenever the module changes, because every callback closes over
+    // `this` and resolves against `m_module`.
+    m_debugInfo = DebugInfo{};
+    m_debugInfo.apiVersion = kDebugApiVersion;
+    m_debugInfo.host = this;
+    m_debugInfo.functionCount = [](void* host) -> std::int32_t {
+        const VM* vm = static_cast<const VM*>(host);
+        return vm->m_module == nullptr ? 0
+                                       : static_cast<std::int32_t>(vm->m_module->functions.size());
+    };
+    m_debugInfo.functionName = [](void* host, std::int32_t index) -> const char* {
+        VM* vm = static_cast<VM*>(host);
+        if (vm->m_module == nullptr || index < 0 ||
+            static_cast<std::size_t>(index) >= vm->m_module->functions.size()) {
+            return "";
+        }
+        return vm->m_module->functions[static_cast<std::size_t>(index)].name.c_str();
+    };
+    m_debugInfo.functionHasCode = [](void* host, std::int32_t index) -> std::int32_t {
+        const VM* vm = static_cast<const VM*>(host);
+        if (vm->m_module == nullptr || index < 0 ||
+            static_cast<std::size_t>(index) >= vm->m_module->functions.size()) {
+            return 0;
+        }
+        return vm->m_module->functions[static_cast<std::size_t>(index)].code.empty() ? 0 : 1;
+    };
+    m_debugInfo.instructionCount = [](void* host, std::int32_t index) -> std::int32_t {
+        const VM* vm = static_cast<const VM*>(host);
+        if (vm->m_module == nullptr || index < 0 ||
+            static_cast<std::size_t>(index) >= vm->m_module->functions.size()) {
+            return 0;
+        }
+        return static_cast<std::int32_t>(
+            vm->m_module->functions[static_cast<std::size_t>(index)].code.size());
+    };
+    m_debugInfo.opcodeName = [](void* host, std::int32_t opcode) -> const char* {
+        VM* vm = static_cast<VM*>(host);
+        // `opCodeName` returns a view into a static table, but the ABI is
+        // `const char*`, so a wrapper keeps the lifetime obvious.
+        const std::string_view name = opCodeName(static_cast<OpCode>(opcode));
+        vm->m_debugScratch.assign(name);
+        return vm->m_debugScratch.c_str();
+    };
+    m_debugInfo.instructionText = [](void* host, std::int32_t index, std::int32_t ip) -> const char* {
+        VM* vm = static_cast<VM*>(host);
+        if (vm->m_module == nullptr || index < 0 || ip < 0 ||
+            static_cast<std::size_t>(index) >= vm->m_module->functions.size()) {
+            return "";
+        }
+        const Function& function = vm->m_module->functions[static_cast<std::size_t>(index)];
+        if (static_cast<std::size_t>(ip) >= function.code.size()) {
+            return "";
+        }
+        std::ostringstream text;
+        formatInstruction(*vm->m_module, function, static_cast<std::size_t>(ip), text);
+        vm->m_debugScratch = text.str();
+        return vm->m_debugScratch.c_str();
+    };
+    m_debugInfo.sourceFile = [](void* host, std::int32_t index, std::int32_t ip) -> const char* {
+        VM* vm = static_cast<VM*>(host);
+        if (vm->m_module == nullptr || index < 0 || ip < 0 ||
+            static_cast<std::size_t>(index) >= vm->m_module->functions.size()) {
+            return "";
+        }
+        const Function& function = vm->m_module->functions[static_cast<std::size_t>(index)];
+        const SourceLine at = function.lineAt(static_cast<std::size_t>(ip));
+        if (!at.isValid() || at.file >= vm->m_module->sourceFiles.size()) {
+            return "";
+        }
+        return vm->m_module->sourceFiles[at.file].c_str();
+    };
+    m_debugInfo.sourceLine = [](void* host, std::int32_t index, std::int32_t ip) -> std::int32_t {
+        const VM* vm = static_cast<const VM*>(host);
+        if (vm->m_module == nullptr || index < 0 || ip < 0 ||
+            static_cast<std::size_t>(index) >= vm->m_module->functions.size()) {
+            return 0;
+        }
+        const Function& function = vm->m_module->functions[static_cast<std::size_t>(index)];
+        const SourceLine at = function.lineAt(static_cast<std::size_t>(ip));
+        return at.isValid() ? static_cast<std::int32_t>(at.line) : 0;
+    };
+    m_debugInfo.entryFunctionName = [](void* host) -> const char* {
+        VM* vm = static_cast<VM*>(host);
+        if (vm->m_module == nullptr || vm->m_module->entryPoint < 0 ||
+            static_cast<std::size_t>(vm->m_module->entryPoint) >=
+                vm->m_module->functions.size()) {
+            return "";
+        }
+        return vm->m_module->functions[static_cast<std::size_t>(vm->m_module->entryPoint)]
+            .name.c_str();
+    };
 }
 
 //===----------------------------------------------------------------------===//
@@ -845,6 +954,8 @@ std::uint64_t VM::makeStringOnHeap(const std::string& text) {
 
 bool VM::prepare(const Module& module, std::string& error) {
     m_module = &module;
+    // Before anything runs: a debugger resolves function names through this table.
+    refreshDebugInfo();
     m_heapTop = kHeapBase;
     m_heapBlocks.clear();
     m_stringAddresses.assign(module.strings.size(), 0);
@@ -902,6 +1013,13 @@ bool VM::run(const Module& module, std::string& error) {
         return false;
     }
 
+    // The debugger learns the program here, before the global initialiser runs:
+    // a breakpoint inside a global's initialiser is unusual but legal, and it
+    // should behave like any other.
+    if (m_debugAttached && m_debugHooks.onStart != nullptr) {
+        m_debugHooks.onStart(m_debugHooks.user, &m_debugInfo);
+    }
+
     if (module.initFunction >= 0) {
         if (!runFunctionToCompletion(module.initFunction, error)) {
             return false;
@@ -943,13 +1061,24 @@ bool VM::run(const Module& module, std::string& error) {
             }
             anyRunnable = true;
             if (!runQuantum(process, error)) {
+                // The trap message is already in `error`; the debugger gets it
+                // verbatim so it can show exactly what the VM would have printed.
+                if (m_debugAttached && m_debugHooks.onTrap != nullptr) {
+                    m_debugHooks.onTrap(m_debugHooks.user, error.c_str());
+                }
                 return false;
             }
             if (process.isMain && process.finished) {
+                if (m_debugAttached && m_debugHooks.onFinish != nullptr) {
+                    m_debugHooks.onFinish(m_debugHooks.user);
+                }
                 return true;
             }
         }
         if (!anyRunnable) {
+            if (m_debugAttached && m_debugHooks.onFinish != nullptr) {
+                m_debugHooks.onFinish(m_debugHooks.user);
+            }
             return true;
         }
     }

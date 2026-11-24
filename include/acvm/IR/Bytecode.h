@@ -124,6 +124,21 @@ struct Instruction {
     std::int32_t b = 0;
 };
 
+/// Where an instruction came from: a file index into `Module::sourceFiles` and a
+/// 1-based line. Both zero means "unknown", which is what an optimizer-generated
+/// instruction and a module without source information carry.
+///
+/// 16 bits for the file (65535 files is beyond any single program) and 32 for the
+/// line: the pair fits in 6 bytes and is stored as two numbers, so the format does
+/// not depend on struct padding.
+struct SourceLine {
+    std::uint16_t file = 0;
+    std::uint32_t line = 0;
+
+    [[nodiscard]] bool isValid() const { return line != 0; }
+    friend bool operator==(const SourceLine&, const SourceLine&) = default;
+};
+
 /// One parameter as the calling convention sees it.
 struct ParamInfo {
     std::uint32_t offset = 0;   // frame offset of the parameter slot
@@ -186,8 +201,27 @@ struct Function {
     std::vector<Instruction> code;
     std::vector<Value> constants;
 
+    /// Source position of every instruction, parallel to `code`.
+    ///
+    /// Two vectors rather than a field inside `Instruction`: the optimizer rewrites
+    /// instructions in place (`code[i] = Instruction{...}`) far more often than it
+    /// changes the length of the vector, and a parallel array keeps the line for
+    /// free at every such site. The only pass that has to move it is `compact()`.
+    ///
+    /// Empty when the module was built without source information (a hand-written
+    /// module, or a `.acvm` from before format v4). Every reader must treat empty
+    /// as "unknown", never as line 0.
+    std::vector<SourceLine> lines;
+
+    /// Set by the front end before emitting a statement; `emit()` copies it into
+    /// `lines`. Zero means "no position known" and is stored as such.
+    SourceLine currentLine;
+
     std::size_t addConstant(Value value);
     std::size_t emit(OpCode op, std::int32_t a = 0, std::int32_t b = 0);
+
+    /// Source position of the instruction at `index`, or an invalid one.
+    [[nodiscard]] SourceLine lineAt(std::size_t index) const;
     std::size_t emitJump(OpCode op);
     void patchJump(std::size_t position, std::size_t target);
 };
@@ -206,6 +240,11 @@ struct Module {
     std::vector<GlobalSlot> globals;
     std::vector<MemType> memTypes;
     std::vector<std::string> strings;
+
+    /// Source files referenced by the line tables, in first-use order. A file
+    /// index stored in `SourceLine` points here, so a compiled module carries the
+    /// names it needs to print `main.ax:42` without the sources being present.
+    std::vector<std::string> sourceFiles;
 
     std::uint32_t globalDataSize = 0;
     int entryPoint = -1;

@@ -131,7 +131,7 @@ bool IRGen::generate(Unit& unit, Module& module) {
 
     // Functions that were declared but never defined become trap stubs -- unless
     // the file is a library declaration file, where a missing body means "the
-    // implementation is in a shared library".
+    // implementation is in a shared library" (see docs/NATIVE.md).
     for (std::size_t i = 0; i < m_sema.functions().size(); ++i) {
         const FuncInfo& info = m_sema.functions()[i];
         Function& function = module.functions[i];
@@ -680,7 +680,40 @@ void IRGen::emitStmtList(std::vector<StmtPtr>& stmts) {
     }
 }
 
+void IRGen::setCurrentLine(const SourceRange& range) {
+    if (m_sources == nullptr || m_fn == nullptr) {
+        return;
+    }
+    if (!range.isValid()) {
+        m_fn->currentLine = SourceLine{};
+        return;
+    }
+    // Intern the file name in the module: a `.acvm` must be able to print
+    // `main.ax:42` later, when the sources may not be on disk.
+    const std::string path(m_sources->path(range.begin.file));
+    std::uint16_t fileIndex = 0;
+    bool found = false;
+    for (std::size_t i = 0; i < m_module->sourceFiles.size(); ++i) {
+        if (m_module->sourceFiles[i] == path) {
+            fileIndex = static_cast<std::uint16_t>(i);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        if (m_module->sourceFiles.size() >= 65535) {
+            m_fn->currentLine = SourceLine{};
+            return;
+        }
+        fileIndex = static_cast<std::uint16_t>(m_module->sourceFiles.size());
+        m_module->sourceFiles.push_back(path);
+    }
+    m_fn->currentLine.file = fileIndex;
+    m_fn->currentLine.line = m_sources->lineColumn(range.begin).line;
+}
+
 void IRGen::emitStmt(Stmt& stmt) {
+    setCurrentLine(stmt.range);
     switch (stmt.kind) {
     case StmtKind::VarDecl: {
         if (stmt.isComptime || stmt.varType == nullptr) {
@@ -694,7 +727,7 @@ void IRGen::emitStmt(Stmt& stmt) {
         }
         // A scalar initialiser overwrites the whole slot, so zeroing first
         // would be a dead store. Without an initialiser the zeroing is what
-        // makes uninitialised reads deterministic.
+        // makes uninitialised reads deterministic (docs/LANGUAGE.md, D8).
         if (stmt.init != nullptr && stmt.init->kind != ExprKind::InitList &&
             !type->isAggregate()) {
             emitExpr(*stmt.init);

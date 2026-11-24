@@ -1,0 +1,28 @@
+//  adb_passthrough.ax — a program with no trap, run with and without the debugger.
+//
+//  `tests/check_adb_passthrough.cmake` compares the two runs. The point is the
+//  hook itself: installing a debugger must not change what the program computes,
+//  how much it prints, or the order of the lines. A debugger that perturbs timing
+//  or output is a debugger that hides the bug it was brought in to find.
+
+function fib(int n):int {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+function main():void {
+    int i = 0;
+    while (i < 8) {
+        print(fib(i));
+        print(" ");
+        i = i + 1;
+    }
+    print("\n");
+
+    string text = "hello, axiom";
+    print(text);
+    print("\n");
+    eof: pass;
+}

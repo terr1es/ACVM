@@ -1,0 +1,60 @@
+//  adb_check.ax — a program the debugger is run against.
+//
+//      acvm run --adb --adb-script tests/adb_check.txt tests/adb_check.ax
+//
+//  This file is not a test on its own: every assertion is in the transcript
+//  (`adb_check.txt`) and in the `add_test` that diffs the two. Keeping the
+//  fixture in Axiom rather than in C is what makes the test read like a debugging
+//  session -- which is the thing being tested.
+//
+//  The shapes it deliberately contains:
+//
+//    * three nested calls, so a backtrace has something to show
+//    * a loop, so a line breakpoint has a line to re-enter
+//    * a division that traps, so capture has something to dump
+//    * a source line with several instructions, so `b file:line` can be checked
+//      for firing once rather than once per instruction
+
+function inner(int value):int {
+    int doubled = value * 2;
+    return doubled;
+}
+
+function middle(int value):int {
+    int result = inner(value);
+    return result + 1;
+}
+
+function outer(int value):int {
+    int result = middle(value);
+    return result;
+}
+
+function sumTo(int limit):int {
+    int total = 0;
+    for (int i = 1; i <= limit; i++) {
+        total = total + i;
+    }
+    return total;
+}
+
+function divide(int a, int b):int {
+    int quotient = a / b;
+    return quotient;
+}
+
+function main():void {
+    int first = outer(3);
+    print("outer=");
+    print(first);
+    print("\n");
+
+    int total = sumTo(4);
+    print("sum=");
+    print(total);
+    print("\n");
+
+    int broken = divide(9, 0);
+    print(broken);
+    eof: pass;
+}

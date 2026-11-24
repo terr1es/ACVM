@@ -1,0 +1,89 @@
+//  adb.ax — the Axiom half of the debugger: named entry points.
+//
+//      function import (return:(adb));
+//
+//      if (adbIsAttached() != 0) {
+//          adbBreakAt("jsonParse");
+//          adbCaptureOn();
+//      }
+//
+//  Every function here forwards to the native library declared in `adb.axd`.
+//  Nothing is reimplemented: an Axiom debugger cannot stop an Axiom program,
+//  which is the whole reason the VM owns a hook slot.
+//
+//  ── why wrappers at all ───────────────────────────────────────────────────
+//
+//  `adbBreak("main:12")` needs a string argument to be spelled out at every call
+//  site, and the three common cases deserve names: a function, a source line, and
+//  "here". They also give the documentation one place to explain what a
+//  breakpoint on a line means when optimization moved the instructions around.
+
+module "adb" version "0.1.0";
+
+//  depends: (none)
+
+function import (return:(adb));
+
+//  Stops on entry to `name`. Returns 0 when the breakpoint was set, -1 when there
+//  is no function of that name (or no debugger attached).
+//
+//  The stop happens when the function is *entered* -- instruction 0 -- so a
+//  recursive function stops once per call. That is what a reader expects from a
+//  function breakpoint; to stop once, delete the breakpoint after the first hit
+//  from the prompt.
+function adbBreakAt(string name):int {
+    return adbBreak(name);
+    eof: pass;
+}
+
+//  Stops at a source line. `file` may be a bare name (`main.ax`), a path, or ""
+//  for "that line in any file".
+//
+//  Lines and instructions are not one to one: the compiler emits several
+//  instructions per statement, and optimization may reorder them. The breakpoint
+//  fires at the **first instruction of the statement starting on that line**, which
+//  is what stepping by line does in any debugger. Building with `-O0` keeps the
+//  mapping exact when it matters.
+function adbBreakLine(string file, int line):int {
+    string spec = "";
+    if (file.length > 0) {
+        spec = file + ":" + itoa(line, 10);
+    } else {
+        spec = ":" + itoa(line, 10);
+    }
+    return adbBreak(spec);
+    eof: pass;
+}
+
+//  Stops at `instruction` inside the named function -- the only form stable across
+//  optimization levels, because it names an address instead of a statement.
+function adbBreakAtInstruction(string name, int instruction):int {
+    return adbBreak(name + ":" + itoa(instruction, 10));
+    eof: pass;
+}
+
+//  Turns the capture ring on. Returns the previous state, so a nested call can
+//  put it back:
+//
+//      int was = adbCaptureOn();
+//      ...the suspicious section...
+//      adbCapture(was);
+function adbCaptureOn():int {
+    return adbCapture(1);
+    eof: pass;
+}
+
+function adbCaptureOff():int {
+    return adbCapture(0);
+    eof: pass;
+}
+
+//  A readable summary for a log line: "adb: attached, 2 stop(s)" or
+//  "adb: not attached".
+function adbStatus():string {
+    if (adbIsAttached() == 0) {
+        return "adb: not attached";
+    }
+    return "adb: attached, " + itoa(adbStopCount(), 10) + " stop(s)";
+    eof: pass;
+}

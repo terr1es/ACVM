@@ -42,6 +42,9 @@ void printUsage(std::ostream& out) {
         << "  --no-assert        Disable 'assert' checks (and their arguments)\n"
         << "  --stats            Report how many instructions the program executed\n"
         << "  --stats-detail     Also break the count down per opcode\n"
+        << "  --adb              Run under the Axiom Debugger (interactive prompt)\n"
+        << "  --break <spec>     Breakpoint: 'main', 'main:12', 'prog.ax:42', ':42'\n"
+        << "  --adb-script <f>   Read debugger commands from a file (implies --adb)\n"
         << "  --                 Everything after this goes to the program\n"
         << "                     (read it with argCount() / argAt(i))\n";
 }
@@ -65,17 +68,14 @@ int usageError(const std::string& message) {
 
 #ifdef _WIN32
 #include <windows.h>
-/// Print the exception code, the faulting address and the thread id to stderr instead
-/// of letting the process vanish.
+/// 崩溃时把异常码、访问类型和目标地址打到 stderr，而不是让进程静默消失。
 ///
-/// This exists because of a concrete lesson. The `parallel` thread pool had an
-/// intermittent crash: `access=execute`, the target inside a MEM_FREE region, at an
-/// address like 0x7FF9... (the base range of a system DLL). Without these three lines of
-/// output it was "a segfault, sometimes"; with them it was obvious that control had
-/// jumped into a released code page -- a worker still running after `FreeLibrary`.
+/// 保留它是因为一个真实的教训：`parallel` 的线程池有一个偶发崩溃，表现是
+/// `access=execute`、目标落在 MEM_FREE 区、地址形如 0x7FF9...（系统 DLL 的基址段）。
+/// 没有这三行输出时它只是一个「有时段错误」的谜；有了它，才看出那是控制流跳进了
+/// 已释放的代码页 —— 也就是 worker 在 `FreeLibrary` 之后还在跑。
 ///
-/// Deliberately minimal, with no stack walk: a stack walk changes timing and would hide
-/// exactly this class of race.
+/// 只做最小工作（不做栈回溯）：栈回溯本身会改变时序，把这类竞争 bug 藏起来。
 static LONG WINAPI acvmCrashFilter(EXCEPTION_POINTERS* info) {
     const EXCEPTION_RECORD* rec = info->ExceptionRecord;
     std::fprintf(stderr, "[crash] code=0x%08lX at %p tid=%lu\n",
@@ -157,6 +157,20 @@ int main(int argc, char** argv) {
             options.assertions = false;
         } else if (arg == "--stats") {
             options.stats = true;
+        } else if (arg == "--adb") {
+            options.adb = true;
+        } else if (arg == "--break") {
+            if (i + 1 >= args.size()) {
+                return usageError("'--break' requires a specification");
+            }
+            options.adbBreaks.push_back(args[++i]);
+            options.adb = true;
+        } else if (arg == "--adb-script") {
+            if (i + 1 >= args.size()) {
+                return usageError("'--adb-script' requires a path");
+            }
+            options.adbScript = args[++i];
+            options.adb = true;
         } else if (arg == "--stats-detail") {
             options.stats = true;
             options.statsDetail = true;

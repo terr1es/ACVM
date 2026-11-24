@@ -90,7 +90,15 @@ std::size_t Function::addConstant(Value value) {
 
 std::size_t Function::emit(OpCode op, std::int32_t a, std::int32_t b) {
     code.push_back(Instruction{op, a, b});
+    lines.push_back(currentLine);
     return code.size() - 1;
+}
+
+SourceLine Function::lineAt(std::size_t index) const {
+    if (index >= lines.size()) {
+        return SourceLine{};
+    }
+    return lines[index];
 }
 
 std::size_t Function::emitJump(OpCode op) { return emit(op, 0, 0); }

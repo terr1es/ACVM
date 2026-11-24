@@ -671,6 +671,33 @@ VM::Step VM::step(Process& process, std::string& error) {
             }
             --m_budget;
 
+            // The debugger sees the instruction *before* it executes, which is the only
+            // moment at which a breakpoint can prevent it. One pointer test when nothing
+            // is attached; the callback itself decides whether to stop.
+            if (m_debugAttached) {
+                DebugStepInfo info;
+                // The frame holds a pointer into the module's function table; the ABI
+                // wants an index, so the difference is computed rather than stored.
+                const std::ptrdiff_t ordinal =
+                    m_module == nullptr ? -1 : frame.function - m_module->functions.data();
+                info.functionIndex = ordinal >= 0 ? static_cast<std::int32_t>(ordinal) : -1;
+                info.ip = static_cast<std::int32_t>(ip);
+                info.opcode = static_cast<std::int32_t>(code[ip].op);
+                info.operandA = code[ip].a;
+                info.operandB = code[ip].b;
+                info.frameDepth = static_cast<std::int32_t>(process.frames.size());
+                info.instructionsRetired = static_cast<std::int64_t>(m_instructions);
+                if (m_debugHooks.beforeInstruction != nullptr &&
+                    m_debugHooks.beforeInstruction(m_debugHooks.user, &info) ==
+                        DebugAction::Abort) {
+                    m_debugAttached = false;
+                    m_debugAborted = true;
+                    frame.ip = ip;
+                    trap(error, TrapKind::Unreachable, "stopped by the debugger");
+                    return Step::Trap;
+                }
+            }
+
             const Instruction& inst = code[ip];
             ++ip;
             ++m_instructions;

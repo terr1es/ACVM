@@ -6,6 +6,7 @@
 
 #include <iosfwd>
 #include <string>
+#include <vector>
 
 namespace acvm {
 
@@ -28,6 +29,19 @@ struct DriverOptions {
     /// and the level at which constant folding and branch resolution are on but
     /// nothing speculative happens.
     OptLevel optimize = OptLevel::O2;
+
+    /// Attach the Axiom Debugger (`--adb`). The debugger itself lives in
+    /// `stdlib/adb.c`; this flag only closes the circuit between the VM's hook
+    /// slot and that library, so a run without it pays one pointer test per
+    /// instruction and nothing else.
+    bool adb = false;
+    /// Breakpoints given on the command line, in `adbBreak` syntax.
+    std::vector<std::string> adbBreaks;
+    /// Read debugger commands from this file instead of the terminal. A scripted
+    /// session is how the debugger is tested: the transcript is the assertion.
+    std::string adbScript;
+    /// Suppress the banner and the per-stop chatter (for scripted runs).
+    bool adbQuiet = false;
 };
 
 /// Wires the stages together:
@@ -55,6 +69,12 @@ public:
 
 private:
     bool compile(const std::string& path, Module& module, const DriverOptions& options);
+
+    /// Loads `adb` next to the standard library and installs its hooks into the
+    /// VM. Returns false with a message when `--adb` was requested but the library
+    /// is missing -- a debugger that silently does not attach is worse than one
+    /// that refuses to start.
+    bool attachDebugger(VM& vm, const DriverOptions& options, std::string& error);
 
     std::vector<std::string> m_programArgs;
     /// Loads every file reachable from `root`'s import declarations and merges

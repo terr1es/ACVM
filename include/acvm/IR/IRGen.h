@@ -2,6 +2,7 @@
 #pragma once
 
 #include "acvm/AST/AST.h"
+#include "acvm/Common/SourceManager.h"
 #include "acvm/IR/Bytecode.h"
 #include "acvm/Sema/Sema.h"
 
@@ -25,7 +26,7 @@ class DiagnosticEngine;
 ///
 /// The whole frame is zeroed on entry so that padding bytes inside aggregates
 /// are deterministic; that makes byte-wise equality equivalent to member-wise
-/// equality.
+/// equality (docs/LANGUAGE.md, D8).
 class IRGen {
 public:
     IRGen(DiagnosticEngine& diagnostics, Sema& sema);
@@ -33,6 +34,11 @@ public:
     bool generate(Unit& unit, Module& module);
 
     void setAssertionsEnabled(bool enabled) { m_assertions = enabled; }
+
+    /// Source of file names and line numbers for the line tables. Optional: a
+    /// caller that only wants bytecode (a test, an embedder) leaves it null and
+    /// every instruction records an unknown position.
+    void setSourceManager(const SourceManager* sources) { m_sources = sources; }
 
 private:
     struct LoopContext {
@@ -51,6 +57,14 @@ private:
     void emitFunctionBody(Stmt& decl, int funcIndex);
     void emitGlobalInit(Unit& unit);
     void emitEventCondition(Stmt& decl, int funcIndex);
+
+    const SourceManager* m_sources = nullptr;
+
+    /// Records `range` as the position of everything emitted until the next
+    /// statement. Called at the top of `emitStmt`, which is the only place that
+    /// knows where a statement starts -- expressions inherit the position of the
+    /// statement that contains them, which is what a breakpoint means.
+    void setCurrentLine(const SourceRange& range);
 
     void emitStmt(Stmt& stmt);
     void emitStmtList(std::vector<StmtPtr>& stmts);

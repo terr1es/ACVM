@@ -2,6 +2,7 @@
 #pragma once
 
 #include "acvm/IR/Bytecode.h"
+#include "acvm/VM/DebugApi.h"
 
 #include <cstdint>
 #include <iosfwd>
@@ -9,6 +10,20 @@
 #include <vector>
 
 namespace acvm {
+
+//===----------------------------------------------------------------------===//
+// Dynamic loading
+//===----------------------------------------------------------------------===//
+//
+// Exposed because the debugger is loaded the same way a native library module is,
+// and there must be exactly one implementation of "open a .dll on this platform":
+// a second copy in the driver would be a second set of #ifdefs to get wrong.
+
+/// Opens a shared library by file name. Returns null on failure.
+void* vmOpenLibrary(const std::string& name);
+/// Resolves a symbol, or null.
+void* vmLookupSymbol(void* handle, const std::string& symbol);
+void vmCloseLibrary(void* handle);
 
 class VM {
 public:
@@ -40,6 +55,22 @@ public:
     /// Lowers the resident-memory cap. Tests use a tiny one so the trap can be
     /// reached in a few pages instead of allocating the full default.
     void setMemoryLimit(std::uint64_t bytes);
+
+    /// Installs or removes the debugger. Pass nullptr to remove.
+    ///
+    /// The VM copies the struct, so the caller may let it go after the call --
+    /// but the `user` pointer and the function pointers must outlive the run.
+    void setDebugHooks(const DebugHooks* hooks);
+
+    /// The info table a debugger reads the program through. Filled in by the VM;
+    /// valid between `prepare` and the end of the run.
+    [[nodiscard]] const DebugInfo& debugInfo() const { return m_debugInfo; }
+
+    /// Builds the info table for the module currently loaded. Called from
+    /// `prepare`, so a debugger can read the program *before* it starts --
+    /// attaching after the first instruction would make breakpoint resolution
+    /// depend on execution order.
+    void refreshDebugInfo();
 
     /// Instructions retired by the last run(). Useful when optimising a
     /// program: on a dispatch loop the count is close to a linear predictor of
@@ -169,6 +200,18 @@ private:
     bool trap(std::string& error, TrapKind kind, const std::string& detail);
 
     const Module* m_module = nullptr;
+
+    /// Debugger attachment. `m_debugHooks` is null unless someone installed one,
+    /// and the step loop tests that pointer once per instruction.
+    DebugHooks m_debugHooks{};
+    bool m_debugAttached = false;
+    bool m_debugAborted = false;
+    DebugInfo m_debugInfo{};
+    /// Set while the VM formats text for a callback, so the returned `const char*`
+    /// stays alive until the next callback. A single buffer is enough because the
+    /// debugger consumes each string before asking for the next.
+    std::string m_debugScratch;
+
     std::ostream& m_out;
     std::ostream& m_err;
 

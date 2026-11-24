@@ -15,6 +15,12 @@ void writeU8(std::ostream& out, std::uint8_t value) {
     out.put(static_cast<char>(value));
 }
 
+void writeU16(std::ostream& out, std::uint16_t value) {
+    const char bytes[2] = {static_cast<char>(value & 0xFFu),
+                           static_cast<char>((value >> 8) & 0xFFu)};
+    out.write(bytes, 2);
+}
+
 void writeU32(std::ostream& out, std::uint32_t value) {
     char bytes[4] = {static_cast<char>(value & 0xFF), static_cast<char>((value >> 8) & 0xFF),
                      static_cast<char>((value >> 16) & 0xFF),
@@ -57,6 +63,16 @@ bool readU8(std::istream& in, std::uint8_t& value) {
         return false;
     }
     value = static_cast<std::uint8_t>(byte);
+    return true;
+}
+
+bool readU16(std::istream& in, std::uint16_t& value) {
+    unsigned char bytes[2];
+    if (!in.read(reinterpret_cast<char*>(bytes), 2)) {
+        return false;
+    }
+    value = static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) |
+                                       (static_cast<std::uint16_t>(bytes[1]) << 8));
     return true;
 }
 
@@ -165,6 +181,13 @@ bool saveModule(const Module& module, const std::string& path, std::string& erro
         writeString(out, text);
     }
 
+    // Source files (v4): the line tables in the functions index into this list,
+    // so a `.acvm` can print `main.ax:42` after the sources are gone.
+    writeU32(out, static_cast<std::uint32_t>(module.sourceFiles.size()));
+    for (const std::string& file : module.sourceFiles) {
+        writeString(out, file);
+    }
+
     // External libraries (v2): the .acvm names the shared objects it needs but
     // does not contain them. Loading happens at run time, so a module with no
     // external functions stays self contained.
@@ -213,10 +236,16 @@ bool saveModule(const Module& module, const std::string& path, std::string& erro
         }
 
         writeU32(out, static_cast<std::uint32_t>(function.code.size()));
-        for (const Instruction& inst : function.code) {
+        for (std::size_t i = 0; i < function.code.size(); ++i) {
+            const Instruction& inst = function.code[i];
             writeU8(out, static_cast<std::uint8_t>(inst.op));
             writeI32(out, inst.a);
             writeI32(out, inst.b);
+            // Position travels with the instruction rather than in a second
+            // section: a debugger reading the code cannot get them out of step.
+            const SourceLine line = i < function.lines.size() ? function.lines[i] : SourceLine{};
+            writeU32(out, line.line);
+            writeU16(out, line.file);
         }
     }
 
@@ -319,6 +348,19 @@ bool loadModule(Module& module, const std::string& path, std::string& error) {
         }
     }
 
+    std::uint32_t sourceFileCount = 0;
+    if (!readU32(in, sourceFileCount)) {
+        error = "truncated source file table";
+        return false;
+    }
+    module.sourceFiles.resize(sourceFileCount);
+    for (std::string& file : module.sourceFiles) {
+        if (!readString(in, file)) {
+            error = "truncated source file table";
+            return false;
+        }
+    }
+
     std::uint32_t libraryCount = 0;
     if (!readU32(in, libraryCount)) {
         error = "truncated external library table";
@@ -412,9 +454,12 @@ bool loadModule(Module& module, const std::string& path, std::string& error) {
             return false;
         }
         function.code.resize(codeCount);
-        for (Instruction& inst : function.code) {
+        function.lines.resize(codeCount);
+        for (std::size_t i = 0; i < function.code.size(); ++i) {
+            Instruction& inst = function.code[i];
             std::uint8_t op = 0;
-            if (!readU8(in, op) || !readI32(in, inst.a) || !readI32(in, inst.b)) {
+            if (!readU8(in, op) || !readI32(in, inst.a) || !readI32(in, inst.b) ||
+                !readU32(in, function.lines[i].line) || !readU16(in, function.lines[i].file)) {
                 error = "truncated code section";
                 return false;
             }

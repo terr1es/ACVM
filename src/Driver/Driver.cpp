@@ -15,6 +15,7 @@
 #include "acvm/Parse/Parser.h"
 #include "acvm/Sema/Sema.h"
 #include "acvm/VM/VM.h"
+#include "acvm/VM/DebugApi.h"
 
 #include <algorithm>
 #include <cctype>
@@ -419,7 +420,7 @@ bool Driver::expandImports(Unit& root, const std::string& rootPath, SourceManage
                 // declares `library "stdlib"`, and stdlib.ax then supplies a
                 // portable fallback. It is compiled in and shipped inside the
                 // .acvm, so the program still runs where the .dll is missing
-                // Sema keeps both: the forward declaration
+                // (docs/PLUGIN.md). Sema keeps both: the forward declaration
                 // carries the symbol, the definition supplies the body.
                 if (declaresLibrary) {
                     const std::filesystem::path fallbackPath =
@@ -580,6 +581,9 @@ bool Driver::compile(const std::string& path, Module& module, const DriverOption
     // and it is why O4 does not promise the same execution flow.
     generator.setAssertionsEnabled(options.assertions &&
                                   !optLevelMayChangeFlow(options.optimize));
+    // Line tables: the debugger needs them, the optimizer moves them, and a
+    // module built without a source manager simply records "unknown" positions.
+    generator.setSourceManager(&sources);
     if (!generator.generate(*unit, module)) {
         return false;
     }
@@ -616,6 +620,101 @@ bool Driver::compile(const std::string& path, Module& module, const DriverOption
     return true;
 }
 
+//===----------------------------------------------------------------------===//
+// Debugger attachment
+//===----------------------------------------------------------------------===//
+
+/// The debugger's own ABI, mirroring `stdlib/adb.c`.
+///
+/// Declared here rather than in a shared header because the direction of the
+/// dependency matters: the VM must not know that `adb` exists, and `adb` must not
+/// include the VM's C++ headers. The driver is the only place that needs both, so
+/// it is the only place that names both.
+namespace {
+
+using AdbInstallFn = std::int64_t (*)(void* infoTable, void* user, void* in, void* out,
+                                      std::int32_t scripting);
+using AdbHooksFn = std::int64_t (*)(void* hookTable);
+using AdbBreakFn = std::int64_t (*)(const char* spec);
+
+struct AdbBindings {
+    void* handle = nullptr;
+    AdbInstallFn install = nullptr;
+    AdbHooksFn hooks = nullptr;
+    AdbBreakFn addBreak = nullptr;
+};
+
+/// Loads `adb.dll` from the same places the VM looks for a module library.
+AdbBindings loadAdb(std::string& error) {
+    AdbBindings bindings;
+    std::vector<std::string> candidates;
+#ifdef ACVM_LIB_DIR
+    candidates.push_back(std::string(ACVM_LIB_DIR) +
+                         (sizeof(void*) == 8 ? "/adb.dll" : "/adb.dll"));
+#endif
+    candidates.push_back("adb.dll");
+    candidates.push_back("libadb.so");
+
+    for (const std::string& path : candidates) {
+        void* handle = vmOpenLibrary(path);
+        if (handle == nullptr) {
+            continue;
+        }
+        bindings.handle = handle;
+        bindings.install = reinterpret_cast<AdbInstallFn>(vmLookupSymbol(handle, "adbInstall"));
+        bindings.hooks = reinterpret_cast<AdbHooksFn>(vmLookupSymbol(handle, "adbHooks"));
+        bindings.addBreak = reinterpret_cast<AdbBreakFn>(vmLookupSymbol(handle, "adbBreak"));
+        if (bindings.install != nullptr && bindings.hooks != nullptr) {
+            return bindings;
+        }
+        vmCloseLibrary(handle);
+        bindings = AdbBindings{};
+    }
+    error = "cannot load 'adb' (build adb.dll next to the standard library, or drop --adb)";
+    return bindings;
+}
+
+} // namespace
+
+bool Driver::attachDebugger(VM& vm, const DriverOptions& options, std::string& error) {
+    AdbBindings bindings = loadAdb(error);
+    if (bindings.handle == nullptr) {
+        return false;
+    }
+
+    // The debugger reads its commands from a file when one was given, so a test
+    // can assert on the transcript. Interactive use keeps stdin.
+    void* input = stdin;
+    FILE* script = nullptr;
+    if (!options.adbScript.empty()) {
+        script = std::fopen(options.adbScript.c_str(), "r");
+        if (script == nullptr) {
+            error = "cannot open the debugger script '" + options.adbScript + "'";
+            return false;
+        }
+        input = script;
+    }
+
+    // The info table has to exist before the debugger starts: `adbBreak` resolves
+    // function names through it, which is what turns a typo into an immediate
+    // message instead of a breakpoint that never fires.
+    const DebugInfo& info = vm.debugInfo();
+    bindings.install(const_cast<DebugInfo*>(&info), nullptr, input, stdout,
+                     script != nullptr ? 1 : 0);
+
+    for (const std::string& spec : options.adbBreaks) {
+        if (bindings.addBreak(spec.c_str()) != 0) {
+            error = "adb: cannot set a breakpoint at '" + spec + "'";
+            return false;
+        }
+    }
+
+    DebugHooks hooks;
+    bindings.hooks(&hooks);
+    vm.setDebugHooks(&hooks);
+    return true;
+}
+
 int Driver::runSource(const std::string& path, const DriverOptions& options) {
     m_stats = options.stats;
     m_statsDetail = options.statsDetail;
@@ -634,6 +733,12 @@ int Driver::runSource(const std::string& path, const DriverOptions& options) {
 #endif
     });
     std::string error;
+    if (options.adb) {
+        if (!attachDebugger(vm, options, error)) {
+            m_err << "error: " << error << '\n';
+            return 1;
+        }
+    }
     const bool ok = vm.run(module, error);
     if (options.stats) {
         reportStats(vm, module);
@@ -747,6 +852,12 @@ int Driver::runBytecode(const std::string& path, const DriverOptions& options) {
         ACVM_LIB_DIR,
 #endif
     });
+    if (options.adb) {
+        if (!attachDebugger(vm, options, error)) {
+            m_err << "error: " << error << '\n';
+            return 1;
+        }
+    }
     const bool ok = vm.run(module, error);
     if (m_stats) {
         reportStats(vm, module);
