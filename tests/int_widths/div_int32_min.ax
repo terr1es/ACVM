@@ -1,0 +1,18 @@
+// `min / -1` is the one division that overflows, and the one the hardware traps on.
+//
+// The VM has to catch it before the divide instruction runs: on x86 a 32 bit `idiv` with
+// this input raises #DE, which is not a signal the interpreter can turn into a language
+// trap. The generic path checks the pair explicitly, and so does the fast path, but only a
+// test proves both do.
+//
+// The companion file mod_int32_min.ax checks the other half of the same coin: the same
+// operands under `%`, where the answer is 0 and nothing should trap.
+
+function main():void {
+    print("before\n");
+    int32 lowest = -2147483647 - 1;
+    int32 minusOne = 0 - 1;
+    int32 boom = lowest / minusOne;
+    print(boom);
+    eof: pass;
+}

@@ -1,0 +1,33 @@
+// int64 overflow, and the values just inside it, in one file.
+//
+// The fast path treats 64 bit integers as the widest native case, so the bound test that
+// guards 32 bit results is skipped there and the overflow has to come from the operation
+// itself. Both directions are worth pinning down: this file must trap at its last line,
+// while the additions at the boundary of the range must not. Over-trapping matters as
+// much as wrapping -- a bound test applied to 64 bit results would reject `max64 + 0`.
+//
+// The literals carry the `i64` suffix because the default type for a constant is `int`,
+// which is 32 bits: without it the compiler rejects the literal before the VM ever runs.
+
+function main():void {
+    print("before\n");
+
+    int64 top = 9223372036854775807i64;
+    int64 lowest = -9223372036854775807i64 - 1i64;
+    int64 zero = 0;
+
+    // Must not trap: the widest legal values, unchanged.
+    int64 same = top + zero;
+    int64 low = lowest + zero;
+    print("boundary ok: ");
+    print(same);
+    print(" ");
+    print(low);
+    print("\n");
+
+    // Must trap: one past the top.
+    int64 one = 1;
+    int64 boom = top + one;
+    print(boom);
+    eof: pass;
+}

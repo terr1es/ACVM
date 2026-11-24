@@ -1,0 +1,15 @@
+// int32 multiplication must trap even though the exact product fits in 64 bits.
+//
+// This is the case a fast path is most likely to get wrong: computing the product in a
+// wider native type succeeds, so the trap can only come from checking the result against
+// the *declared* width afterwards. Multiply is also the operation where the intermediate
+// is furthest from the operands, so a check on the operands rather than the result would
+// pass.
+
+function main():void {
+    print("before\n");
+    int32 big = 65536;
+    int32 product = big * big;
+    print(product);
+    eof: pass;
+}

@@ -134,25 +134,37 @@ algorithm on the same data (cross-checked by checksum) across three engines:
 
 | n | ACVM | CPython 3.13 | C++ `-O0` | C++ `-O2` |
 | ---: | ---: | ---: | ---: | ---: |
-| 50 000 | 109.6 ms | 33.5 ms | 2.83 ms | 1.90 ms |
-| 200 000 | 482 ms | 156 ms | 10.84 ms | 7.47 ms |
-| 1 000 000 | 2658 ms | 1082 ms | 53.1 ms | 37.0 ms |
+| 50 000 | 89.2 ms | 33.5 ms | 2.83 ms | 1.90 ms |
+| 200 000 | 386 ms | 156 ms | 10.84 ms | 7.47 ms |
+| 1 000 000 | 2064 ms | 1082 ms | 53.1 ms | 37.0 ms |
 
-- 39–50× slower than unoptimized C++, 58–73× slower than `-O2`
-- 2.5–3.3× slower than CPython 3.13
+- 31–39× slower than unoptimized C++, 47–56× slower than `-O2`
+- 1.9–2.7× slower than CPython 3.13
 
 The CPython comparison is the interesting one. Counting with `sys.settrace`, CPython
 executes **179 bytecodes per element** and ACVM executes **175 instructions** — the same
-amount of work. The difference is the cost of a single dispatch: 3.3 ns for CPython,
-12.5 ns for ACVM. That 3.8× is the 32-byte `Value` copy, memory access through a page
-table, and a `MemType` lookup on every instruction.
+amount of work. The remaining difference is the cost of a single dispatch, about 10 ns
+against CPython's 3.3 ns.
 
-In other words: the algorithm and the instruction count are already at the floor. What
-remains is the cost of *implementing* an instruction. Closing that gap means changing the
-representation of `Value` and the memory model, not adding more fused instructions.
+That gap used to be 3.8× rather than 3.0×. The dispatch loop was the first thing worth
+attacking, because it was paying for structure rather than for work: every instruction
+re-read `frames.back()`, copied the `Frame`, re-derived the code pointer and the base
+address, and returned through an `enum` the caller switched on. Hoisting that into a loop
+with the instruction pointer held in a register removed roughly a quarter of the wall
+clock, and a fast path for native-width integers removed a little more — the generic
+arithmetic path works in 128 bits with masks and range checks at every width, which is
+right for `int128` and wasteful for an `int`.
+
+What remains is not dispatch overhead. It is the 32-byte `Value` copy on every push and
+pop, memory access through a page table rather than a flat array, and a `MemType` lookup
+per instruction. Closing that means changing the representation of `Value` and the memory
+model, not adding more fused instructions — the instruction count is already at the floor.
 
 These numbers were measured on one machine (llvm-mingw, Windows x86-64) and are reported
-as ratios rather than absolute times for that reason.
+as ratios rather than absolute times for that reason. The ACVM column is derived from the
+original cross-engine run by applying the factor measured for the dispatch rework on a
+single machine (1.23× at 50 000, 1.25× at 200 000, 1.29× at 1 000 000); the other three
+columns were not re-run, so they remain as measured together.
 
 ## Can it do anything real?
 

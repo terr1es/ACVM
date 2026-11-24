@@ -1,0 +1,17 @@
+// `min % -1` must be 0, not a trap.
+//
+// Written as a companion to div_int32_min.ax. The two operations share the operand check
+// in the generic path but not the outcome: `/` traps, `%` returns zero. A fast path that
+// mirrored the division's check into the modulo would trap here, and a fast path that let
+// the hardware compute it would raise #DE instead of producing 0 -- so both failure modes
+// are visible from the output of this file alone.
+
+function main():void {
+    int32 lowest = -2147483647 - 1;
+    int32 minusOne = 0 - 1;
+    int32 remainder = lowest % minusOne;
+    print("remainder: ");
+    print(remainder);
+    print("\n");
+    eof: pass;
+}

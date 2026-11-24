@@ -1,0 +1,29 @@
+// The int32 boundaries must not trap. This is the counterpart to the overflow tests:
+// a fast path that checked the operands instead of the result, or that applied a bound
+// test to an intermediate rather than a final value, would reject these.
+//
+// Run through the optimizer differential harness as well, so the value the VM produces
+// and the value the constant folder produces have to agree.
+
+function main():void {
+    int32 top = 2147483647;
+    int32 low = -2147483647 - 1;
+    int32 zero = 0;
+    int32 one = 1;
+
+    print(top + zero);        print("\n");
+    print(low + zero);        print("\n");
+    print(top - zero);        print("\n");
+    print(low - zero);        print("\n");
+    print(top * one);         print("\n");
+    print(low * one);         print("\n");
+    print(top / one);         print("\n");
+    print(low / one);         print("\n");
+    print(top % two());       print("\n");
+    print(low % two());       print("\n");
+    eof: pass;
+}
+
+function two():int32 {
+    return 2;
+}

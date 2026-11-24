@@ -1,0 +1,24 @@
+// int32 arithmetic must trap on overflow, not wrap.
+//
+// The VM gained a fast path that computes signed 32 and 64 bit integers in native
+// precision instead of the 128 bit form used for every width. That path is a duplicate of
+// the arithmetic in the generic one, and a duplicate is only trustworthy if something
+// checks that both agree at the boundaries. The existing width tests covered int8 and
+// int128 -- both of which take the *generic* path -- so the fast path had no coverage at
+// all before this file.
+//
+// Each case below is one the two implementations could disagree about: a sum that leaves
+// the type but not the next width up, a product that leaves both, and a negative operand
+// on the edge of the range.
+
+function main():void {
+    print("before\n");
+
+    // max + 1: leaves int32, easy to miss if the check is done in 64 bits without a
+    // bound test afterwards.
+    int32 maxv = 2147483647;
+    int32 one = 1;
+    int32 boom = maxv + one;
+    print(boom);
+    eof: pass;
+}

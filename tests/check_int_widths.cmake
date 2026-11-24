@@ -47,6 +47,33 @@ function(expect_trap_everywhere file must_contain)
     endforeach()
 endfunction()
 
+# The opposite assertion: the program must *finish*, and produce the same bytes at every
+# level. Necessary because an overflow check that is one comparison too strict passes every
+# trap test in this file -- it only shows up as a program that should have run and did not.
+function(expect_ok_everywhere file)
+    set(reference "")
+    foreach(level IN ITEMS O0 O1 O2 O3 O4)
+        execute_process(
+            COMMAND "${ACVM}" run "${SOURCE_DIR}/${file}" "-${level}"
+            RESULT_VARIABLE rc
+            OUTPUT_VARIABLE out
+            ERROR_VARIABLE err)
+
+        if(NOT rc EQUAL 0)
+            message(FATAL_ERROR
+                "${file} at ${level}: expected it to complete, but it failed.\n${out}${err}")
+        endif()
+
+        if(reference STREQUAL "")
+            set(reference "${out}")
+        elseif(NOT out STREQUAL reference)
+            message(FATAL_ERROR
+                "${file} at ${level}: output differs from O0.\n--- O0 ---\n${reference}"
+                "\n--- ${level} ---\n${out}")
+        endif()
+    endforeach()
+endfunction()
+
 function(expect_error file must_contain)
     execute_process(
         COMMAND "${ACVM}" check "${SOURCE_DIR}/${file}"
@@ -75,6 +102,20 @@ expect_trap_everywhere(overflow_int8.ax "integer overflow")
 
 # A width whose maximum has no representation is refused outright.
 expect_error(unsigned128.ax "unsigned int128' is not supported")
+
+# The VM gained a fast path for signed 32 and 64 bit integers, computed in native
+# precision instead of the 128 bit form used at every other width. That makes a second
+# implementation of the same arithmetic, so the boundaries it handles need their own
+# coverage: int8 and int128 exercise the generic path, not this one.
+expect_trap_everywhere(overflow_int32.ax "integer overflow")
+expect_trap_everywhere(overflow_int32_mul.ax "integer overflow")
+expect_trap_everywhere(div_int32_min.ax "integer overflow")
+expect_trap_everywhere(overflow_int64.ax "integer overflow")
+
+# And the cases that must *not* trap -- `min % -1` is 0, and every value at the edge of
+# int32 survives an operation that cannot leave the range.
+expect_ok_everywhere(mod_int32_min.ax)
+expect_ok_everywhere(int32_boundaries.ax)
 
 message(STATUS
     "${SOURCE_DIR}: int width overflow agrees with the VM at O0..O4, and unsigned int128 is refused")
