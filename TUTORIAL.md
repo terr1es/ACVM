@@ -1037,14 +1037,25 @@ function main():void {
 `import (name)` looks for `name.axd` (declarations for a shared library) then `name.ax`
 (pure Axiom). Names imported this way are called unqualified.
 
+The `function` keyword is noise for a module list, so the short form is accepted too. Both
+normalise to the same declaration, so they can be mixed in one file:
+
+```axiom
+import (io, json);                    // short form: a module list
+function import (return:(str));       // the long form, same meaning
+```
+
 ### 10.2 Importing a file by path
 
 ```axiom
 import "lib/sort.ax";              // statement form
+import ("lib/sort.ax");            // parenthesised, also a path
 function import (return:("lib/sort.ax"));   // equivalent
 ```
 
-Bare `import` accepts only a quoted path, not a module name.
+A quoted string is always a path and an identifier is always a module name, so one token
+of lookahead tells the two apart: `import (io);` is a module, `import ("io.ax");` is a
+file.
 
 ### 10.3 Declaring a module's identity
 

@@ -145,6 +145,11 @@ int compact(Function& fn, const std::vector<char>& drop) {
 
     std::vector<Instruction> code;
     code.reserve(static_cast<std::size_t>(kept));
+    // The line table follows the code through this one pass. Every other pass
+    // rewrites instructions in place, so `lines[i]` stays correct without being
+    // touched; only dropping an instruction can desynchronise the two vectors.
+    std::vector<SourceLine> lines;
+    lines.reserve(static_cast<std::size_t>(kept));
     for (std::size_t i = 0; i < n; ++i) {
         if (drop[i]) {
             continue;
@@ -164,10 +169,12 @@ int compact(Function& fn, const std::vector<char>& drop) {
                                  : (kept > 0 ? kept - 1 : 0);
         }
         code.push_back(ins);
+        lines.push_back(i < fn.lines.size() ? fn.lines[i] : SourceLine{});
     }
 
     const int removed = static_cast<int>(n) - kept;
     fn.code = std::move(code);
+    fn.lines = std::move(lines);
     return removed;
 }
 

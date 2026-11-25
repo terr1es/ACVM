@@ -26,6 +26,16 @@ void* vmOpenLibrary(const std::string& name);
 void* vmLookupSymbol(void* handle, const std::string& symbol);
 void vmCloseLibrary(void* handle);
 
+/// Absolute path of the running executable, or "" when the platform will not say.
+///
+/// Declared here rather than in a utility header because this is the one file that
+/// already includes the platform's loader headers; a second copy elsewhere would be
+/// a second set of `#ifdef`s to get wrong. The driver uses it to find the module
+/// directory that sits beside an installed `acvm`, so that a copy of the tool outside
+/// its build tree still resolves `import` against its own stdlib rather than against
+/// whichever tree happened to be present when it was compiled.
+std::string vmExecutablePath();
+
 class VM {
 public:
     VM(std::ostream& out, std::ostream& err);

@@ -324,12 +324,44 @@ if(ACVM_INSTALL_COMMAND AND NOT ACVM_USER_BIN STREQUAL "/.local/bin" AND NOT ACV
                     "$<TARGET_FILE:${target}>" "${ACVM_USER_BIN}")
     endforeach()
 
+    # `~/.local/share/acvm` mirrors what `cmake --install` writes under the prefix:
+    # the module sources the compiler reads at compile time. Shipping only the
+    # executable and the .dlls was the bug: `import (io)` then resolved through the
+    # compile-time default, which names the machine that built the binary.
+    set(ACVM_USER_SHARE "$ENV{USERPROFILE}/.local/share/acvm")
+    if(NOT WIN32)
+        set(ACVM_USER_SHARE "$ENV{HOME}/.local/share/acvm")
+    endif()
+
+    # Only `*.ax` and `*.axd` are copied, matching `cmake --install` above: the `.c`
+    # files are already compiled into the shared libraries, and shipping a second
+    # copy invites someone to edit the one that is not used.
+    set(ACVM_MODULE_SOURCES "")
+    foreach(layer stdlib extralib)
+        foreach(pattern "*.ax" "*.axd")
+            file(GLOB found "${CMAKE_CURRENT_SOURCE_DIR}/${layer}/${pattern}")
+            list(APPEND ACVM_MODULE_SOURCES ${found})
+        endforeach()
+    endforeach()
+
+    set(ACVM_COPY_MODULES "")
+    foreach(source IN LISTS ACVM_MODULE_SOURCES)
+        get_filename_component(layer "${source}" DIRECTORY)
+        get_filename_component(layer "${layer}" NAME)
+        list(APPEND ACVM_COPY_MODULES
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${source}" "${ACVM_USER_SHARE}/${layer}")
+    endforeach()
+
     add_custom_target(install-local
         COMMAND ${CMAKE_COMMAND} -E make_directory "${ACVM_USER_BIN}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:acvm>" "${ACVM_USER_BIN}"
         ${ACVM_COPY_LIBRARIES}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${ACVM_USER_SHARE}/stdlib"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${ACVM_USER_SHARE}/extralib"
+        ${ACVM_COPY_MODULES}
         DEPENDS acvm ${ACVM_STDLIB_TARGETS}
-        COMMENT "Installing acvm and its libraries into ${ACVM_USER_BIN}")
+        COMMENT "Installing acvm, its libraries and its modules into ${ACVM_USER_BIN}")
 endif()
 
 # Standard install rule, for `cmake --install build --prefix <somewhere>`.
@@ -337,6 +369,20 @@ include(GNUInstallDirs)
 install(TARGETS acvm ${ACVM_STDLIB_TARGETS}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# The modules are source, not data the compiler was built from: `import (io)` reads
+# stdlib/io.axd every time a program is compiled. An install that omits them ships a
+# compiler that only works where it was built -- it would fall back to the
+# compile-time path, which points into the build machine's source tree.
+#
+# `*.ax` and `*.axd` only: the `.c` files are already compiled into the shared
+# libraries and shipping them would invite someone to edit a copy that is not used.
+install(DIRECTORY stdlib/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/acvm/stdlib
+        FILES_MATCHING PATTERN "*.ax" PATTERN "*.axd")
+install(DIRECTORY extralib/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/acvm/extralib
+        FILES_MATCHING PATTERN "*.ax" PATTERN "*.axd")
 if(ACVM_BUILD_TESTS)
     enable_testing()
     function(acvm_add_test name)
@@ -442,7 +488,7 @@ if(ACVM_BUILD_TESTS)
     # Pairs of "check:module it needs". `formats_check` exercises the whole
     # format family, whose shared foundation is value.ax.
     set(ACVM_EXTRALIB_CHECKS "")
-    foreach(pair net_check:net formats_check:value tools_check:cli)
+    foreach(pair net_check:net formats_check:value tools_check:cli import_forms_check:json)
         string(REPLACE ":" ";" parts "${pair}")
         list(GET parts 0 extra_check)
         list(GET parts 1 extra_module)
@@ -460,6 +506,27 @@ if(ACVM_BUILD_TESTS)
                             ternary_check int128_check methods_check ${ACVM_EXTRALIB_CHECKS})
         acvm_add_script_check(${check_name})
     endforeach()
+
+    # Every other check invokes `acvm` with an absolute path, so the invocation form
+    # was never a variable -- which is how a regression that dropped the importing
+    # file's own directory for relative paths (`acvm run prog.ax`) got in: ctest
+    # stayed green while `import (mylib)` failed in every real project.
+    add_test(NAME relative_invocation
+             COMMAND ${CMAKE_COMMAND}
+                     -DACVM=$<TARGET_FILE:acvm>
+                     -DWORK=${CMAKE_BINARY_DIR}/relcheck
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_relative_invocation.cmake)
+
+    # An installed toolchain has to work away from the machine that built it. This
+    # installs into a scratch prefix, writes a program into a third directory, and
+    # requires it to compile -- which fails if the install omits the module sources
+    # or if the binary only looks for them through the compile-time default.
+    add_test(NAME install_relocatable
+             COMMAND ${CMAKE_COMMAND}
+                     -DACVM=$<TARGET_FILE:acvm>
+                     -DBUILD_DIR=${CMAKE_BINARY_DIR}
+                     -DPREFIX=${CMAKE_BINARY_DIR}/reloc_prefix
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_relocatable_install.cmake)
 
     # The debugger's test is a transcript: a scripted session is run and its
     # output is compared with the expected file. `adb` is a stdlib module, so the

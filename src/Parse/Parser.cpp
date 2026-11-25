@@ -446,12 +446,21 @@ StmtPtr Parser::parseTopLevel() {
         return parseVarDecl(true, false, false);
     }
 
-    // `import "file.ax";` at file scope: the short form of a file import.
+    // `import` at file scope. Three spellings, told apart by the token after it:
+    //
+    //     import "lib.ax";        a quoted file path
+    //     import (io, json);      a module list
+    //     import ();              an empty list
+    //
+    // The module list is the one a reader writes first -- `import` reads like a
+    // keyword, and `function import (return:(io));` is a mouthful. Both forms are
+    // normalized to the same `ImportDecl` here, so no later stage sees a
+    // difference, which is the same rule §2.2.1.1 already applies to the two
+    // spellings of the function form.
     if (peek().kind == TokenKind::KwImport) {
         const Token keyword = advance();
         auto decl = std::make_unique<Stmt>(StmtKind::ImportDecl, keyword.range);
         decl->funcKind = FuncKind::Import;
-        decl->modulesArePaths = true;
 
         const auto takePath = [&]() {
             const Token module = advance();
@@ -460,19 +469,52 @@ StmtPtr Parser::parseTopLevel() {
                 raw.size() >= 2 ? raw.substr(1, raw.size() - 2) : std::string_view{};
             decl->modules.emplace_back(decodeEscapes(body), module.range);
         };
-        if (check(TokenKind::StringLit)) {
-            takePath();
-        } else if (check(TokenKind::LParen)) {
-            // `import("file.ax");` -- accepted so a stray pair of parens is not
-            // a hard error.
-            advance();
+
+        // One token of lookahead decides between `(io, ...)` and `("io.ax")`.
+        // An identifier can only be a module name: paths are quoted, so there is
+        // no case where both readings fit.
+        if (check(TokenKind::LParen) && peek(1).kind == TokenKind::Ident) {
+            advance();   // '('
+            while (true) {
+                const Token module = expect(TokenKind::Ident, "as a module name");
+                decl->modules.emplace_back(std::string(module.text), module.range);
+                if (!match(TokenKind::Comma)) {
+                    break;
+                }
+            }
+            if (check(TokenKind::RParen)) {
+                advance();
+            } else {
+                errorAt(peek(), "expected ')' to close the module list");
+            }
+        } else {
+            decl->modulesArePaths = true;
             if (check(TokenKind::StringLit)) {
                 takePath();
+            } else if (check(TokenKind::LParen)) {
+                // `import("file.ax");` -- accepted so a stray pair of parens is
+                // not a hard error.
+                advance();
+                if (check(TokenKind::StringLit)) {
+                    takePath();
+                }
+                expect(TokenKind::RParen, "after the imported file path");
+            } else if (check(TokenKind::Ident)) {
+                // `import io;` -- the same intent as `import (io);`, one pair of
+                // parens short. Naming the exact spelling is the whole point: the
+                // generic message used to send the reader to the spec to discover
+                // that `import` is a *function* in this language.
+                const Token name = peek();
+                errorAt(name, "'import " + std::string(name.text) +
+                                  "' is missing its parentheses");
+                m_diagnostics.help(name.range.begin,
+                                   "write 'import (" + std::string(name.text) + ");'");
+            } else {
+                errorAt(peek(), "expected a module list in parentheses, e.g. import (io);, "
+                                "or a quoted file path, e.g. import \"lib.ax\";");
             }
-            expect(TokenKind::RParen, "after the imported file path");
-        } else {
-            errorAt(peek(), "expected a quoted file path, e.g. import \"lib.ax\";");
         }
+
         if (check(TokenKind::Semicolon)) {
             advance();
         } else {

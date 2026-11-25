@@ -10,8 +10,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -210,6 +213,31 @@ void vmCloseLibrary(void* handle) {
     ::FreeLibrary(reinterpret_cast<HMODULE>(handle));
 #else
     ::dlclose(handle);
+#endif
+}
+
+std::string vmExecutablePath() {
+#if defined(_WIN32)
+    char buffer[MAX_PATH];
+    const DWORD length = ::GetModuleFileNameA(nullptr, buffer, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return {};
+    }
+    return std::string(buffer, static_cast<std::size_t>(length));
+#elif defined(__APPLE__)
+    char buffer[4096];
+    std::uint32_t size = sizeof(buffer);
+    if (_NSGetExecutablePath(buffer, &size) != 0) {
+        return {};
+    }
+    return std::string(buffer);
+#else
+    char buffer[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0) {
+        return {};
+    }
+    return std::string(buffer, static_cast<std::size_t>(length));
 #endif
 }
 

@@ -58,36 +58,106 @@ std::string canonicalPath(const std::filesystem::path& path) {
 /// `extralib` comes last on purpose. A name that exists in both places must
 /// resolve to `stdlib` -- the optional layer may be replaced or deleted, and a
 /// program's meaning must not change because of that.
+/// Directory holding the running executable, or empty when the platform will not
+/// say.
+///
+/// The installed layout is derived from this: `acvm` in `.../bin` with its modules
+/// in `.../share/acvm/stdlib`. Without that fallback an installed toolchain would
+/// only work on the machine that built it, because the compile-time default below
+/// points into the source tree -- which is exactly the bug this exists to fix. A
+/// copy of `acvm` in another directory used to fail with a parse error from a
+/// *stale* stdlib it found on the build machine, or with "module not found" once
+/// that tree was gone.
+std::filesystem::path executableDir() {
+    // The platform headers live in VM.cpp, which already needs them for dynamic
+    // loading. Asking it for the path keeps this file free of `windows.h` -- whose
+    // `near` and `far` macros are empty and silently break any variable of that
+    // name (there is one below, in a diagnostic).
+    const std::string path = vmExecutablePath();
+    if (path.empty()) {
+        return {};
+    }
+    return std::filesystem::path(path).parent_path();
+}
+
+/// Appends `candidate` when it is a directory and not already present.
+///
+/// Duplicates matter here: a build tree can have the executable's directory and the
+/// compile-time default be the same path, and searching it twice would make the
+/// diagnostic about a missing module list the same directory twice.
+void addDirIfPresent(std::vector<std::filesystem::path>& dirs,
+                     const std::filesystem::path& candidate) {
+    if (candidate.empty()) {
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(candidate, ec)) {
+        return;
+    }
+    const std::filesystem::path normal = std::filesystem::weakly_canonical(candidate, ec);
+    for (const std::filesystem::path& existing : dirs) {
+        const std::filesystem::path other = std::filesystem::weakly_canonical(existing, ec);
+        if (other == normal) {
+            return;
+        }
+    }
+    dirs.push_back(normal);
+}
+
+/// One module directory, resolved in the order a user can predict:
+///
+///   1. `$ACVM_STDLIB` / `$ACVM_EXTRALIB` -- an explicit override always wins
+///   2. next to the executable, in the installed layout (`../share/acvm/<name>` and
+///      a plain `<exe>/<name>` sibling)
+///   3. the compile-time default, which is the source tree in a checkout
+///
+/// Installed before default, not the other way round: an installed toolchain must
+/// be self-consistent, and its compile-time default still names the machine that
+/// built it. In a checkout the installed layout does not exist, so the default is
+/// what gets used and nothing changes.
+void addModuleDir(std::vector<std::filesystem::path>& dirs, const char* envName,
+                  const char* baked, const char* leaf,
+                  const std::filesystem::path& exeDir) {
+    if (const char* env = std::getenv(envName); env != nullptr && env[0] != '\0') {
+        addDirIfPresent(dirs, env);
+        return;
+    }
+    if (!exeDir.empty()) {
+        addDirIfPresent(dirs, exeDir / leaf);
+        addDirIfPresent(dirs, exeDir / ".." / "share" / "acvm" / leaf);
+    }
+    if (baked != nullptr && baked[0] != '\0') {
+        addDirIfPresent(dirs, baked);
+    }
+}
+
 std::vector<std::filesystem::path> moduleSearchDirs(const std::filesystem::path& importingDir) {
     std::vector<std::filesystem::path> dirs;
-    dirs.push_back(importingDir);
 
-    std::filesystem::path stdlibDir;
-    if (const char* env = std::getenv("ACVM_STDLIB"); env != nullptr && env[0] != '\0') {
-        stdlibDir = env;
-    }
+    // An empty `importingDir` means the source was named without a directory --
+    // `acvm run prog.ax` -- whose parent_path() is "" and which therefore means the
+    // current directory. Skipping it as "absent" silently removed the caller's own
+    // directory from the search path, so `import (mylib)` only worked when the file
+    // was named by an absolute path. "." is spelled out so `addDirIfPresent` can
+    // still reject a genuinely missing directory.
+    addDirIfPresent(dirs, importingDir.empty() ? std::filesystem::path(".") : importingDir);
+
+    // The executable's directory is looked up once and shared by both layers.
+    const std::filesystem::path exeDir = executableDir();
+
 #ifdef ACVM_STDLIB_DIR
-    else {
-        stdlibDir = ACVM_STDLIB_DIR;
-    }
+    const char* bakedStdlib = ACVM_STDLIB_DIR;
+#else
+    const char* bakedStdlib = nullptr;
 #endif
-    std::error_code ec;
-    if (!stdlibDir.empty() && std::filesystem::is_directory(stdlibDir, ec)) {
-        dirs.push_back(stdlibDir);
-    }
-
-    std::filesystem::path extralibDir;
-    if (const char* env = std::getenv("ACVM_EXTRALIB"); env != nullptr && env[0] != '\0') {
-        extralibDir = env;
-    }
 #ifdef ACVM_EXTRALIB_DIR
-    else {
-        extralibDir = ACVM_EXTRALIB_DIR;
-    }
+    const char* bakedExtralib = ACVM_EXTRALIB_DIR;
+#else
+    const char* bakedExtralib = nullptr;
 #endif
-    if (!extralibDir.empty() && std::filesystem::is_directory(extralibDir, ec)) {
-        dirs.push_back(extralibDir);
-    }
+
+    addModuleDir(dirs, "ACVM_STDLIB", bakedStdlib, "stdlib", exeDir);
+    addModuleDir(dirs, "ACVM_EXTRALIB", bakedExtralib, "extralib", exeDir);
     return dirs;
 }
 
@@ -620,6 +690,27 @@ bool Driver::compile(const std::string& path, Module& module, const DriverOption
     return true;
 }
 
+/// Where `library "x"` looks for x.dll / libx.so.
+///
+/// The module's own directory comes first so a program can ship a private copy of a
+/// library; then the directory holding `acvm` itself, which is where an installed
+/// toolchain keeps the shared half of the standard library; then the build tree
+/// default. The executable's directory has to be listed explicitly rather than left
+/// to the loader: Windows searches the application directory, Linux does not, and a
+/// relocated toolchain must behave the same on both.
+std::vector<std::string> librarySearchDirs(const std::string& sourcePath) {
+    std::vector<std::string> dirs;
+    dirs.push_back(std::filesystem::path(sourcePath).parent_path().generic_string());
+    const std::filesystem::path exeDir = executableDir();
+    if (!exeDir.empty()) {
+        dirs.push_back(exeDir.generic_string());
+    }
+#ifdef ACVM_LIB_DIR
+    dirs.push_back(ACVM_LIB_DIR);
+#endif
+    return dirs;
+}
+
 //===----------------------------------------------------------------------===//
 // Debugger attachment
 //===----------------------------------------------------------------------===//
@@ -725,14 +816,9 @@ int Driver::runSource(const std::string& path, const DriverOptions& options) {
 
     VM vm(m_out, m_err);
     vm.setAssertionsEnabled(options.assertions);
-    vm.setJitMode(options.jit ? JitMode::On : JitMode::Off);
     vm.setProgramArgs(m_programArgs);
-    vm.setLibrarySearchPath(std::vector<std::string>{
-        std::filesystem::path(path).parent_path().generic_string(),
-#ifdef ACVM_LIB_DIR
-        ACVM_LIB_DIR,
-#endif
-    });
+    vm.setJitMode(options.jit ? JitMode::On : JitMode::Off);
+    vm.setLibrarySearchPath(librarySearchDirs(path));
     std::string error;
     if (options.adb) {
         if (!attachDebugger(vm, options, error)) {
@@ -758,6 +844,7 @@ void Driver::reportStats(const VM& vm, const Module& module) {
     }
     m_err << "stats: " << vm.instructionCount() << " instructions, " << module.functions.size()
           << " function(s), " << codeBytes << " bytes of code\n";
+
     if (vm.jitMode() == JitMode::On) {
         m_err << "jit: " << vm.jitCompiledCount() << " compiled, " << vm.jitRefusedCount()
               << " refused";
@@ -854,14 +941,9 @@ int Driver::runBytecode(const std::string& path, const DriverOptions& options) {
     }
 
     VM vm(m_out, m_err);
-    vm.setJitMode(options.jit ? JitMode::On : JitMode::Off);
     vm.setProgramArgs(m_programArgs);
-    vm.setLibrarySearchPath(std::vector<std::string>{
-        std::filesystem::path(path).parent_path().generic_string(),
-#ifdef ACVM_LIB_DIR
-        ACVM_LIB_DIR,
-#endif
-    });
+    vm.setJitMode(options.jit ? JitMode::On : JitMode::Off);
+    vm.setLibrarySearchPath(librarySearchDirs(path));
     if (options.adb) {
         if (!attachDebugger(vm, options, error)) {
             m_err << "error: " << error << '\n';

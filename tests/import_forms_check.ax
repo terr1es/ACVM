@@ -1,0 +1,36 @@
+//  import_forms.ax — every spelling of `import` this build accepts.
+//
+//  `import (io);` is the spelling a reader writes first, and it is the one that used
+//  to fail with three cascading parse errors and no hint that `import` is a
+//  *function* in this language. The parser now normalises the module-list form to the
+//  same node the function form produces, so nothing after the parser can tell the two
+//  apart -- which is why this file only has to show that each spelling resolves.
+//
+//      acvm run tests/import_forms_check.ax
+
+// Module list, the short spelling.
+import (io);
+import (json);
+
+// The function spelling, in the same file. Both reach the same `ImportDecl`, so
+// mixing them is legal and this line proves it.
+function import (return:(str));
+
+function main():void {
+    // `io` came from the module list: pathJoin is defined there.
+    print(pathJoin("a", "b"));
+    print(" ");
+
+    // `json` likewise.
+    Doc d = docNew(0);
+    ptr Value v = jsonParse(#d, "{\"a\": 7}");
+    print(valInt(valGet(v, "a"), 0));
+    print(" ");
+
+    // `str` came from the function form. One module, two spellings, no difference.
+    print(repeat("ok", 1));
+    print("\n");
+
+    docFree(#d);
+    eof: pass;
+}

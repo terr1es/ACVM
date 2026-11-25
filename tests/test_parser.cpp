@@ -38,6 +38,56 @@ TEST(parses_an_import_declaration) {
     CHECK_EQ(result.unit->decls[0]->modules.size(), std::size_t(2));
 }
 
+TEST(parses_import_as_a_parenthesised_module_list) {
+    // `import (io);` -- the spelling a reader writes first, because `import` reads
+    // like a keyword. It normalises to the same node as the function form, so
+    // nothing after the parser can tell them apart.
+    const auto result = testsupport::parseSource("import (io, json);");
+    CHECK(result.diagnostics.empty());
+    CHECK_EQ(result.unit->decls.size(), std::size_t(1));
+    CHECK(result.unit->decls[0]->kind == StmtKind::ImportDecl);
+    CHECK_EQ(result.unit->decls[0]->modules.size(), std::size_t(2));
+    CHECK_EQ(result.unit->decls[0]->modules[0].first, std::string("io"));
+    CHECK_EQ(result.unit->decls[0]->modules[1].first, std::string("json"));
+    // Not paths: a module name is resolved in the search path, a path verbatim.
+    CHECK(!result.unit->decls[0]->modulesArePaths);
+}
+
+TEST(parses_a_single_module_without_a_comma) {
+    const auto result = testsupport::parseSource("import (io);");
+    CHECK(result.diagnostics.empty());
+    CHECK_EQ(result.unit->decls[0]->modules.size(), std::size_t(1));
+}
+
+TEST(parses_an_empty_module_list) {
+    const auto result = testsupport::parseSource("import ();");
+    CHECK(result.diagnostics.empty());
+    CHECK(result.unit->decls[0]->modules.empty());
+}
+
+TEST(a_quoted_import_is_still_a_path) {
+    // The one-token lookahead has to keep the old form working: a string inside
+    // the parentheses is a file path, not a module name.
+    const auto result = testsupport::parseSource("import (\"lib.ax\");");
+    CHECK(result.diagnostics.empty());
+    CHECK(result.unit->decls[0]->modulesArePaths);
+    CHECK_EQ(result.unit->decls[0]->modules[0].first, std::string("lib.ax"));
+}
+
+TEST(a_missing_paren_names_the_spelling_to_use) {
+    // The message that prompted this: `import io;` used to produce three cascading
+    // errors and no hint that `import` is a *function* in this language.
+    const auto result = testsupport::parseSource("import io;");
+    CHECK(!result.diagnostics.empty());
+    CHECK(result.diagnostics.find("missing its parentheses") != std::string::npos);
+    CHECK(result.diagnostics.find("import (io);") != std::string::npos);
+}
+
+TEST(an_unclosed_module_list_is_one_error) {
+    const auto result = testsupport::parseSource("import (io\nfunction f():void { eof: pass; }");
+    CHECK(result.diagnostics.find("close the module list") != std::string::npos);
+}
+
 TEST(parses_default_return_clause) {
     const auto result =
         testsupport::parseSource("function clamp(int x, return:0):int { return x; eof: pass; }");
