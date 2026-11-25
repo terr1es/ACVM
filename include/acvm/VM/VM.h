@@ -154,7 +154,10 @@ public:
         static void returnToCaller(void* process, bool hasResult, std::int64_t result,
                                    bool resultIsPtr = false);
         static bool readRaw64(VM& vm, std::uint64_t address, std::int64_t& out);
-        static int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
+        static bool constantString(VM& vm, int index, std::int64_t& out);
+        static void zeroThroughPointer(VM& vm, std::uint64_t address, std::uint64_t size);
+        static void copyThroughPointers(VM& vm, std::uint64_t destination,
+                                        std::uint64_t source, std::uint64_t size);        static int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
                                  void** out, int maxPages);
         static bool callFunction(VM& vm, void* process, int functionIndex, int argc,
                                  std::string* error);

@@ -590,6 +590,14 @@ if(ACVM_BUILD_TESTS)
         # needs revisiting, which is the intended signal: the file then no longer contains a
         # refused callee and its whole point has to be re-established.
         acvm_add_jit_diff_check(jit_mixed_call_check -DEXPECT_COMPILED=6)
+
+        # Strings and aggregates: CONST_STR, MEM_ZERO and MEM_COPY. A string is a 16 byte
+        # descriptor rather than a register value, so `string s = "x";` is four
+        # instructions and any one of them being unsupported used to refuse the whole
+        # function -- which is how a single unused label kept arithmetic-heavy loops in
+        # the interpreter. The count is the file's five compilable functions; a sixth
+        # exists only to be refused, as the callee in the mixed-direction check.
+        acvm_add_jit_diff_check(jit_string_check -DEXPECT_COMPILED=5)
     endif()
 
     # Passing arguments is the point of this one, so it runs with some.

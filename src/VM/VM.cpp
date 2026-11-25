@@ -1295,6 +1295,45 @@ bool VM::JitBridge::readRaw64(VM& vm, std::uint64_t address, std::int64_t& out) 
     return true;
 }
 
+bool VM::JitBridge::constantString(VM& vm, int index, std::int64_t& out) {
+    // `prepare()` materialised every string literal once, at `kStringBase`, and nothing
+    // ever moves or frees one -- the same property that makes pinning frame pages sound.
+    // So this is a lookup rather than an allocation, and the address it returns stays
+    // valid for the life of the process.
+    //
+    // The interpreter's CONST_STR pushes exactly this address, tagged as a pointer. Using
+    // one helper for both is what keeps the compiled path from inventing its own notion of
+    // where a literal lives, which is the mistake that made a compiled callee read an
+    // empty string earlier.
+    const std::size_t slot = static_cast<std::size_t>(index);
+    if (index < 0 || slot >= vm.m_stringAddresses.size()) {
+        return false;
+    }
+    out = static_cast<std::int64_t>(vm.m_stringAddresses[slot]);
+    return true;
+}
+
+void VM::JitBridge::zeroThroughPointer(VM& vm, std::uint64_t address,
+                                       std::uint64_t size) {
+    // MEM_ZERO, verbatim: the null check lives in the generated code (so it can branch to
+    // the trap exit) and this only writes. The interpreter ignores the result of
+    // `zeroBytes` here too, because an address that fails to resolve was already caught by
+    // the null check or is inside a page the process owns.
+    vm.zeroBytes(address, static_cast<std::size_t>(size));
+}
+
+void VM::JitBridge::copyThroughPointers(VM& vm, std::uint64_t destination,
+                                        std::uint64_t source, std::uint64_t size) {
+    // MEM_COPY. Straight `readBytes`/`writeBytes` rather than `std::memcpy`: a VM address
+    // is not a host pointer, and the page table has to be walked -- which is exactly the
+    // thing that would go wrong if this reimplemented the copy instead of calling in.
+    std::vector<std::uint8_t> buffer(static_cast<std::size_t>(size));
+    if (!vm.readBytes(source, buffer.data(), buffer.size())) {
+        return;
+    }
+    vm.writeBytes(destination, buffer.data(), buffer.size());
+}
+
 int VM::JitBridge::pinFramePages(VM& vm, std::uint64_t frameBase,
                                  std::uint64_t frameSize, void** out, int maxPages) {
     if (vm.m_memory == nullptr) {

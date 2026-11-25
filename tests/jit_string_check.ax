@@ -1,0 +1,96 @@
+//  jit_string_check.ax -- string and aggregate movement inside compiled code.
+//
+//  A string is not a register value. It is a 16 byte `{ptr, len}` descriptor, so
+//  `string s = "hello";` is four instructions: LOCAL_ADDR, MEM_ZERO, CONST_STR, MEM_COPY.
+//  Any one of those being unsupported used to refuse the whole function -- and because
+//  compilation is all or nothing per function, a single unused label was enough to send an
+//  arithmetic-heavy loop back to the interpreter. That was the most common refusal in the
+//  suite by a wide margin, which is why this file exists.
+//
+//  What each function is here to hold down:
+//
+//  1. **CONST_STR.** The literal has to resolve to the same descriptor address the
+//     interpreter pushes. Getting that wrong is not a crash: the callee reads a length of
+//     0 or garbage, so these checks compare lengths and contents by value.
+//  2. **MEM_ZERO.** Declaring a local zeroes its slot first. Zeroing the wrong number of
+//     bytes writes outside the frame; zeroing none leaves the old contents, and a string
+//     that is not fully overwritten keeps a stale pointer in its length field.
+//  3. **MEM_COPY.** This is how the descriptor reaches the local, and how `string t = s;`
+//     copies it. A short copy leaves one of the two fields stale.
+//  4. **The mixed direction.** `passesStringToInterpreted` is compiled and calls a function
+//     that is refused, so the string crosses from a native slot to the interpreter's value
+//     stack -- the same boundary `jit_mixed_call_check.ax` covers for integers, but with the
+//     pointer tag that decides whether the callee sees a string or a number.
+//
+//  Nothing in a function under test may call `print`: BUILTIN is refused, which would move
+//  the function back to the interpreter and leave this file testing nothing. That is why
+//  every check returns an `int` for `main` to compare.
+
+function import (return:(test));
+
+// A global is how `interpretedLen` gets refused: LOAD_GLOBAL is not lowered, so it stays
+// interpreted even though its body is trivial. The +2 is what proves the call happened.
+global int gBias = 2;
+
+function interpretedLen(string s):int {
+    return s.length + gBias;
+    eof: pass;
+}
+
+function passesStringToInterpreted():int {
+    return interpretedLen("abcdef");
+    eof: pass;
+}
+
+// Eleven bytes, so the payload does not fit in a register even if something tried to
+// treat it as one.
+function literalLength():int {
+    string s = "hello world";
+    return s.length;
+    eof: pass;
+}
+
+// The second local is a copy of the first, so both descriptors must point at the same
+// bytes. Multiplying the two lengths keeps a single wrong field from passing by accident.
+function copyOfLocal():int {
+    string s = "abcd";
+    string t = s;
+    return t.length * 10 + s.length;
+    eof: pass;
+}
+
+// An empty literal has no payload to copy: this is the case where MEM_ZERO alone decides
+// the result, because there is no data to overwrite a stale field with.
+function emptyLiteral():int {
+    string s = "";
+    return s.length;
+    eof: pass;
+}
+
+struct Pair {
+    int a;
+    int b;
+};
+
+// A struct local goes through the same three instructions as a string, with a different
+// size, so this is the case where a hardcoded 16 would show up.
+function structThroughCopy(int x):int {
+    Pair p = {x, 3};
+    Pair q = p;
+    q.a = q.a + q.b;
+    return q.a;
+    eof: pass;
+}
+
+function main():void {
+    testGroup("jit strings");
+
+    checkInt(literalLength(), 11, "literal in a compiled function");
+    checkInt(copyOfLocal(), 44, "one local copied from another");
+    checkInt(emptyLiteral(), 0, "empty literal, nothing to copy");
+    checkInt(structThroughCopy(10), 13, "struct copied into a local");
+    checkInt(passesStringToInterpreted(), 8, "compiled caller, interpreted callee");
+
+    testFinish();
+    eof: pass;
+}

@@ -203,9 +203,9 @@ refusals most likely to be met:
 |---|---|
 | `unsupported opcode BUILTIN` | `print`, `eprint` and the other builtins call back into the interpreter |
 | `call` to a `library` function | the native call is marshalled by the interpreter |
-| a string literal (`CONST_STR`) | constants are materialised by the interpreter |
 | a global (`LOAD_GLOBAL`) | globals live in a different address space |
 | a struct returned by value | the caller supplies a destination slot |
+| `STR_EQ`, `CONCAT` | string comparison and concatenation are interpreter builtins |
 | `int128`, floats, constants past 64 bits | the lowering works in 64 bit registers |
 | unsigned division | no single x86-64 instruction matches the interpreter's rules |
 | a `process` body | deliberate: compiled code cannot yield, so it could not be preempted |
@@ -213,6 +213,26 @@ refusals most likely to be met:
 The first row is the one most often met in practice, and it is also the one that limits the
 measured speedup: a function is refused for containing a single `print`, so programs that
 report their own progress stay interpreted however much arithmetic they do.
+
+**String literals and aggregates are compiled.** A string is not a register value: it is a
+16 byte `{ptr, len}` descriptor, so `string s = "hi";` is four instructions --
+`LOCAL_ADDR`, `MEM_ZERO`, `CONST_STR`, `MEM_COPY`. All four are lowered, through three
+bridges that call into the VM (`constantString`, `zeroThroughPointer`,
+`copyThroughPointers`), which is what makes them agree with the interpreter about where a
+literal lives and how much of a slot it fills.
+
+This mattered more than it looks. Before it, one unused string literal refused the whole
+function, and compilation is all or nothing per function, so a hot loop with a leftover
+label ran interpreted end to end:
+
+| 20 000 000 iteration loop | Interpreter | `--jit` | |
+|---|---:|---:|---|
+| with no string | 2681 ms | 170 ms | 16× |
+| with one unused `string label = "...";` | 2676 ms | 165 ms | 16× |
+
+The second row was 2865 ms before the string was lowered -- the JIT made it 8% *slower*,
+because it paid to look at a function it then refused. `tests/jit_string_check.ax` holds
+this down, including the case where the literal crosses into an interpreted callee.
 
 Recursion and ordinary calls *are* compiled. Two bugs made that look false for a while,
 both now covered by `tests/jit_call_check.ax`: `!x` was lowered as a bitwise complement
@@ -225,6 +245,15 @@ tests could not reach — a compiled function calling one that was refused — s
 function in `jit_call_check.ax` compiles, so the "compiled into interpreted" boundary was
 never crossed. It also covers mutual recursion and arguments past the fourth, which is where
 the x64 ABI stops passing them in registers.
+
+Lowering the string opcodes exposed a third bug, this one in the stack-depth analysis rather
+than in the encoder: a call returning an aggregate was modelled as popping its destination
+and pushing nothing, when `Ret` pushes the result whatever its type. Every `T x = f();` with
+a struct or string therefore looked like it underflowed two instructions later, so the
+refusal named `MEM_COPY` -- which was fine -- instead of the aggregate return that was
+actually unsupported. Twelve test programs reported it that way. The message now names the
+real cause, and a misleading diagnostic is worth fixing on its own: it cost more time to
+find than the fix took.
 
 `--stats` reports what happened:
 
@@ -247,9 +276,9 @@ no difference" instead of "this platform has no JIT". The JIT tests are skipped 
 hosts for the same reason: the encoder test calls the bytes it emits, and the differential
 tests would fail on the flag rather than on anything the programs do.
 
-Correctness rests on differential testing: thirteen programs are run interpreted and then
+Correctness rests on differential testing: fourteen programs are run interpreted and then
 compiled, and the two outputs must match byte for byte (`tests/compare_jit.cmake`). A
-fourteenth test covers the encoder on its own, without the VM.
+fifteenth test covers the encoder on its own, without the VM.
 
 Two properties of those tests are worth spelling out, because both were wrong at first and
 both made the suite look stronger than it was:

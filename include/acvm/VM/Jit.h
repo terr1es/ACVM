@@ -143,6 +143,26 @@ void returnToCaller(void* process, bool hasResult, std::int64_t result,
 /// the address as data.
 bool readRaw64(VM& vm, std::uint64_t address, std::int64_t& out);
 
+/// Address of the `{ptr,len}` descriptor for string literal number `index`.
+///
+/// A literal is not copied or allocated per execution: `VM::prepare` lays every one of
+/// them out once and the address is stable for the life of the process. Returning that
+/// address is therefore a lookup, and the tag is a pointer -- the same tag the
+/// interpreter's `CONST_STR` pushes. A function containing a string literal used to be
+/// refused outright, which is what kept most real programs out of the JIT entirely.
+bool constantString(VM& vm, int index, std::int64_t& out);
+
+/// Zeroes `size` bytes at a VM address. The null check is the caller's, because generated
+/// code has to branch to its own trap exit rather than learn about failure through a
+/// return value -- and because MEM_ZERO only traps when there is something to write.
+void zeroThroughPointer(VM& vm, std::uint64_t address, std::uint64_t size);
+
+/// Copies `size` bytes from one VM address to another. `MEM_COPY` is how a value type
+/// larger than a register moves -- a string is a 16 byte `{ptr,len}` descriptor, so
+/// `string s = "x";` is CONST_STR followed by a 16 byte copy into the local's slot.
+void copyThroughPointers(VM& vm, std::uint64_t destination, std::uint64_t source,
+                         std::uint64_t size);
+
 int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
                   void** out, int maxPages);
 

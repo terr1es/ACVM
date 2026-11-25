@@ -85,6 +85,19 @@ int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
     return VM::JitBridge::pinFramePages(vm, frameBase, frameSize, out, maxPages);
 }
 
+bool constantString(VM& vm, int index, std::int64_t& out) {
+    return VM::JitBridge::constantString(vm, index, out);
+}
+
+void zeroThroughPointer(VM& vm, std::uint64_t address, std::uint64_t size) {
+    VM::JitBridge::zeroThroughPointer(vm, address, size);
+}
+
+void copyThroughPointers(VM& vm, std::uint64_t destination, std::uint64_t source,
+                         std::uint64_t size) {
+    VM::JitBridge::copyThroughPointers(vm, destination, source, size);
+}
+
 bool callFunction(VM& vm, void* process, int functionIndex, int argc,
                   std::string* error) {
     return VM::JitBridge::callFunction(vm, process, functionIndex, argc, error);
@@ -403,6 +416,8 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 pushes = 1;
                 return true;
             case OpCode::Load: pops = 1; pushes = 1; return true;
+            case OpCode::MemZero: pops = 1; return true;
+            case OpCode::MemCopy: pops = 2; return true;
             case OpCode::Store: pops = 2; return true;
             case OpCode::StoreKeep: pops = 1; return true;
             case OpCode::StoreLocal: case OpCode::StoreGlobal:
@@ -444,7 +459,15 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                     if (callee.returnsAggregate) {
                         pops += 1;
                     }
-                    pushes = callee.returnsValue && !callee.returnsAggregate ? 1 : 0;
+                    // An aggregate return pops a destination *and* pushes a result: `Ret`
+                    // pushes the returned value whatever its type, and the value it pushes
+                    // for an aggregate is a pointer to that destination, which is what the
+                    // MEM_COPY after the call copies from. Modelling the push as zero made
+                    // every `T x = f();` where `f` returns a struct or string look like it
+                    // underflowed two instructions later -- so the refusal named the wrong
+                    // instruction, and the real reason (an aggregate return the lowering
+                    // does not implement) was nowhere in the message.
+                    pushes = callee.returnsValue ? 1 : 0;
                 }
                 return true;
             default:
@@ -614,6 +637,93 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             }
             assembler.movImm(kRegA, Width::Qword, static_cast<std::int64_t>(raw));
             pushA();
+            break;
+        }
+
+        case OpCode::ConstStr: {
+            // The string table is laid out once, by `prepare()`, and never moves -- so
+            // this is a lookup, not an allocation, and the address stays valid for as
+            // long as the process runs. The helper returns the same descriptor address
+            // the interpreter's CONST_STR pushes, which is what keeps the two paths from
+            // disagreeing about where a literal lives.
+            //
+            // Refusing this opcode is what kept most real programs out of the JIT: a
+            // single string in a function -- an unused label, a format for a message --
+            // sent the whole function back to the interpreter, and compilation is all or
+            // nothing per function. It was the most common refusal by a wide margin.
+            if (inst.a < 0 ||
+                static_cast<std::size_t>(inst.a) >= module.strings.size()) {
+                refusal = "string index out of range";
+                break;
+            }
+            if (depth >= kMaxValueSlots) {
+                refusal = "expression stack deeper than the JIT supports";
+                break;
+            }
+            assembler.mov(kArg1, kRegVm);
+            assembler.movImm(kArg2, Width::Dword, inst.a);
+            assembler.lea(kArg3, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.callAbsolute(
+                reinterpret_cast<const void*>(&jitbridge::constantString));
+            assembler.test(kRegA, kRegA, Width::Byte);
+            assembler.jcc(Cond::Equal, failureExit);
+            ++depth;
+            break;
+        }
+
+        case OpCode::MemZero: {
+            // Pops a destination and zeroes `a` bytes through it, exactly as the
+            // interpreter does -- including its null check, which applies only when there
+            // is something to write. Zeroing nothing is a no-op, so that case emits no
+            // code at all rather than a call that would return immediately.
+            //
+            // This matters more than it looks: declaring `string s = "...";` zeroes the
+            // local's slot before storing, so a function whose only string is an unused
+            // label needs both this and CONST_STR to compile. With CONST_STR done and this
+            // missing, the refusal merely moved one opcode along.
+            const std::int32_t bytes = inst.a > 0 ? inst.a : 0;
+            if (depth < 1) {
+                refusal = "stack underflow in MEM_ZERO";
+                break;
+            }
+            --depth;
+            if (bytes == 0) {
+                break;
+            }
+            assembler.mov(kArg2, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.test(kArg2, kArg2, Width::Qword);
+            assembler.jcc(Cond::Equal, nullExit);
+            assembler.mov(kArg1, kRegVm);
+            assembler.movImm(kArg3, Width::Qword, bytes);
+            assembler.callAbsolute(
+                reinterpret_cast<const void*>(&jitbridge::zeroThroughPointer));
+            break;
+        }
+
+        case OpCode::MemCopy: {
+            // `destination` was pushed first, so it sits one slot below the top. Both
+            // addresses get the interpreter's null check before anything is written --
+            // order matters, because the interpreter rejects the pair before it copies.
+            const std::int32_t bytes = inst.a > 0 ? inst.a : 0;
+            if (depth < 2) {
+                refusal = "stack underflow in MEM_COPY";
+                break;
+            }
+            if (bytes == 0) {
+                depth -= 2;
+                break;
+            }
+            assembler.mov(kArg2, mem(Reg::Rsp, slotOffset(depth - 1)));
+            assembler.mov(kArg3, mem(Reg::Rsp, slotOffset(depth - 2)));
+            assembler.test(kArg2, kArg2, Width::Qword);
+            assembler.jcc(Cond::Equal, nullExit);
+            assembler.test(kArg3, kArg3, Width::Qword);
+            assembler.jcc(Cond::Equal, nullExit);
+            assembler.mov(kArg1, kRegVm);
+            assembler.movImm(kArg4, Width::Qword, bytes);
+            assembler.callAbsolute(
+                reinterpret_cast<const void*>(&jitbridge::copyThroughPointers));
+            depth -= 2;
             break;
         }
 
