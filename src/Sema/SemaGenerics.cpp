@@ -217,6 +217,14 @@ bool Sema::inferTypeArguments(FuncTemplate& tmpl, const std::vector<const Type*>
         if (declared == nullptr) {
             continue;
         }
+        // A null argument type means "not known yet", not "does not fit": a bare function
+        // name has no type of its own -- `sortBy(points, n, keyX)` -- and only the
+        // instantiated parameter, `Func<int, T>` with T bound, can type it. Skipping it
+        // here is what lets T be inferred from the remaining arguments; if this parameter
+        // was the only place T appeared, the "cannot infer" error below still fires.
+        if (argTypes[i] == nullptr) {
+            continue;
+        }
         if (!unify(*declared, argTypes[i])) {
             why = "argument " + std::to_string(i + 1) + " has type '" +
                   (argTypes[i] != nullptr ? argTypes[i]->describe() : std::string("<unknown>")) +

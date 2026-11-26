@@ -54,6 +54,11 @@ enum class OpCode : std::uint8_t {
     JumpIfFalse,                 // a = target
     JumpIfTrue,                  // a = target
     Call,                        // a = function index, b = argument count
+    /// A call whose target is a run-time value: `b` = argument count, and the callee
+    /// handle is popped from the stack after the arguments. The handle is the function
+    /// index plus one, so 0 -- which a zeroed slot holds -- means "not a function" and
+    /// traps, instead of silently calling the first function in the module.
+    CallIndirect,
     Ret,
     MemCopy,                     // a = byte count; pop dst, pop src
     MemZero,                     // a = byte count; pop dst
@@ -96,6 +101,17 @@ enum class OpCode : std::uint8_t {
     /// store, step src, step dst). The compiler only emits it when it has
     /// matched the three-statement sequence, so nothing else changes.
     CopyStep,
+
+    /// Integer exponentiation: pop the exponent, pop the base, push `base ** exp`.
+    /// `a` is the memType of both operands, exactly like ADD.
+    ///
+    /// Appended at the end rather than next to ADD/MUL because the enum's values are
+    /// what a serialized module stores: inserting in the middle would silently
+    /// reinterpret every opcode after it in an already compiled `.acvm` file.
+    ///
+    /// Traps on a negative exponent (no integer result) and on overflow, so the
+    /// exponentiation does not need a wrapping variant.
+    Pow,
 };
 
 enum class TrapKind : std::int32_t {
@@ -113,6 +129,11 @@ enum class TrapKind : std::int32_t {
     /// missing or does not export the symbol. Distinct from Unreachable so the
     /// message reads as a deployment problem, not a program bug.
     ExternalCallFailed,
+    /// `**` was given a negative exponent at runtime. Its own kind rather than
+    /// IntegerOverflow: nothing overflowed, the result is a fraction and there is no
+    /// integer to produce. Appended at the end so existing serialized modules keep
+    /// their trap numbers.
+    NegativeExponent,
 };
 
 std::string_view opCodeName(OpCode op);

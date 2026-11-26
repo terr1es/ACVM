@@ -143,6 +143,7 @@ bool Sema::check(Unit& unit) {
 
     collectTypeNames(unit);
     declareDecls(unit, *global);
+    checkGlobalInitializers(*global);
 
     for (auto& decl : unit.decls) {
         if (decl->kind == StmtKind::FuncDecl && !decl->isForward &&
@@ -374,6 +375,41 @@ void Sema::declareDecls(Unit& unit, Scope& global) {
             break;
         default:
             break;
+        }
+    }
+}
+
+void Sema::checkGlobalInitializers(Scope& scope) {
+    Flow flow;
+    for (const GlobalInfo& info : m_globals) {
+        Stmt* decl = info.decl;
+        if (decl == nullptr || decl->init == nullptr) {
+            continue;
+        }
+        const Type* type = info.type;
+        if (type == nullptr || type->isError()) {
+            continue;
+        }
+        if (decl->init->kind == ExprKind::InitList) {
+            checkInitializer(*decl->init, type, scope, flow);
+            continue;
+        }
+        // A scalar or a `Func<...>`: the same three steps a local declaration uses, so a
+        // function name is resolved against the declared signature here too.
+        if (type->isFunc() && decl->init->kind == ExprKind::Name &&
+            resolveFunctionValue(*decl->init, type, scope)) {
+            continue;
+        }
+        checkExpr(*decl->init, scope, flow);
+        adaptLiteral(*decl->init, type);
+        const Type* initType = decl->init->type;
+        if (initType != nullptr && !initType->isError() &&
+            !m_types.isAssignable(initType, type)) {
+            m_diagnostics.error(decl->init->range,
+                                "cannot initialise '" + decl->name + "' of type '" +
+                                    type->describe() + "' with a value of type '" +
+                                    initType->describe() + "'" +
+                                    conversionHint(initType, type));
         }
     }
 }
@@ -860,6 +896,38 @@ const Type* Sema::resolveTypeNode(TypeNode& node, Scope& scope) {
             node.resolved = m_types.getInt(bits, node.isUnsigned);
             return node.resolved;
         }
+        case ScalarBase::Bit: {
+            // The largest width that still fits the 192 KB global data budget
+            // (`VM::kStringBase - VM::kGlobalBase`). Above it a value can never be a
+            // global or a struct field -- the two places a fixed-size type beats
+            // `alloc` -- so the limit sits where the type stops being useful rather
+            // than at a round number.
+            constexpr unsigned kMaxBitWidth = 1048576;
+            if (node.powerBase != 0 && node.powerBase != 2) {
+                diagError(node.range,
+                          "the power notation in a bit width must have base 2, found '" +
+                              std::to_string(node.powerBase) + "u" +
+                              std::to_string(node.powerExponent) +
+                              "'; write the width in decimal or use base 2");
+                node.resolved = m_types.errorType();
+                return node.resolved;
+            }
+            if (node.bits < 1 || node.bits > kMaxBitWidth) {
+                std::string found = std::to_string(node.bits);
+                if (node.powerExponent != 0) {
+                    found += " (2^" + std::to_string(node.powerExponent) + ")";
+                }
+                diagError(node.range, "a bit width must be in [1, " +
+                                          std::to_string(kMaxBitWidth) + "], found " + found);
+                m_diagnostics.note(node.range.begin,
+                                   "1048576 bits is the largest width that still fits the 192 KB "
+                                   "global data budget; use 'alloc' for a runtime-sized bit buffer");
+                node.resolved = m_types.errorType();
+                return node.resolved;
+            }
+            node.resolved = m_types.getBit(node.bits);
+            return node.resolved;
+        }
         case ScalarBase::Float: {
             if (node.mantissa != 0 || node.exponent != 0) {
                 if (node.mantissa < 1 || node.exponent < 2 || node.mantissa + node.exponent > 126) {
@@ -916,6 +984,36 @@ const Type* Sema::resolveTypeNode(TypeNode& node, Scope& scope) {
         // ordinary function that says `T` still gets "unknown type 'T'".
         if (const Type* bound = lookupTypeBinding(node.name)) {
             node.resolved = bound;
+            return node.resolved;
+        }
+
+        // `Func<Ret, A1, A2>`: a function value.
+        //
+        // Written with the type-argument syntax generics already use, so no grammar is
+        // added and `Func` stays an ordinary identifier rather than a keyword. The return
+        // type comes first, so `Func<int, int, int>` reads as "returns int, takes two
+        // ints" -- the same order as the type itself, `int(int, int)`.
+        if (node.name == "Func") {
+            if (node.typeArgs.empty()) {
+                diagError(node.range,
+                          "'Func' needs a return type and its parameter types, as in "
+                          "'Func<int, int>'");
+                node.resolved = m_types.errorType();
+                return node.resolved;
+            }
+            std::vector<const Type*> signature;
+            signature.reserve(node.typeArgs.size());
+            bool ok = true;
+            for (TypeNodePtr& arg : node.typeArgs) {
+                const Type* resolved =
+                    arg == nullptr ? nullptr : resolveTypeNode(*arg, scope);
+                if (resolved == nullptr || resolved->isError()) {
+                    ok = false;
+                    resolved = m_types.errorType();
+                }
+                signature.push_back(resolved);
+            }
+            node.resolved = ok ? m_types.getFunc(std::move(signature)) : m_types.errorType();
             return node.resolved;
         }
 
@@ -984,6 +1082,16 @@ const Type* Sema::resolveTypeNode(TypeNode& node, Scope& scope) {
     }
     case TypeNode::Kind::Ptr: {
         const Type* inner = node.inner ? resolveTypeNode(*node.inner, scope) : m_types.errorType();
+        // A bit field has no address: it may start mid-byte, and the VM addresses
+        // bytes. Allowing `ptr bit3` would promise something no store could honour.
+        if (inner != nullptr && inner->isBit()) {
+            diagError(node.range,
+                      "cannot form a pointer to '" + inner->describe() +
+                          "': a bit string has no address; use a 'bitN' variable or an array "
+                          "of them, and read the element instead");
+            node.resolved = m_types.errorType();
+            return node.resolved;
+        }
         node.resolved = m_types.getPtr(inner);
         return node.resolved;
     }

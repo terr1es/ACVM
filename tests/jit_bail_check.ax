@@ -1,0 +1,69 @@
+//  jit_bail_check.ax — a function that has to hand its tail back to the interpreter.
+//
+//  `print` is executed by the interpreter and nothing else, so a compiled body cannot run
+//  it. Refusing the whole function for that used to be the most common refusal by a wide
+//  margin, and it counted functions whose hot loop had nothing to do with the print.
+//
+//  Now the body is compiled up to the first instruction that needs the interpreter and
+//  execution falls back there. The restart point must have an empty expression stack,
+//  because the interpreter reads operands from `process.stack` while the compiled body
+//  keeps them in frame slots with no type tags -- so `print` in the middle of an
+//  expression is still a refusal, and `print` as its own statement is a hand-off.
+//
+//  The dangerous shape is the one below: the hand-off point sits inside a conditional
+//  inside a loop, so the false branch jumps *over* it. A jump target past the hand-off
+//  that was bound to the wrong place ran into the epilogue and returned a garbage result
+//  code -- a wrong answer, not a crash, which is why it needs a test rather than an eye.
+
+// A loop whose body contains a conditional print. The condition is false for every
+// iteration except the last, so both the branch that prints and the branch that skips
+// are exercised.
+function counting(int64 n):int64 {
+    int64 total = 0;
+    int64 i = 0;
+    while (i < n) {
+        total = total + i * i;
+        if (i == n - 1) {
+            print("last=");
+            print(i);
+            print(" ");
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+// The same, with the print in the loop and the return value used afterwards: a hand-off
+// that lost the frame would corrupt `total`, and one that popped it twice would trap.
+function twice(int64 n):int64 {
+    int64 total = 0;
+    int64 i = 0;
+    while (i < n) {
+        if (i % 500 == 0) {
+            print(".");
+        }
+        total = total + 1;
+        i = i + 1;
+    }
+    return total;
+}
+
+function main():void {
+    int64 a = counting(5);
+    print("| ");
+    print(a);
+    print("\n");
+
+    int64 b = twice(1200);
+    print("| ");
+    print(b);
+    print("\n");
+
+    // Called a second time: the first hand-off must not have left the cache in a state
+    // where the second call starts at the hand-off point.
+    int64 c = counting(3);
+    print("| ");
+    print(c);
+    print("\n");
+    eof: pass;
+}

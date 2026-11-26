@@ -157,13 +157,29 @@ public:
         static bool constantString(VM& vm, int index, std::int64_t& out);
         static void zeroThroughPointer(VM& vm, std::uint64_t address, std::uint64_t size);
         static void copyThroughPointers(VM& vm, std::uint64_t destination,
-                                        std::uint64_t source, std::uint64_t size);        static int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
+                                        std::uint64_t source, std::uint64_t size);
+        static int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
                                  void** out, int maxPages);
         static bool callFunction(VM& vm, void* process, int functionIndex, int argc,
                                  std::string* error);
         static bool popResult(void* process, std::int64_t* out, bool isPtr = false);
         static bool pushValue(void* process, std::int64_t value, bool isPtr = false);
-        static bool safePoint(VM& vm, void* process, std::uint64_t nextIp);
+        /// Runs the event phase of a safe point. Returns 0 to continue, 1 to yield
+        /// (let the scheduler run another process), 2 when an event handler trapped --
+        /// in which case `*error` is set and the compiled function must return a trap.
+        ///
+        /// Events are evaluated here rather than only at a yield: the interpreter runs
+        /// them at every safe point, and a compiled function that skipped them because
+        /// it had nothing to switch to would fire an event fewer times than the same
+        /// program interpreted. Only the *yield* needs the expression stack empty, which
+        /// is why the caller decides what to do with 1 and this always does the work.
+        static int safePoint(VM& vm, void* process, std::uint64_t nextIp,
+                             std::string* error);
+        /// Leaves `ip` for the interpreter to resume at, and returns. Used when the
+        /// compiled body reaches an instruction only the interpreter can execute: the
+        /// frame and its slots stay exactly as they are, so the interpreter continues
+        /// the same function from that instruction with nothing left to hand over.
+        static void bailToInterpreter(void* process, std::uint64_t ip);
         static bool consumeBudget(VM& vm, std::uint64_t amount);
     };
 
@@ -184,6 +200,13 @@ private:
         std::vector<std::uint64_t> arenaMarks;
         bool finished = false;
         bool isMain = false;
+        /// Set once a compiled entry point has been tried for this process.
+        ///
+        /// A compiled function cannot be resumed in the middle -- it owns its own
+        /// return -- so a process that yields out of one continues interpreted from
+        /// then on. Without this flag the next quantum would re-enter the compiled
+        /// entry from the top and re-run everything the process had already done.
+        bool jitEntrySpent = false;
     };
 
     enum class Step { Continue, SafePoint, Finished, Trap };

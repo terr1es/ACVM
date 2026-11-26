@@ -229,6 +229,15 @@ private:
     void declareStruct(Stmt& decl, Scope& scope);
     void declareEnum(Stmt& decl, Scope& scope);
     void declareGlobalVar(Stmt& decl, Scope& scope);
+    /// Type-checks file-scope initialisers, which `declareGlobalVar` does not.
+    ///
+    /// Deferred to its own pass because an initialiser may name a function or a global
+    /// declared further down the file -- `Func<int, int> handler = serve;` with `serve`
+    /// defined below is the ordinary shape -- and nothing is in scope until every
+    /// declaration has been seen. Before this pass existed, a global's initialiser was
+    /// never checked at all: `global int x = "hello";` compiled and stored a string
+    /// descriptor as an integer.
+    void checkGlobalInitializers(Scope& scope);
     /// Builds the FuncInfo for a declaration and records it in `m_functions`.
     ///
     /// `declareIntoScope` is false when instantiating a generic function: the
@@ -326,6 +335,25 @@ private:
 
     /// `knownTypes[i]` (optional) supplies the type of `args[i]` without checking
     /// the expression again; index 0 is the callee slot and is ignored.
+    /// Resolves `expr` -- a bare function name -- against an expected `Func<...>`
+    /// signature, filling in `funcValue` and the expression's type. Reports and returns
+    /// false when the name is not a function, no overload matches, or more than one does.
+    ///
+    /// Every place a function value may appear goes through here: an initialiser, an
+    /// assignment, and an argument to a parameter of function type. A call site is not one
+    /// of them -- `f<int>(x)` would parse as a comparison -- so the signature has to come
+    /// from the destination, which is why this takes one.
+    bool resolveFunctionValue(Expr& expr, const Type* target, Scope& scope);
+    /// Type-checks the arguments of a call through a `Func<...>` value and marks the call
+    /// indirect. `callee` is whatever named the value -- a local, a field, an element --
+    /// and its type is `signature`.
+    ///
+    /// One implementation for all three shapes, because the diagnostics are the interesting
+    /// part: an arity mismatch and an argument mismatch have to read the same whether the
+    /// value came from a variable or from `table.run`.
+    const Type* checkIndirectCallOf(Expr& call, Expr& callee, const Type* signature,
+                                    std::vector<ExprPtr>& args, Scope& scope, Flow& flow);
+
     [[nodiscard]] int resolveOverload(Symbol& symbol, std::vector<ExprPtr>& args, Scope& scope,
                                       Flow& flow, SourceRange range,
                                       const std::vector<const Type*>* knownTypes = nullptr);

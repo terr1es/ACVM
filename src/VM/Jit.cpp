@@ -107,8 +107,12 @@ bool pushValue(void* process, std::int64_t value, bool isPtr) {
     return VM::JitBridge::pushValue(process, value, isPtr);
 }
 
-bool safePoint(VM& vm, void* process, std::uint64_t nextIp) {
-    return VM::JitBridge::safePoint(vm, process, nextIp);
+int safePoint(VM& vm, void* process, std::uint64_t nextIp, std::string* error) {
+    return VM::JitBridge::safePoint(vm, process, nextIp, error);
+}
+
+void bailToInterpreter(void* process, std::uint64_t ip) {
+    VM::JitBridge::bailToInterpreter(process, ip);
 }
 
 bool consumeBudget(VM& vm, std::uint64_t amount) {
@@ -317,6 +321,25 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         whyNot = "process body (must remain preemptible)";
         return nullptr;
     }
+    // The frame's pages are pinned once, at entry, into a table the whole body addresses
+    // through -- so the frame has to fit in the table. Worst case the frame starts one byte
+    // before a page boundary, so a frame of N bytes spans at most N/65536 + 1 pages.
+    //
+    // Refusing here rather than letting `pinFramePages` fail at run time: that failure came
+    // out as `runtime error: ` with an empty message, because the exit path had nothing to
+    // say. A function with a frame in this range is one with enormous stack arrays, which is
+    // not the shape the JIT is for anyway.
+    {
+        constexpr std::uint64_t kPageBytes = 65536;
+        const std::uint64_t worstCasePages = function.frameSize / kPageBytes + 1;
+        if (worstCasePages > kMaxPinnedPages) {
+            whyNot = "in '" + function.name + "': frame of " +
+                     std::to_string(function.frameSize) +
+                     " bytes spans more pages than the JIT pins";
+            return nullptr;
+        }
+    }
+
 
     const std::size_t codeSize = function.code.size();
     constexpr std::size_t kNoLabel = std::numeric_limits<std::size_t>::max();
@@ -402,6 +425,10 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             isBackEdge[i] = true;
         }
     }
+
+    // Filled in by the hand-off analysis, which needs `effectOf` and therefore lives
+    // inside the depth pass below.
+    std::size_t bailIp = std::numeric_limits<std::size_t>::max();
 
     std::vector<int> depthAt(codeSize, kUnknown);
     depthAt[0] = 0;
@@ -523,11 +550,108 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 return nullptr;
             }
         }
+
+        // -- where to hand the frame back to the interpreter -------------------
+        //
+        // A builtin (`print`, `atoi`, ...) and a call into a shared library are executed
+        // by the interpreter, which is the only implementation of them. Refusing the
+        // whole function for that was the biggest reason real programs stayed
+        // interpreted: across `examples/`, 146 of 381 functions compiled and `print` was
+        // the most common refusal -- and the refusal counted functions whose hot loop had
+        // nothing to do with it.
+        //
+        // Instead the body is compiled *up to* the first instruction the lowering cannot
+        // emit, and execution falls back there with the frame untouched. The restart
+        // point must have an empty expression stack: a compiled function keeps operands
+        // in frame slots with no type tags, and the interpreter reads `process.stack`, so
+        // an empty stack is the only state that needs no translation. That is a real
+        // limit -- `print` in the middle of an expression is not a restart point -- and a
+        // function with no empty-stack instruction before its first such instruction is
+        // still refused, exactly as it was before.
+        for (std::size_t i = 0; i < codeSize; ++i) {
+            if (depthAt[i] < 0) {
+                continue;
+            }
+            const Instruction& candidate = function.code[i];
+            int pops = 0;
+            int pushes = 0;
+            bool needsInterpreter = !effectOf(candidate, pops, pushes);
+            switch (candidate.op) {
+            // `effectOf` knows these have a defined stack effect but the lowering has no
+            // case for them, so without this they fall to the `default:` refusal instead
+            // of becoming a hand-off point. Every one of them is safe to hand over
+            // *before*: none has partially run by then, and the interpreter then does
+            // exactly what it would have done in a fully interpreted programme -- which
+            // is what keeps the differential test meaningful, trap messages included.
+            //
+            // This list has to stay in step with the lowering's switch. A new opcode that
+            // `effectOf` models but the lowering does not emit belongs here, and the
+            // symptom of forgetting is a refusal naming it rather than anything subtler.
+            case OpCode::Trap:
+            case OpCode::ConstFloat:
+            case OpCode::ArenaMark:
+            case OpCode::CopyStep:
+            case OpCode::GlobalAddr:
+            case OpCode::LoadGlobal:
+            case OpCode::StoreGlobal:
+                needsInterpreter = true;
+                break;
+            default:
+                break;
+            }
+            if (!needsInterpreter && candidate.op == OpCode::Call) {
+                if (!kCompileCalls) {
+                    needsInterpreter = true;
+                } else if (candidate.a >= 0 &&
+                           static_cast<std::size_t>(candidate.a) < module.functions.size()) {
+                    needsInterpreter =
+                        module.functions[static_cast<std::size_t>(candidate.a)].isExternal();
+                }
+            }
+            if (!needsInterpreter) {
+                continue;
+            }
+            // Walk back to the nearest instruction that starts with an empty stack. A
+            // jump target in between ends the search: another path arrives there, so
+            // stepping over it would change what that path executes.
+            std::size_t at = i;
+            bool found = false;
+            while (true) {
+                if (depthAt[at] == 0) {
+                    found = true;
+                    break;
+                }
+                if (at == 0 || labels[at] != kNoLabel) {
+                    break;
+                }
+                --at;
+            }
+            if (!found) {
+                whyNot = "in '" + function.name + "': needs the interpreter at " +
+                         std::to_string(i) +
+                         " and no empty-stack instruction precedes it";
+                return nullptr;
+            }
+            if (bailIp == std::numeric_limits<std::size_t>::max() || at < bailIp) {
+                bailIp = at;
+            }
+        }
+        // Handing over at the first instruction would compile a prologue and nothing
+        // else, which is the interpreter's work plus the cost of compiling it.
+        if (bailIp == 0) {
+            bailIp = std::numeric_limits<std::size_t>::max();
+            whyNot = "in '" + function.name +
+                     "': needs the interpreter at its first instruction";
+            return nullptr;
+        }
     }
 
     std::size_t depth = 0;
     std::string refusal;
     bool emittedReturn = false;
+    // Which jump targets have been bound. An early hand-off to the interpreter leaves
+    // targets past it unbound, and `finalize` rejects a block with an unbound label.
+    std::vector<bool> labelBound(codeSize, false);
 
     auto pushA = [&]() {
         if (depth >= kMaxValueSlots) {
@@ -610,6 +734,21 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     for (std::size_t ip = 0; ip < codeSize && refusal.empty(); ++ip) {
         if (labels[ip] != kNoLabel) {
             assembler.bind(labels[ip]);
+            labelBound[ip] = true;
+        }
+        // Everything from here on is the interpreter's, so this is a return as far as the
+        // compiled body is concerned: emit the hand-off and stop lowering. Instructions
+        // past this point may not even have a known stack depth, which is why they must
+        // not be reached by falling through.
+        if (ip == bailIp) {
+            assembler.mov(kArg1, kRegProcess);
+            assembler.movImm(kArg2, Width::Qword, static_cast<std::int64_t>(ip));
+            assembler.callAbsolute(
+                reinterpret_cast<const void*>(&jitbridge::bailToInterpreter));
+            assembler.movImm(kRegA, Width::Dword, 3);
+            assembler.jmp(failureExit);
+            emittedReturn = true;
+            break;
         }
         if (depthAt[ip] < 0) {
             continue;   // unreachable, or past an instruction whose effect is unknown
@@ -1097,6 +1236,77 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         }
 
         case OpCode::LocalAddr: {
+            // Fuse `LOCAL_ADDR k` with the access that consumes it.
+            //
+            // IRGen emits the *address* of a local for every store and for the generic
+            // pointer load, and `for i in 0..n` is built almost entirely from those two
+            // pairs -- 216 `LOCAL_ADDR; SWAP; STORE` and 112 `LOCAL_ADDR; LOAD` across
+            // the example programs counted. Each one went through
+            // `jitbridge::loadThroughPointer`, which is a C++ call, a memType lookup and
+            // a 32 byte `Value` construction, per local variable access. Measured on a
+            // 20 000 000 iteration range loop: 4.7x, against 21x for the same loop
+            // written with LOAD_LOCAL. The whole difference was this.
+            //
+            // Safe because the address is dead the moment the access happens: nothing
+            // can observe it between the two instructions, and a jump target in the
+            // middle would be the only way another path could arrive there. A slot that
+            // straddles a page still takes the bridge, so the page-boundary rule is
+            // unchanged.
+            if (ip + 1 < codeSize && labels[ip + 1] == kNoLabel) {
+                const Instruction& next = function.code[ip + 1];
+                if (next.op == OpCode::Load) {
+                    const IntInfo info = intInfoOf(module, next.a);
+                    if (info.supported && depth < kMaxValueSlots) {
+                        auto slow = assembler.newLabel();
+                        auto done = assembler.newLabel();
+                        emitScalarLoad(inst.a, info.bits, info.isUnsigned, slow);
+                        assembler.mov(mem(Reg::Rsp, slotOffset(depth)), kRegA);
+                        assembler.jmp(done);
+                        assembler.bind(slow);
+                        emitHelperLoad(inst.a, next.a, depth);
+                        assembler.bind(done);
+                        ++depth;
+                        ++ip;   // the LOAD has been emitted
+                        break;
+                    }
+                } else if (next.op == OpCode::Swap && ip + 2 < codeSize &&
+                           labels[ip + 2] == kNoLabel && depth >= 1) {
+                    const Instruction& store = function.code[ip + 2];
+                    if (store.op == OpCode::Store) {
+                        const IntInfo info = intInfoOf(module, store.a);
+                        if (info.supported) {
+                            // The value being stored sits one slot below the address
+                            // that SWAP would have moved it above; parking it in the
+                            // scratch slot first is what `STORE_LOCAL` does too, because
+                            // forming the address clobbers every scratch register.
+                            const std::size_t valueSlot = depth - 1;
+                            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(valueSlot)));
+                            assembler.mov(mem(Reg::Rsp, slotOffset(kScratchSlot)), kRegA);
+
+                            auto slow = assembler.newLabel();
+                            auto done = assembler.newLabel();
+                            emitSlotAddress(inst.a, info.bits, slow);
+                            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+                            assembler.mov(mem(kTmp1, 0), kRegA, widthOfBits(info.bits));
+                            assembler.jmp(done);
+                            assembler.bind(slow);
+                            assembler.mov(kArg1, kRegVm);
+                            assembler.lea(kArg2, mem(kRegBase, inst.a));
+                            assembler.movImm(kArg3, Width::Dword, store.a);
+                            assembler.mov(kArg4, mem(Reg::Rsp, slotOffset(valueSlot)));
+                            assembler.callAbsolute(
+                                reinterpret_cast<const void*>(&jitbridge::storeSlot));
+                            assembler.test(kRegA, kRegA, Width::Byte);
+                            assembler.jcc(Cond::Equal, failureExit);
+                            assembler.bind(done);
+
+                            depth -= 1;   // the address and the value both go away
+                            ip += 2;
+                            break;
+                        }
+                    }
+                }
+            }
             assembler.lea(kRegA, mem(kRegBase, inst.a));
             pushA();
             break;
@@ -1352,24 +1562,38 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // program never yielded, which is why this only appeared once calls were
             // compiled inside a program that also ran a second process.
             //
-            // Skipping the yield costs preemption granularity only: the function reaches
-            // the next safe point with an empty stack, or returns.
-            if (depth != 0) {
-                break;
-            }
+            // The event phase runs at every safe point, yield or not, because the
+            // interpreter runs it at every safe point. Only the *yield* needs an empty
+            // expression stack -- the interpreter resumes at `ip + 1` from
+            // `process.stack`, which knows nothing about this function's frame slots.
+            //
             // Resume point for the interpreter if we yield; the interpreter's own handler
             // has already advanced past the instruction when it writes ip back.
             assembler.mov(kArg1, kRegVm);
             assembler.mov(kArg2, kRegProcess);
             assembler.movImm(kArg3, Width::Qword, static_cast<std::int64_t>(ip + 1));
+            assembler.mov(kArg4, kRegError);
             assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::safePoint));
-            assembler.test(kRegA, kRegA, Width::Byte);
-            // Non-zero means yield: hand the frame back exactly where it stands.
-            auto noYield = assembler.newLabel();
-            assembler.jcc(Cond::Equal, noYield);
-            assembler.movImm(kRegA, Width::Dword, 2);
+
+            auto after = assembler.newLabel();
+            auto isTrap = assembler.newLabel();
+            // 2 -- an event handler trapped; `*error` already says what.
+            assembler.cmpImm(kRegA, 2);
+            assembler.jcc(Cond::Equal, isTrap);
+            // 1 -- a yield was asked for. Honoured only with an empty stack; skipped
+            // otherwise, which costs preemption granularity and nothing else.
+            if (depth != 0) {
+                assembler.jmp(after);
+            } else {
+                assembler.test(kRegA, kRegA, Width::Byte);
+                assembler.jcc(Cond::Equal, after);
+                assembler.movImm(kRegA, Width::Dword, 2);
+                assembler.jmp(failureExit);
+            }
+            assembler.bind(isTrap);
+            assembler.movImm(kRegA, Width::Dword, 0);
             assembler.jmp(failureExit);
-            assembler.bind(noYield);
+            assembler.bind(after);
             break;
         }
 
@@ -1383,6 +1607,24 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     if (!refusal.empty()) {
         whyNot = "in '" + function.name + "': " + refusal;
         return nullptr;
+    }
+
+    // Anything the early hand-off left behind needs its own hand-off, not a shared
+    // unreachable address. A conditional jump whose target is past `bailIp` -- the
+    // false branch of `if (rare) { print(...); }`, say -- arrives at that target
+    // directly, and binding it to code that falls into the epilogue would return a
+    // garbage result code. Each stub names its own ip, so the interpreter resumes at
+    // the instruction the compiled path was about to run.
+    for (std::size_t i = 0; i < codeSize; ++i) {
+        if (labels[i] == kNoLabel || labelBound[i]) {
+            continue;
+        }
+        assembler.bind(labels[i]);
+        assembler.mov(kArg1, kRegProcess);
+        assembler.movImm(kArg2, Width::Qword, static_cast<std::int64_t>(i));
+        assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::bailToInterpreter));
+        assembler.movImm(kRegA, Width::Dword, 3);
+        assembler.jmp(failureExit);
     }
 
     if (!emittedReturn) {

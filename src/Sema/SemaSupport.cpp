@@ -110,6 +110,106 @@ std::string signatureOf(const FuncInfo& info) {
 // Overload resolution
 //===----------------------------------------------------------------------===//
 
+const Type* Sema::checkIndirectCallOf(Expr& call, Expr& callee, const Type* signature,
+                                     std::vector<ExprPtr>& args, Scope& scope, Flow& flow) {
+    const std::string name =
+        callee.kind == ExprKind::Name ? callee.text : std::string("this function value");
+    const std::size_t given = args.size() - 1;
+    if (given != signature->funcParamCount()) {
+        m_diagnostics.error(call.range,
+                            "'" + name + "' has type '" + signature->describe() + "' and takes " +
+                                std::to_string(signature->funcParamCount()) +
+                                " argument(s), but " + std::to_string(given) + " were given");
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            checkExpr(*args[i], scope, flow);
+        }
+        call.type = m_types.errorType();
+        return call.type;
+    }
+    bool ok = true;
+    for (std::size_t i = 0; i < given; ++i) {
+        checkExpr(*args[i + 1], scope, flow);
+        adaptLiteral(*args[i + 1], signature->funcParam(i));
+        const Type* actual = args[i + 1]->type;
+        if (actual != nullptr && !actual->isError() &&
+            !m_types.isAssignable(actual, signature->funcParam(i))) {
+            m_diagnostics.error(args[i + 1]->range,
+                                "cannot pass '" + actual->describe() + "' as '" +
+                                    signature->funcParam(i)->describe() + "' to '" + name + "'");
+            ok = false;
+        }
+    }
+    if (!ok) {
+        call.type = m_types.errorType();
+        return call.type;
+    }
+    call.indirectCall = true;
+    call.type = signature->funcReturn();
+    return call.type;
+}
+
+bool Sema::resolveFunctionValue(Expr& expr, const Type* target, Scope& scope) {
+    if (target == nullptr || !target->isFunc() || expr.kind != ExprKind::Name) {
+        return false;
+    }
+    // Not a function: not this helper's business. Copying a `Func` from another `Func`
+    // is an ordinary load, and an unknown name is the ordinary "undefined" error, so both
+    // have to fall through to the regular path rather than be diagnosed here.
+    Symbol* named = scope.lookup(expr.text);
+    if (named == nullptr || named->kind != Symbol::Kind::Function) {
+        return false;
+    }
+
+    int match = -1;
+    bool ambiguous = false;
+    for (const int index : named->overloads) {
+        if (index < 0 || static_cast<std::size_t>(index) >= m_functions.size()) {
+            continue;
+        }
+        const FuncInfo& candidate = m_functions[static_cast<std::size_t>(index)];
+        if (candidate.params.size() != target->funcParamCount()) {
+            continue;
+        }
+        if (!m_types.isAssignable(candidate.ret, target->funcReturn())) {
+            continue;
+        }
+        bool fits = true;
+        for (std::size_t i = 0; i < candidate.params.size(); ++i) {
+            if (!m_types.isAssignable(candidate.params[i], target->funcParam(i))) {
+                fits = false;
+                break;
+            }
+        }
+        if (!fits) {
+            continue;
+        }
+        if (match >= 0) {
+            ambiguous = true;
+        }
+        match = index;
+    }
+
+    if (match < 0) {
+        m_diagnostics.error(expr.range, "no overload of '" + expr.text + "' matches '" +
+                                            target->describe() + "'");
+        expr.type = m_types.errorType();
+        return false;
+    }
+    if (ambiguous) {
+        m_diagnostics.error(expr.range,
+                            "'" + expr.text + "' has more than one overload matching '" +
+                                target->describe() + "'; the signature has to name one of "
+                                "them exactly");
+        expr.type = m_types.errorType();
+        return false;
+    }
+    expr.funcValue = match;
+    expr.sym = named;
+    expr.type = target;
+    expr.isLValue = false;
+    return true;
+}
+
 int Sema::resolveOverload(Symbol& symbol, std::vector<ExprPtr>& args, Scope& scope, Flow& flow,
                           SourceRange range, const std::vector<const Type*>* knownTypes) {
     const std::size_t argc = args.size() - 1;
@@ -123,6 +223,60 @@ int Sema::resolveOverload(Symbol& symbol, std::vector<ExprPtr>& args, Scope& sco
     for (std::size_t i = 1; i < args.size(); ++i) {
         const bool known = knownTypes != nullptr && i < knownTypes->size() &&
                            (*knownTypes)[i] != nullptr;
+        // Only a name that *is* a function can be a function value. A variable of type
+        // `Func<...>` is an ordinary expression and takes the path below -- which is what
+        // makes a generic body able to pass its own `Func<int, T>` parameter on: the
+        // parameter is a local, not a function, and its type is already concrete.
+        Symbol* named = (!known && args[i]->kind == ExprKind::Name)
+                            ? scope.lookup(args[i]->text)
+                            : nullptr;
+        if (named != nullptr && named->kind == Symbol::Kind::Function) {
+            // A bare function name as an argument: only the parameter type can resolve it,
+            // and the parameter type belongs to the candidate. Taking the first `Func<...>`
+            // declared at this position is exact whenever the overloads agree there, which
+            // is the only case where passing a function name is unambiguous anyway.
+            bool funcPosition = false;
+            for (const int candidate : symbol.overloads) {
+                if (candidate < 0 || static_cast<std::size_t>(candidate) >= m_functions.size()) {
+                    continue;
+                }
+                const FuncInfo& info = m_functions[static_cast<std::size_t>(candidate)];
+                if (i - 1 >= info.params.size() || !info.params[i - 1]->isFunc()) {
+                    continue;
+                }
+                funcPosition = true;
+                if (resolveFunctionValue(*args[i], info.params[i - 1], scope)) {
+                    argTypes[i] = info.params[i - 1];
+                }
+                break;
+            }
+            if (argTypes[i] != nullptr) {
+                continue;
+            }
+            // A *template* may also declare `Func<...>` here, and its parameter type is not
+            // concrete yet -- `Func<int, T>` has no T until the other arguments say what it
+            // is. Leaving the type null defers the check to `tryTemplates`, which resolves
+            // it against the instantiated parameter. Anything else is the ordinary
+            // "function used as a value" error, which the loop below then reports.
+            if (!funcPosition) {
+                for (const int templateIndex : symbol.templates) {
+                    const FuncTemplate& tmpl = m_templates[static_cast<std::size_t>(templateIndex)];
+                    if (tmpl.decl == nullptr || i - 1 >= tmpl.decl->params.size()) {
+                        continue;
+                    }
+                    const TypeNode* declared = tmpl.decl->params[i - 1].type.get();
+                    if (declared != nullptr && declared->kind == TypeNode::Kind::Named &&
+                        declared->name == "Func") {
+                        argTypes[i] = nullptr;
+                        funcPosition = true;
+                        break;
+                    }
+                }
+                if (funcPosition) {
+                    continue;
+                }
+            }
+        }
         argTypes[i] = known ? (*knownTypes)[i] : checkExpr(*args[i], scope, flow);
     }
 
@@ -183,6 +337,22 @@ int Sema::resolveOverload(Symbol& symbol, std::vector<ExprPtr>& args, Scope& sco
             const int instance = instantiateTemplate(templateIndex, typeArgs, range);
             if (instance < 0) {
                 return -2;   // instantiation already reported a real error
+            }
+            // A deferred function value: the parameter type is concrete now, so the name
+            // can finally be resolved against it. Failing here is the same class of error
+            // as a wrong argument type, and `resolveFunctionValue` has already reported it.
+            const FuncInfo& instantiated = m_functions[static_cast<std::size_t>(instance)];
+            bool deferredOk = true;
+            for (std::size_t i = 0; i < argc; ++i) {
+                if (argTypes[i + 1] != nullptr || i >= instantiated.params.size()) {
+                    continue;
+                }
+                if (!resolveFunctionValue(*args[i + 1], instantiated.params[i], scope)) {
+                    deferredOk = false;
+                }
+            }
+            if (!deferredOk) {
+                return -2;
             }
             if (best >= 0 && best != instance) {
                 m_diagnostics.error(range, "the call to '" + symbol.name +
@@ -585,7 +755,36 @@ const Type* Sema::checkMember(Expr& expr, Scope& scope, Flow& flow) {
 
 const Type* Sema::checkInitializer(Expr& expr, const Type* target, Scope& scope, Flow& flow) {
     if (expr.kind != ExprKind::InitList) {
+        // A leaf of an initialiser list: `Func<int, int> table[2] = {twice, square};` -- an
+        // array of function values is the shape a dispatch table takes, so the element
+        // target has to resolve a name the same way a single declaration does.
+        if (expr.kind == ExprKind::Name && target->isFunc() &&
+            resolveFunctionValue(expr, target, scope)) {
+            return expr.type;
+        }
         checkExpr(expr, scope, flow);
+        // `struct P p[200] = {0}`: a scalar zero standing for a whole aggregate. This is the
+        // C idiom for "zero it all", and it has to be caught here rather than in IRGen,
+        // which would otherwise treat the 0 as the *address* to copy from -- a null pointer
+        // dereference at run time, which is exactly what it used to do.
+        //
+        // Only a constant zero is allowed. `{5}` for a struct has no meaning to pick: is 5
+        // the first field, or all fields? Refusing is better than guessing.
+        if (target->isAggregate() && (expr.type == nullptr || !expr.type->isAggregate())) {
+            const bool isZero = expr.isConstExpr && !expr.constIsFloat && expr.constInt == 0;
+            if (!isZero) {
+                m_diagnostics.error(expr.range,
+                                    "cannot initialise '" + target->describe() +
+                                        "' from " + expr.type->describe() +
+                                        "; use '{0}' to zero it, or a '{...}' matching the "
+                                        "type");
+                expr.type = m_types.errorType();
+                return expr.type;
+            }
+            expr.aggregateZeroFill = true;
+            expr.type = target;
+            return expr.type;
+        }
         adaptLiteral(expr, target);
         return expr.type;
     }
@@ -648,6 +847,28 @@ const Type* Sema::checkInitializer(Expr& expr, const Type* target, Scope& scope,
                 break;
             }
             checkInitializer(*expr.kids[i], members[i], scope, flow);
+        }
+        expr.type = target;
+        return expr.type;
+    }
+
+    // A wide bit string is a fixed block of bytes, so `{0}` means "all bits zero" --
+    // the only initialiser that makes sense for a value with no numeric form. A
+    // non-zero entry is refused rather than silently reinterpreted: there is no
+    // field order to map braces onto.
+    if (target->isBit()) {
+        if (!expr.kids.empty()) {
+            const Expr& only = *expr.kids[0];
+            const bool zero = expr.kids.size() == 1 && only.kind == ExprKind::IntLit &&
+                              only.lit.intValue == 0;
+            if (!zero) {
+                m_diagnostics.error(expr.range,
+                                    "a '" + target->describe() +
+                                        "' can only be initialised with '{0}'; assign bits "
+                                        "through an array element instead");
+                expr.type = m_types.errorType();
+                return expr.type;
+            }
         }
         expr.type = target;
         return expr.type;

@@ -188,7 +188,8 @@ bool pushValue(void* process, std::int64_t value, bool isPtr = false);
 /// With one process there is nothing to hand control to, so the compiled path continues --
 /// which is why a single-process program never pays for this. With more than one it yields
 /// exactly where the interpreter would.
-bool safePoint(VM& vm, void* process, std::uint64_t nextIp);
+int safePoint(VM& vm, void* process, std::uint64_t nextIp, std::string* error);
+void bailToInterpreter(void* process, std::uint64_t ip);
 
 /// Charges `amount` instructions against the runaway-loop budget and reports whether it is
 /// exhausted. Called from compiled loop back edges, so an infinite loop still stops with a

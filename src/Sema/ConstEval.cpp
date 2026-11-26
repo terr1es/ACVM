@@ -67,6 +67,30 @@ bool binaryOp(BinOp op, const ConstValue& lhs, const ConstValue& rhs, ConstValue
         }
         out.i = a % b;
         return true;
+    case BinOp::Pow: {
+        // Exponentiation by squaring, refusing to fold when the result leaves the
+        // 128 bit cell: leaving the expression unfolded lets the runtime trap fire at
+        // the line that wrote it, instead of the compiler reporting a wrong constant.
+        if (b < 0) {
+            return false;
+        }
+        Int128 result = 1;
+        Int128 base = a;
+        Int128 exponent = b;
+        while (exponent > 0) {
+            if ((exponent & 1) != 0) {
+                if (__builtin_mul_overflow(result, base, &result)) {
+                    return false;
+                }
+            }
+            exponent >>= 1;
+            if (exponent > 0 && __builtin_mul_overflow(base, base, &base)) {
+                return false;
+            }
+        }
+        out.i = result;
+        return true;
+    }
     case BinOp::Shl:
         out.i = a << static_cast<int>(b & 127);
         return true;

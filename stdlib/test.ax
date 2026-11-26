@@ -179,6 +179,72 @@ function checkEmpty(string actual, string name):void {
     eof: pass;
 }
 
+// ─── named cases ───────────────────────────────────────────────────────────
+//
+//  A test file usually ends up as one long `main` that calls every group in order, and
+//  adding a group means editing two places -- the function and the list at the bottom.
+//  `Func<void>` removes the second edit: a case is registered by naming it.
+//
+//      function addsNumbers():void { checkInt(1 + 1, 2, "1+1"); }
+//      function sortsNames():void  { ... }
+//
+//      function main():void {
+//          testCase("addition", addsNumbers);
+//          testCase("sorting", sortsNames);
+//          testRunAll();
+//          testFinish();
+//      }
+//
+//  The table is fixed size because there is no growable array here (a test script may not
+//  want to import `vec` for one array, and `vec` allocates). Sixty-four cases is more than
+//  any single file in this repository has, and `testCase` says so when the table is full
+//  instead of silently dropping a case -- a test that is never run is worse than one that
+//  fails.
+
+comptime int TEST_MAX_CASES = 64;
+
+global string TestCaseName[TEST_MAX_CASES] = {""};
+global Func<void> TestCaseBody[TEST_MAX_CASES];
+global int TestCaseRegistered = 0;
+
+//  Registers `body` under `name`. Call before `testRunAll`.
+//
+//  A `Func<void>` parameter takes a bare function name at the call site, so the call has no
+//  cast and no address-of: `testCase("addition", addsNumbers)`.
+function testCase(string name, Func<void> body):void {
+    if (TestCaseRegistered >= TEST_MAX_CASES) {
+        print("[FAIL] cannot register '" + name + "': the case table holds " +
+              itoa(TEST_MAX_CASES, 10) + "\n");
+        TestFailed = TestFailed + 1;
+        return;
+    }
+    TestCaseName[TestCaseRegistered] = name;
+    TestCaseBody[TestCaseRegistered] = body;
+    TestCaseRegistered = TestCaseRegistered + 1;
+    eof: pass;
+}
+
+//  Runs every registered case in registration order, each under its own `testGroup`
+//  header, and returns how many cases were run.
+//
+//  A case that traps or asserts stops the run: there is no recovery from a trap here, and
+//  pretending otherwise (catching it) would need a construct this language does not have.
+//  Order the cases so the most fundamental one runs first.
+function testRunAll():int {
+    for i in 0..TestCaseRegistered {
+        testGroup(TestCaseName[i]);
+        TestCaseBody[i]();
+    }
+    return TestCaseRegistered;
+    eof: pass;
+}
+
+//  Number of registered cases, registered so far. Useful in a check of the harness itself.
+function testCaseCount():int {
+    return TestCaseRegistered;
+    eof: pass;
+}
+
 // ─── summary ───────────────────────────────────────────────────────────────
 
 function testCountPassed():int {

@@ -1,0 +1,105 @@
+//  cli_dispatch_check.ax — subcommand dispatch through a `Func` table.
+//
+//  The table form exists because a program with subcommands otherwise repeats
+//  `if (cliCommand(a) == "...")` once per command, and the repetition is where a command
+//  gets forgotten. What a table costs is a pairing nothing enforces: `names[i]` is handled by
+//  `handlers[i]`, and the two arrays are separate. So what this file checks is exactly that
+//  pairing -- a dispatch that looked at the wrong index would still "work", returning some
+//  handler's value, and a test that only checked "a number came back" would pass.
+//
+//  Run:  acvm run tests/cli_dispatch_check.ax
+
+function import (return:(cli));
+
+// Each handler returns its own number, so the value returned identifies which one ran --
+// the property a table can get wrong without any visible symptom.
+function onServe(ptr CliArgs a):int {
+    return 11;
+}
+
+function onBuild(ptr CliArgs a):int {
+    return 22;
+}
+
+function onTest(ptr CliArgs a):int {
+    return 33;
+}
+
+function onUnknown(ptr CliArgs a):int {
+    return 99;
+}
+
+// A handler that reads its arguments, to prove the pointer it receives is the real parse
+// result and not a copy of the wrong thing.
+function onEcho(ptr CliArgs a):int {
+    if (cliPositionalCount(a) < 2) {
+        return 1;
+    }
+    if (cliPositionalAt(a, 1) != "target") {
+        return 2;
+    }
+    return 0;
+}
+
+comptime int CALLS = 5;
+
+string DispatchNames[CALLS] = {"serve", "build", "test", "echo", "none"};
+Func<int, ptr CliArgs> DispatchHandlers[CALLS] = {onServe, onBuild, onTest, onEcho, onUnknown};
+
+// Parses `line` and dispatches through the table. `Doc` is freed before returning, so every
+// case below is also a check that the handler ran while the parse result was still alive.
+function run(string line):int {
+    Doc d = docNew(0);
+    ptr CliArgs a = cliParse(#d, line);
+    int code = cliDispatch(a, #DispatchNames[0], #DispatchHandlers[0], CALLS, onUnknown);
+    docFree(#d);
+    return code;
+    eof: pass;
+}
+
+function main():void {
+    // The program name comes first, as on a real command line; `cliCommand` is positional 0.
+    if (run("tool serve x") != 11) {
+        print("MISMATCH: serve dispatched to the wrong handler\n");
+        trap();
+    }
+    if (run("tool build x") != 22) {
+        print("MISMATCH: build dispatched to the wrong handler\n");
+        trap();
+    }
+    if (run("tool test") != 33) {
+        print("MISMATCH: the last real command did not dispatch\n");
+        trap();
+    }
+
+    // A handler that reads its own arguments: `target` is positional 1 here.
+    if (run("tool echo target") != 0) {
+        print("MISMATCH: the handler did not see the parsed positionals\n");
+        trap();
+    }
+
+    // No match falls to `unknown`, not to the first handler and not to a crash.
+    if (run("tool nonsense") != 99) {
+        print("MISMATCH: an unknown command did not reach the fallback\n");
+        trap();
+    }
+
+    // No command at all: `cliCommand` is "" and no name matches, so this is also `unknown`.
+    if (run("tool") != 99) {
+        print("MISMATCH: a missing command did not reach the fallback\n");
+        trap();
+    }
+
+    // `count` smaller than the arrays: the tail is simply not searched, which is what lets a
+    // caller dispatch a subset (a hidden command, a build without a feature).
+    Doc d = docNew(0);
+    ptr CliArgs a = cliParse(#d, "tool test");
+    if (cliDispatch(a, #DispatchNames[0], #DispatchHandlers[0], 2, onUnknown) != 99) {
+        print("MISMATCH: a short count still matched a command outside it\n");
+        trap();
+    }
+    docFree(#d);
+
+    print("done\n");
+    eof: pass;
+}

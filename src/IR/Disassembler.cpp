@@ -76,6 +76,10 @@ void formatInstruction(const Module& module, const Function& function, std::size
         out << "*frame+" << (inst.b & 0x0FFF'FFFF) << "++ = *frame+" << inst.a << "++ ("
         << (((inst.b >> 28) & 0x7) + 1) << " bytes)";
         break;
+
+    case OpCode::Pow:
+        out << "pow (type " << inst.a << ")";
+        break;
     case OpCode::DerefLocal:
         out << "frame+" << inst.a << " -> " << memTypeText(module, inst.b);
         break;
@@ -143,6 +147,11 @@ void formatInstruction(const Module& module, const Function& function, std::size
     case OpCode::JumpIfTrue:
         out << "-> " << inst.a;
         break;
+    case OpCode::CallIndirect:
+        // No name to print: the callee is whatever the handle on the stack names.
+        out << "<value>, argc " << inst.b;
+        break;
+
     case OpCode::Call:
         if (inst.a >= 0 && static_cast<std::size_t>(inst.a) < module.functions.size()) {
         out << module.functions[static_cast<std::size_t>(inst.a)].name << ", argc "

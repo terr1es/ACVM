@@ -1,0 +1,208 @@
+//  bit_check.ax -- `bitN` storage: packing, reads, writes.
+//
+//  A `bitN` is a fixed-length bit string. It is not a number: no arithmetic, no
+//  address, no pointer (Sema rejects all three). It exists to be stored densely,
+//  and the thing no library can do is pack *struct fields* -- `bool` is one byte
+//  each, so four flags and a 4-bit kind cost five bytes where one is enough.
+//
+//  What this file holds down, in order of how easy it is to get wrong:
+//
+//  1. **Layout.** `Page` must be exactly one byte. If the packing rule ever
+//     regresses to byte-per-field, this fails loudly instead of quietly costing
+//     5x memory in every pool allocator that uses it.
+//  2. **Writes do not disturb neighbours.** A bit field shares its byte, so a store
+//     is a read-modify-write. Getting the mask wrong clears the neighbouring flags,
+//     which no other check would notice: the value written still reads back.
+//  3. **A field that starts mid-byte reads back at the right shift.** `Page.kind`
+//     sits at bit 4; reading it without shifting returns a value 16x too large.
+//  4. **`as` truncates rather than traps.** `300 as bit8` is 44. This is the one
+//     place a bit string deliberately differs from `as int8`, which traps.
+
+function import (return:(test));
+
+struct Page {
+    bit1 used;
+    bit1 dirty;
+    bit1 pinned;
+    bit1 shared;
+    bit4 kind;
+};
+
+/// The same fields spelled the way they had to be before `bitN`: one byte each.
+struct PageWide {
+    bool used;
+    bool dirty;
+    bool pinned;
+    bool shared;
+    int4 kind;
+};
+
+struct Mixed {
+    bit1 flag;
+    int payload;
+    bit3 lo;
+    bit5 hi;
+};
+
+/// Eight 32-bit words plus a 64-byte block: the shape a hash state has, and the
+/// reason wide bit strings exist at all.
+struct Holder {
+    bit32 w0; bit32 w1; bit32 w2; bit32 w3;
+    bit32 w4; bit32 w5; bit32 w6; bit32 w7;
+    bit512 block;
+};
+
+function echoWide(bit256 v):int {
+    return sizeof(bit256);
+    eof: pass;
+}
+
+function main():void {
+    testGroup("bit strings");
+
+    checkInt(sizeof(Page), 1, "five fields pack into one byte");
+    checkInt(sizeof(PageWide), 5, "the wide spelling is five bytes");
+    checkInt(sizeof(bit1), 1, "an isolated bit1 still occupies a byte");
+    checkInt(sizeof(bit8), 1, "bit8 is one byte");
+    checkInt(sizeof(bit24), 3, "bit24 is three bytes");
+    checkInt(sizeof(bit127), 16, "bit127 is sixteen bytes");
+
+    // Write every field, then read all of them back: a mask that is too wide shows
+    // up as one field clobbering its neighbour.
+    Page p = {0, 0, 0, 0, 0};
+    p.used = 1;
+    p.dirty = 1;
+    p.pinned = 0;
+    p.shared = 1;
+    p.kind = 9;
+    checkInt(p.used as int, 1, "used reads back");
+    checkInt(p.dirty as int, 1, "dirty reads back");
+    checkInt(p.pinned as int, 0, "pinned reads back");
+    checkInt(p.shared as int, 1, "shared reads back");
+    checkInt(p.kind as int, 9, "a field at bit 4 reads back at the right shift");
+
+    // Clearing one field must leave the rest of the byte alone.
+    p.used = 0;
+    checkInt(p.used as int, 0, "used cleared");
+    checkInt(p.dirty as int, 1, "clearing used left dirty alone");
+    checkInt(p.shared as int, 1, "clearing used left shared alone");
+    checkInt(p.kind as int, 9, "clearing used left kind alone");
+
+    // The widest value the field can hold, then zero.
+    p.kind = 15;
+    checkInt(p.kind as int, 15, "bit4 holds 15");
+    p.kind = 0;
+    checkInt(p.kind as int, 0, "bit4 holds 0");
+
+    // An ordinary field between bit fields forces byte alignment, so the struct is
+    // 1 + pad + 4 + 1 rounded up to 4.
+    checkInt(sizeof(Mixed), 12, "an int between bit fields forces alignment");
+    Mixed m = {0, 0, 0, 0};
+    m.flag = 1;
+    m.payload = 123456;
+    m.lo = 7;
+    m.hi = 31;
+    checkInt(m.flag as int, 1, "flag survives an aligned payload");
+    checkInt(m.payload, 123456, "payload survives its bit neighbours");
+    checkInt(m.lo as int, 7, "bit3 after an int reads back");
+    checkInt(m.hi as int, 31, "bit5 packed beside a bit3 reads back");
+
+    // `as` truncates: the low N bits are what a bit string means.
+    int wide = 300;
+    bit8 cut = wide as bit8;
+    checkInt(cut as int, 44, "300 as bit8 keeps the low eight bits");
+    checkInt((12345 as bit3) as int, 1, "12345 as bit3 keeps the low three bits");
+
+    // Comparison is by value, and it is the only operator a bit string supports.
+    bit8 x = 5;
+    bit8 y = 5;
+    checkInt((x == y ? 1 : 0), 1, "two bit strings compare by value");
+
+    // ── packed arrays ────────────────────────────────────────────────────────
+    //
+    // An array of a width that divides 8 packs: `bit1[1000]` is 125 bytes. The
+    // element is then not addressable -- it starts at a bit -- so every access
+    // computes a byte and a bit offset. The indices below sit on the boundaries
+    // where that arithmetic goes wrong: the last bit of one byte, the first of the
+    // next, and the far end of the array.
+    bit1 bits[1000];
+    for (int i = 0; i < 1000; i++) { bits[i] = 0; }
+    bits[0] = 1;
+    bits[7] = 1;
+    bits[8] = 1;
+    bits[999] = 1;
+    checkInt(bits[0] as int, 1, "packed bit1[0]");
+    checkInt(bits[1] as int, 0, "packed bit1[1] stays clear");
+    checkInt(bits[7] as int, 1, "packed bit1[7] is the last bit of byte 0");
+    checkInt(bits[8] as int, 1, "packed bit1[8] is the first bit of byte 1");
+    checkInt(bits[9] as int, 0, "packed bit1[9] stays clear");
+    checkInt(bits[999] as int, 1, "packed bit1[999] at the far end");
+    // Clearing one element must not disturb the two that share its byte.
+    bits[8] = 0;
+    checkInt(bits[8] as int, 0, "packed bit1[8] cleared");
+    checkInt(bits[7] as int, 1, "clearing bit 8 left bit 7 alone");
+    checkInt(bits[999] as int, 1, "clearing bit 8 left the tail alone");
+
+    // Four elements per byte: the offset is a shift, not a division.
+    bit2 two[100];
+    for (int i = 0; i < 100; i++) { two[i] = 0; }
+    two[0] = 3;
+    two[1] = 1;
+    two[3] = 2;
+    two[4] = 3;
+    two[99] = 2;
+    checkInt(two[0] as int, 3, "packed bit2[0] holds its full width");
+    checkInt(two[1] as int, 1, "packed bit2[1] beside it");
+    checkInt(two[2] as int, 0, "packed bit2[2] stays clear");
+    checkInt(two[3] as int, 2, "packed bit2[3] is the last slot of byte 0");
+    checkInt(two[4] as int, 3, "packed bit2[4] is the first slot of byte 1");
+    checkInt(two[99] as int, 2, "packed bit2[99] at the far end");
+
+    // Two per byte.
+    bit4 four[100];
+    for (int i = 0; i < 100; i++) { four[i] = 0; }
+    four[0] = 15;
+    four[1] = 7;
+    four[99] = 9;
+    checkInt(four[0] as int, 15, "packed bit4[0] holds 15");
+    checkInt(four[1] as int, 7, "packed bit4[1] shares byte 0");
+    checkInt(four[99] as int, 9, "packed bit4[99] at the far end");
+
+    // One per byte: the same code path with a shift of zero.
+    bit8 eight[10];
+    for (int i = 0; i < 10; i++) { eight[i] = 0; }
+    eight[3] = 200;
+    eight[9] = 255;
+    checkInt(eight[3] as int, 200, "bit8 array element");
+    checkInt(eight[4] as int, 0, "bit8 array neighbour stays clear");
+    checkInt(eight[9] as int, 255, "bit8 array tail");
+
+    // `bit3` does not divide 8, so it does not pack: an element would straddle two
+    // bytes, and the write would have to read-modify-write across the boundary.
+    // It stays byte-per-element, which is the same footprint `int3` already had.
+    bit3 three[100];
+    for (int i = 0; i < 100; i++) { three[i] = 0; }
+    three[0] = 7;
+    three[99] = 5;
+    checkInt(three[0] as int, 7, "unpacked bit3[0]");
+    checkInt(three[99] as int, 5, "unpacked bit3[99]");
+
+    // ── wide widths: a fixed block, not a number ──────────────────────────────
+    //
+    // Past 128 bits the value no longer fits the VM's scalar cell, so it is stored
+    // and copied like a struct. The point is not arithmetic -- there is none -- but
+    // that a struct can hold a fixed-size block at all: member arrays are not
+    // allowed, so without this a 32-byte digest can only be a pointer.
+    checkInt(sizeof(bit256), 32, "bit256 is 32 bytes");
+    checkInt(sizeof(bit512), 64, "bit512 is 64 bytes");
+    checkInt(sizeof(Holder), 96, "a struct holds 8 words plus a 64-byte block");
+
+    bit256 digest = {0};
+    bit256 copy = digest;
+    checkInt(sizeof(bit256), 32, "a wide bit string survives copy and re-measure");
+    checkInt(echoWide(digest), 32, "a wide bit string passes by value");
+
+    testFinish();
+    print("done\n");
+    eof: pass;
+}

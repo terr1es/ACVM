@@ -1,0 +1,79 @@
+//  testcases_check.ax — the harness's own case table.
+//
+//  `testCase` / `testRunAll` exist because a `Func<void>` can now be stored, so a test file
+//  registers a case by naming it instead of editing a call list at the bottom of `main`.
+//  The risk in a harness is the failure mode where a case is *silently* not run: the run
+//  looks green because nothing failed, and the reason is that nothing happened.
+//
+//  So this file checks the table itself, and its own summary is the interesting number: the
+//  cases registered here are themselves run through the table, so a `testRunAll` that skips
+//  the last case shows up as a missing count rather than as a pass.
+//
+//  Run:  acvm run tests/testcases_check.ax
+
+function import (return:(test));
+
+// Three cases that each record one assertion, so the counters at the end are a known
+// number: 3 registrations, 3 passes, 0 failures.
+function caseOne():void {
+    checkInt(1 + 1, 2, "case one ran");
+}
+
+function caseTwo():void {
+    checkInt(2 + 2, 4, "case two ran");
+}
+
+function caseThree():void {
+    checkInt(3 + 3, 6, "case three ran");
+}
+
+function main():void {
+    testCase("one", caseOne);
+    testCase("two", caseTwo);
+    testCase("three", caseThree);
+
+    // The count is checked *before* running, so a table that quietly dropped a
+    // registration fails here rather than at the summary.
+    if (testCaseCount() != 3) {
+        print("MISMATCH: expected 3 registered cases, got ");
+        print(testCaseCount());
+        print("\n");
+        trap();
+    }
+
+    int ran = testRunAll();
+    if (ran != 3) {
+        print("MISMATCH: expected 3 cases to run, got ");
+        print(ran);
+        print("\n");
+        trap();
+    }
+    if (testCountPassed() != 3) {
+        print("MISMATCH: expected 3 passes, got ");
+        print(testCountPassed());
+        print("\n");
+        trap();
+    }
+    if (testCountFailed() != 0) {
+        print("MISMATCH: expected no failures, got ");
+        print(testCountFailed());
+        print("\n");
+        trap();
+    }
+
+    // Registering after the run must not execute anything retroactively, and must not
+    // disturb the counters -- the table is "what has been registered", not "what ran".
+    testCase("four", caseOne);
+    if (testCaseCount() != 4) {
+        print("MISMATCH: registering after the run did not take effect\n");
+        trap();
+    }
+    if (testCountPassed() != 3) {
+        print("MISMATCH: late registration changed the pass count\n");
+        trap();
+    }
+
+    print("done\n");
+    testFinish();
+    eof: pass;
+}

@@ -263,7 +263,10 @@ void Sema::checkVarDecl(Stmt& stmt, Scope& scope, Flow& flow) {
     } else if (stmt.isConst && !stmt.init) {
         m_diagnostics.error(stmt.nameRange, "a 'const' variable must be initialised");
     } else if (stmt.init) {
-        if (stmt.init->kind == ExprKind::InitList) {
+        if (type->isFunc() && stmt.init->kind == ExprKind::Name &&
+            resolveFunctionValue(*stmt.init, type, scope)) {
+            // Handled: the initialiser is a handle, not a load.
+        } else if (stmt.init->kind == ExprKind::InitList) {
             checkInitializer(*stmt.init, type, scope, flow);
         } else {
             checkExpr(*stmt.init, scope, flow);

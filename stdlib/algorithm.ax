@@ -25,6 +25,15 @@
 //          eof: pass;
 //      }
 //
+//  Sorting by a field, or finding by a test, goes through `Func<...>` instead --
+//  `sortBy`, `minByIndex`, `findIf` and the rest, in the sections near the end of this
+//  file. They take a bare function name at the call site:
+//
+//      struct Point { int x; int y; };
+//      function byX(Point p):int { return p.x; }
+//      Point points[3] = {{3, 1}, {1, 9}, {2, 5}};
+//      sortBy(#points[0], 3, byX);              // ordered by x, stably
+//
 //  The `ptr` contract: the pointer must address at least `count` elements of
 //  the matching type. The VM cannot check the length — a pointer carries no
 //  bound — so passing a count larger than the array is memory corruption, in
@@ -1210,6 +1219,309 @@ function isSortedByKey64(ptr int order, ptr int64 keys, int count):bool {
 
 function isSortedByString(ptr int order, ptr string keys, int count):bool {
     return isSortedByKeyAny(order, keys, count);
+    eof: pass;
+}
+
+//===--- sorting by a key function ----------------------------------------===//
+//
+//  The indirect-sort section above sorts *keys* that already exist as an array. That
+//  covers "I have a column of ints and a parallel column of anything", which is what a
+//  CSV or a table gives you -- but not "I have an array of structs and want it ordered by
+//  one field".
+//
+//  That case used to be impossible to express, and the specification said so: struct
+//  sorting "must be hand-written (indexOf + a custom loop, or extract the sort key into a
+//  `vector int` first)", because `sort()` only knows the built-in rules and there was no
+//  way to pass a comparison. `Func<int, T>` is exactly that missing argument:
+
+//      struct Point { int x; int y; };
+//      function byX(Point p):int { return p.x; }
+//
+//      Point points[3] = {{3, 1}, {1, 9}, {2, 5}};
+//      sortBy(#points[0], 3, byX);              // 1, 2, 3 by x
+//      sortBy(#points[0], 3, byY);              // by y instead
+//
+//  ── why a key function and not a comparator ───────────────────────────────
+//
+//  A comparator would be called ~n log n times *and* twice per merge step, and each call
+//  is an indirect one: the call graph stops being static, so the JIT leaves the function
+//  interpreted from that point on. A key function is called the same number of times but
+//  returns an `int`, so the comparison itself is a plain integer compare in Axiom, and the
+//  common case -- sort by one field -- needs no comparator at all.
+//
+//  The price is that the key is recomputed on every comparison instead of once per element.
+//  For a field read that is one load; for `p.x * p.y` it is a multiply per comparison. When
+//  that matters, extract the keys yourself and use `sortIndicesByKey` -- the two paths share
+//  the merge logic, so the answer is the same either way.
+//
+//  ── stability ─────────────────────────────────────────────────────────────
+//
+//  Stable, like every other sort here: equal keys keep their relative order, because the
+//  merge takes from the left run when the keys are equal.
+
+//  Insertion pass for `sortIndicesByKeyOf`. `key` is called twice per comparison
+//  (once for each side) rather than the current key being hoisted into a local: hoisting
+//  it would need `int` temporaries per element and the win is a load.
+function private insertIndexBy<T>(ptr int order, ptr T data, int count,
+                                  Func<int, T> key):void {
+    for (int i = 1; i < count; i++) {
+        int which = @(order + i);
+        int keyOfWhich = key(@(data + which));
+        int j = i - 1;
+        while (j >= 0 && key(@(data + @(order + j))) > keyOfWhich) {
+            @(order + j + 1) = @(order + j);
+            j--;
+        }
+        @(order + j + 1) = which;
+    }
+    eof: pass;
+}
+
+//  Merge pass for `sortIndicesByKeyOf`; `src` is the identity permutation on entry.
+function private mergeIndexBy<T>(ptr int dst, ptr int src, ptr T data, int lo, int mid, int hi,
+                                 Func<int, T> key):void {
+    int i = lo;
+    int j = mid;
+    int k = lo;
+    while (i < mid && j < hi) {
+        // `<=` rather than `<` is what makes the merge stable.
+        if (key(@(data + @(src + i))) <= key(@(data + @(src + j)))) {
+            @(dst + k) = @(src + i);
+            i++;
+        } else {
+            @(dst + k) = @(src + j);
+            j++;
+        }
+        k++;
+    }
+    while (i < mid) {
+        @(dst + k) = @(src + i);
+        i++;
+        k++;
+    }
+    while (j < hi) {
+        @(dst + k) = @(src + j);
+        j++;
+        k++;
+    }
+    eof: pass;
+}
+
+//  Sorts `order[0..count)` so that `key(data[order[0]]) <= key(data[order[1]]) <= ...`.
+//
+//  `order` must start as the identity permutation; `data` is never written. Use this when
+//  the rows are large or shared and only their order is wanted -- an index column can be
+//  sorted without moving the records, which is what a table view does.
+function sortIndicesByKeyOf<T>(ptr int order, ptr T data, int count,
+                               Func<int, T> key):void {
+    if (count <= 1) {
+        return;
+    }
+    if (count < INDIRECT_INSERTION_CUTOFF) {
+        insertIndexBy(order, data, count, key);
+        return;
+    }
+    ptr int scratch = alloc(count * sizeof(int)) as ptr int;
+    if (scratch == 0 as ptr int) {
+        insertIndexBy(order, data, count, key);   // right answer even when alloc failed
+        return;
+    }
+    int width = 1;
+    while (width < count) {
+        int lo = 0;
+        while (lo < count) {
+            int mid = lo + width;
+            if (mid > count) { mid = count; }
+            int hi = lo + 2 * width;
+            if (hi > count) { hi = count; }
+            mergeIndexBy(scratch, order, data, lo, mid, hi, key);
+            lo = lo + 2 * width;
+        }
+        for (int i = 0; i < count; i++) {
+            @(order + i) = @(scratch + i);
+        }
+        width = width * 2;
+    }
+    free(scratch);
+    eof: pass;
+}
+
+//  True when `key(data[order[i]])` is non-decreasing along `order`.
+function isSortedByKeyOf<T>(ptr int order, ptr T data, int count, Func<int, T> key):bool {
+    for (int i = 1; i < count; i++) {
+        if (key(@(data + @(order + i - 1))) > key(@(data + @(order + i)))) {
+            return false;
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+//  True when `key(data[i])` is non-decreasing -- the check that belongs with `sortBy`.
+//
+//  Separate from `isSortedByKeyOf`, which asks the same question of an index permutation:
+//  a caller who sorted the records has no permutation to hand in.
+function isSortedBy<T>(ptr T data, int count, Func<int, T> key):bool {
+    for (int i = 1; i < count; i++) {
+        if (key(@(data + i - 1)) > key(@(data + i))) {
+            return false;
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+//  Sorts `data[0..count)` in place by `key`, stably.
+//
+//  Sorts an index permutation and then permutes `data` through a copy, rather than moving
+//  elements around inside `data`. Two reasons: the merge logic is then the same one the
+//  index path uses, and a generic `T` may be any size -- a three-word struct moved through
+//  `memcpy` on every swap is slower than one copy pass at the end.
+//
+//  Returns false when the scratch allocation failed, in which case `data` is untouched.
+//  A function that silently leaves the array unsorted would be worse than one that says so.
+function sortBy<T>(ptr T data, int count, Func<int, T> key):bool {
+    if (count <= 1) {
+        return true;
+    }
+    ptr int order = alloc(count * sizeof(int)) as ptr int;
+    if (order == 0 as ptr int) {
+        return false;
+    }
+    ptr T copy = alloc(count * sizeof(T)) as ptr T;
+    if (copy == 0 as ptr T) {
+        free(order);
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        @(order + i) = i;
+    }
+    sortIndicesByKeyOf(order, data, count, key);
+
+    // One copy out, one copy back: `data[i]` takes what used to be at `order[i]`.
+    memcpy(copy, data, count * sizeof(T));
+    for (int i = 0; i < count; i++) {
+        memcpy(data + i, copy + @(order + i), sizeof(T));
+    }
+    free(copy);
+    free(order);
+    return true;
+    eof: pass;
+}
+
+// ─── finding and counting by a predicate ───────────────────────────────────
+//
+//  The same `Func` argument, one level simpler: a predicate returns `bool` and the answer is
+//  an index or a count, so nothing needs a comparator or a key.
+//
+//  These exist because the hand-written loop is the same four lines every time, and the
+//  copy is where an off-by-one lives -- `for (i = 0; i < count; i++)` with `<=`, or starting
+//  at 1. Writing it once, with the bounds in one place, is what a library is for.
+
+//  Index of the first element matching `test`, or -1 when none does.
+function findIf<T>(ptr T data, int count, Func<bool, T> test):int {
+    for (int i = 0; i < count; i++) {
+        if (test(@(data + i))) {
+            return i;
+        }
+    }
+    return -1;
+    eof: pass;
+}
+
+//  Index of the last element matching `test`, or -1. Scans backwards so the first match
+//  found is the last one, rather than scanning forwards and remembering.
+function findLastIf<T>(ptr T data, int count, Func<bool, T> test):int {
+    for (int i = count - 1; i >= 0; i--) {
+        if (test(@(data + i))) {
+            return i;
+        }
+    }
+    return -1;
+    eof: pass;
+}
+
+//  How many elements match `test`. Called `countIf` because `count` is taken by too many
+//  things to be a useful name here.
+function countIf<T>(ptr T data, int count, Func<bool, T> test):int {
+    int matches = 0;
+    for (int i = 0; i < count; i++) {
+        if (test(@(data + i))) {
+            matches = matches + 1;
+        }
+    }
+    return matches;
+    eof: pass;
+}
+
+//  True when any element matches. Short-circuits: the predicate is not called after the
+//  first hit, which matters when it is expensive or when the rest of the array is garbage.
+function anyOf<T>(ptr T data, int count, Func<bool, T> test):bool {
+    for (int i = 0; i < count; i++) {
+        if (test(@(data + i))) {
+            return true;
+        }
+    }
+    return false;
+    eof: pass;
+}
+
+//  True when every element matches. Vacuously true for an empty range, which is the usual
+//  convention and the one `allOf` callers assume.
+function allOf<T>(ptr T data, int count, Func<bool, T> test):bool {
+    for (int i = 0; i < count; i++) {
+        if (!test(@(data + i))) {
+            return false;
+        }
+    }
+    return true;
+    eof: pass;
+}
+
+//  True when no element matches. The complement of `anyOf`, spelled out because negating at
+//  every call site (`!anyOf(...)`) reads badly and is easy to get wrong with a stray `!`.
+function noneOf<T>(ptr T data, int count, Func<bool, T> test):bool {
+    return !anyOf(data, count, test);
+    eof: pass;
+}
+
+//  Index of the smallest `key(data[i])`, or -1 for an empty range.
+//
+//  Returns the index rather than the element: for a struct that is a copy, and the caller
+//  almost always wants to know *which* row it was. First wins on ties, so the result is
+//  stable in the same sense the sorts are.
+function minByIndex<T>(ptr T data, int count, Func<int, T> key):int {
+    if (count <= 0) {
+        return -1;
+    }
+    int best = 0;
+    int bestKey = key(@(data));
+    for (int i = 1; i < count; i++) {
+        int candidate = key(@(data + i));
+        if (candidate < bestKey) {
+            bestKey = candidate;
+            best = i;
+        }
+    }
+    return best;
+    eof: pass;
+}
+
+//  Index of the largest `key(data[i])`, or -1 for an empty range. First wins on ties.
+function maxByIndex<T>(ptr T data, int count, Func<int, T> key):int {
+    if (count <= 0) {
+        return -1;
+    }
+    int best = 0;
+    int bestKey = key(@(data));
+    for (int i = 1; i < count; i++) {
+        int candidate = key(@(data + i));
+        if (candidate > bestKey) {
+            bestKey = candidate;
+            best = i;
+        }
+    }
+    return best;
     eof: pass;
 }
 

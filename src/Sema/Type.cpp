@@ -46,15 +46,44 @@ void layoutMembers(TypeKind kind, std::vector<FieldInfo>& members, std::uint32_t
     }
 
     std::uint32_t offset = 0;
+    /// Bits already used in the byte at `offset`. Non-zero only while a run of bit
+    /// fields is open; any ordinary member closes the byte first.
+    std::uint32_t bitCursor = 0;
 
     for (FieldInfo& member : members) {
         const std::uint32_t memberAlign = std::max<std::uint32_t>(member.type->alignBytes, 1);
+        const bool packs = member.type->isBit() && member.type->bits <= 8;
+        if (packs) {
+            // Never straddle a byte: if the rest of this one is too small, start the
+            // next. Wasting up to 7 bits per run is the price of every access
+            // touching exactly one byte -- which is what makes a bit write a plain
+            // read-modify-write with no cross-byte carry to get wrong.
+            if (bitCursor + member.type->bits > 8) {
+                offset += 1;
+                bitCursor = 0;
+            }
+            member.offset = offset;
+            member.bitOffset = static_cast<std::uint8_t>(bitCursor);
+            member.bitWidth = member.type->bits;
+            bitCursor += member.type->bits;
+            maxAlign = std::max(maxAlign, memberAlign);
+            continue;
+        }
+        if (bitCursor > 0) {
+            offset += 1;   // close the partially filled byte
+            bitCursor = 0;
+        }
         offset = alignUp(offset, memberAlign);
         member.offset = offset;
+        member.bitOffset = 0;
+        member.bitWidth = 0;
         offset += member.type->sizeBytes;
         maxAlign = std::max(maxAlign, memberAlign);
     }
 
+    if (bitCursor > 0) {
+        offset += 1;
+    }
     size = alignUp(offset, maxAlign);
     align = maxAlign;
 }
@@ -90,6 +119,8 @@ std::string Type::describe() const {
         return "char";
     case TypeKind::Int:
         return (isUnsigned ? "unsigned int" : "int") + std::to_string(bits);
+    case TypeKind::Bit:
+        return "bit" + std::to_string(bits);
     case TypeKind::Float: {
         if (mantissa != 0 || exponent != 0) {
             return "double" + std::to_string(mantissa) + "." + std::to_string(exponent);
@@ -124,6 +155,17 @@ std::string Type::describe() const {
         return "vector " + (elem != nullptr ? elem->describe() : std::string("<null>"));
     case TypeKind::Null:
         return "null";
+    case TypeKind::Func: {
+        // `Func<ret, args...>`, the shape it is written in. A null return type is a
+        // partially built instance, which only `describe` asks about on an error path.
+        std::string result = "Func<";
+        result += funcReturn() != nullptr ? funcReturn()->describe() : "<null>";
+        for (std::size_t i = 0; i < funcParamCount(); ++i) {
+            result += ", ";
+            result += funcParam(i) != nullptr ? funcParam(i)->describe() : "<null>";
+        }
+        return result + ">";
+    }
     }
     return "<unknown>";
 }
@@ -194,6 +236,26 @@ const Type* TypeContext::getInt(unsigned bits, bool isUnsigned) {
     return type;
 }
 
+const Type* TypeContext::getBit(unsigned bits) {
+    if (bits < 1) {
+        return m_error;
+    }
+    if (const auto it = m_bits.find(bits); it != m_bits.end()) {
+        return it->second;
+    }
+    Type* type = make(TypeKind::Bit);
+    type->bits = bits;
+    type->isUnsigned = true;   // a bit string has no sign; reads zero-extend
+    type->name = type->describe();
+    type->sizeBytes = (bits + 7) / 8;
+    // Alignment 1 so a bit field can follow a `bit1` in the same byte. The packing
+    // itself is decided by the layout pass, which is the only place that knows
+    // whether the previous member left room.
+    type->alignBytes = 1;
+    m_bits.emplace(bits, type);
+    return type;
+}
+
 const Type* TypeContext::getFloat(unsigned bits, unsigned mantissa, unsigned exponent) {
     if (mantissa != 0 || exponent != 0) {
         // doubleA.B: accepted syntactically, stored as binary64.
@@ -255,8 +317,15 @@ const Type* TypeContext::getArray(const Type* elem, std::uint64_t length) {
     Type* type = make(TypeKind::Array);
     type->elem = elem;
     type->length = length;
-    type->sizeBytes = static_cast<std::uint32_t>(elem->sizeBytes * length);
-    type->alignBytes = std::max<std::uint32_t>(elem->alignBytes, 1);
+    const unsigned perByte = elem->bitElementsPerByte();
+    if (perByte > 0) {
+        // Packed: `bit1 flags[1000]` is 125 bytes, not 1000.
+        type->sizeBytes = static_cast<std::uint32_t>((length + perByte - 1) / perByte);
+        type->alignBytes = 1;
+    } else {
+        type->sizeBytes = static_cast<std::uint32_t>(elem->sizeBytes * length);
+        type->alignBytes = std::max<std::uint32_t>(elem->alignBytes, 1);
+    }
     type->name = type->describe();
     m_arrays.emplace(key, type);
     return type;
@@ -292,6 +361,24 @@ const Type* TypeContext::getVector(const Type* elem) {
     type->alignBytes = 8;
     type->name = type->describe();
     m_vectors.emplace(elem, type);
+    return type;
+}
+
+const Type* TypeContext::getFunc(std::vector<const Type*> signature) {
+    if (const auto it = m_funcs.find(signature); it != m_funcs.end()) {
+        return it->second;
+    }
+    Type* type = make(TypeKind::Func);
+    type->elems = std::move(signature);
+    // The handle, not the signature: a function value is one word at run time, so every
+    // layout question answers the same as `int64`. Keeping the signature in `elems` is
+    // what lets the two be told apart at compile time while the bytes stay identical.
+    type->sizeBytes = 8;
+    type->alignBytes = 8;
+    type->layoutDone = true;
+    type->name = type->describe();
+    const auto stored = type->elems;
+    m_funcs.emplace(stored, type);
     return type;
 }
 
@@ -354,6 +441,8 @@ bool TypeContext::same(const Type* lhs, const Type* rhs) const {
     switch (lhs->kind) {
     case TypeKind::Int:
         return lhs->bits == rhs->bits && lhs->isUnsigned == rhs->isUnsigned;
+    case TypeKind::Bit:
+        return lhs->bits == rhs->bits;
     case TypeKind::Float:
         return lhs->bits == rhs->bits && lhs->mantissa == rhs->mantissa &&
                lhs->exponent == rhs->exponent;

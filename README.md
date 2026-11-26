@@ -182,33 +182,64 @@ Measured on the same machine as the table above, best of three:
 
 | Program | Interpreter | `--jit` | |
 |---|---:|---:|---|
-| 20 000 000 iteration loop | 3020 ms | 189 ms | 16× |
-| `examples/quicksort_max.ax` | 218 ms | 112 ms | 1.9× |
+| `while` loop, 20 000 000 iterations | 2213 ms | 157 ms | 14× |
+| `for i in 0..n` loop, 20 000 000 iterations | 3507 ms | 491 ms | 7.1× |
+| the same loop written in `main` | 3536 ms | 521 ms | 6.8× |
+| `examples/quicksort_max.ax` | 174 ms | 51 ms | 3.4× |
 | `examples/quicksort.ax` | 94 ms | 89 ms | 1.06× |
 
-The spread is the whole story: **a leaf function is where the 16× is.** `quicksort_max`
-now compiles all four of its functions including the recursive partition, but each call
-still goes through the interpreter's calling convention — arguments pushed onto the value
-stack one helper call at a time, a frame zeroed, the page table consulted — so the win
-there is bounded by call overhead rather than by arithmetic. `quicksort.ax` is dominated
-by startup and printing and gets almost nothing.
+The spread is the whole story, and it is about **which functions get compiled**, not about
+how good the arithmetic is:
+
+* **The entry function is compiled.** The interpreter only reached compiled code through
+  CALL, so `main` used to run interpreted however much arithmetic it did — and `main` is
+  where a tutorial, a test or a small tool puts its whole program. That row above was 1.0×
+  before.
+* **A function that only *prints* at the end is still compiled.** `print` is the
+  interpreter's, so the body is compiled up to the first instruction the lowering cannot
+  emit and execution hands the frame back there. Refusing the whole function for one
+  `print` kept most real programs out.
+* **`for i in 0..n` fuses its local accesses.** IRGen emits a local's address for every
+  store and for the generic load, so a range loop is `LOCAL_ADDR; SWAP; STORE` and
+  `LOCAL_ADDR; LOAD` pairs — 216 and 112 of them across `examples/`. Each was a bridge
+  call, a memType lookup and a 32 byte `Value`; now each is a single move. That row was
+  4.7× before.
+* **A program that declares a `process` keeps its entry function interpreted.** Compiled
+  code cannot yield, and `main` finishing ends the run — so a compiled `main` never gave
+  the scheduler a turn and a worker process never ran at all (measured: a counter of 6
+  interpreted against 0 compiled). Callees stay compiled; the entry function does not.
+
+`examples/quicksort_max.ax` now compiles all five of its functions including the recursive
+partition, but each call still goes through the interpreter's calling convention —
+arguments pushed onto the value stack one helper call at a time, a frame zeroed, the page
+table consulted — so the win there is bounded by call overhead rather than by arithmetic.
+`quicksort.ax` is dominated by startup and printing and gets almost nothing.
 
 **Compilation is all or nothing, per function.** A half-compiled body would have to flush
 every live register back to memory at the unsupported instruction and reload afterwards,
 which is where a JIT stops being simple and starts producing wrong answers at the edges.
-So anything the lowering does not handle refuses the whole function, and these are the
-refusals most likely to be met:
+So when the lowering meets something it cannot emit, the body stops *there* — the frame is
+handed back to the interpreter at the nearest instruction that starts with an empty
+expression stack, and the rest of the function runs interpreted. An empty stack is the
+only state that needs no translation: a compiled body keeps operands in frame slots with
+no type tags, while the interpreter reads `process.stack`.
+
+That covers 51% of the functions in `examples/` now, against 38% before, and the rest are
+refused outright for these reasons:
 
 | Refusal | Why |
 |---|---|
-| `unsupported opcode BUILTIN` | `print`, `eprint` and the other builtins call back into the interpreter |
-| `call` to a `library` function | the native call is marshalled by the interpreter |
-| a global (`LOAD_GLOBAL`) | globals live in a different address space |
 | a struct returned by value | the caller supplies a destination slot |
-| `STR_EQ`, `CONCAT` | string comparison and concatenation are interpreter builtins |
-| `int128`, floats, constants past 64 bits | the lowering works in 64 bit registers |
+| a return value wider than a register | `int128` has no single-register form |
 | unsigned division | no single x86-64 instruction matches the interpreter's rules |
 | a `process` body | deliberate: compiled code cannot yield, so it could not be preempted |
+| needs the interpreter at the first instruction | the hand-off point is the function's first instruction, so compiling it would be a prologue and nothing else |
+| an indirect call (`CALL_INDIRECT`) | the target is a run-time value; see `Func<...>` below |
+| a frame wider than eight pages | the frame's pages are pinned at entry and addressed through a table; 800 KB of stack arrays does not fit |
+
+`print`, `CONCAT`, `STR_EQ`, globals and `library` calls are no longer refusals: each is a
+hand-off point now, so a function is compiled up to the first one and executed interpreted
+from there.
 
 The first row is the one most often met in practice, and it is also the one that limits the
 measured speedup: a function is refused for containing a single `print`, so programs that
@@ -292,14 +323,98 @@ both made the suite look stronger than it was:
   functions were compiled. `jit_mixed_call_check.ax` pins the exact number, since one of its
   functions exists only to be refused.
 
+## Function values: `Func<...>`
+
+A function can be stored, passed and called through a value:
+
+```axiom
+function import (return:(io));
+
+function add(int a, int b):int { return a + b; }
+function mul(int a, int b):int { return a * b; }
+function twice(int a):int { return a * 2; }
+function square(int a):int { return a * a; }
+
+function apply(int value, Func<int, int> transform):int {
+    return transform(value);
+}
+
+function main():void {
+    Func<int, int, int> op = add;
+    print(op(2, 3));          // 5
+
+    op = mul;                 // the same slot, a different callee
+    print(op(2, 3));          // 6
+
+    Func<int, int> table[2] = {twice, square};
+    print(table[1](4));       // 16
+}
+```
+
+The signature is written with the type-argument syntax generics already use — the return
+type first, so `Func<int, int, int>` is "returns int, takes two ints". `Func` is an ordinary
+identifier, not a keyword.
+
+**A function value is one word.** It is the callee's index plus one, and 0 means "never
+set", so calling one traps instead of calling whatever happens to be first in the module.
+There is no environment, because Axiom has no closures to capture one (spec Q99) — that is
+what keeps it a word, and why `sizeof(Func<int, int>)` is 8.
+
+**Where a function name may appear as a value** is an initialiser, an assignment, an array
+element, a struct field, or an argument to a parameter of function type -- including a
+*generic* function's parameter, so `sortBy(points, n, byX)` infers `T` from the data and
+leaves the key's signature to be resolved after instantiation. Not a call site: type arguments
+are not spelled at calls (`f<int>(x)` parses as a comparison), so the *destination* is the
+only thing that can say which overload is meant — an ambiguous signature is a compile
+error, and so is one that matches nothing.
+
+**A compiled function never contains an indirect call.** `CALL_INDIRECT` makes the function
+a hand-off point for the JIT, so the function runs interpreted from there: the call graph
+stops being static, and everything built on that — inlining, dead-code elimination, the
+debugger's frame walk — would have to grow a run-time lookup. Keeping it out of compiled
+code keeps the compiled half static. In practice this bounds the loss: `algorithm`'s
+`sortBy` compiles, and only the comparison loop that calls the key does not.
+
+**A function value works everywhere a `Func` type can be written**, including a global, an
+array element and a struct field:
+
+```axiom
+Func<int, int> table[2] = {twice, square};   // a dispatch table
+Func<int, int> handler = twice;               // a global, initialised at startup
+
+struct Cmd { string name; Func<int, int> run; };
+Cmd cmd = {"double", twice};
+print(cmd.run(21));                           // 42 -- a field, called as a method
+```
+
+Globals were the last gap: file-scope initialisers were not type-checked at all, so a global
+`Func` was silently zeroed and `global int x = "hello";` compiled. Both are errors or work
+now, depending on which they should be; the check runs in its own pass, after every
+declaration is in scope, because `Func<int, int> h = serve;` may name a function defined
+further down the file.
+
 ## Can it do anything real?
 
 Yes — the standard library and the extra modules are written in Axiom and tested:
 
 | Module | Contents |
 |---|---|
-| `stdlib/` | `algorithm` (73 functions), `map` (57), `hash` (52), `sync` (39), `time` (34), `str` (26), `set` (25), `vec` (22), plus `astl`, `random`, `test` |
+| `stdlib/` | `algorithm`, `map`, `hash`, `sync`, `time`, `str`, `set`, `vec`, plus `astl`, `random`, `test` |
 | `extralib/` | `json`, `xml`, `yaml`, `toml`, `ini`, `csv`, `http`, `net`, `inflate`, `sha256`, `glob`, `cli`, `value` |
+
+Three of them changed shape once `Func<...>` existed, because each had a hole that only a
+function value could fill:
+
+| Module | What was impossible, and is not now |
+|---|---|
+| `algorithm` | `sortBy(ptr T, int, Func<int, T>)` orders structs by one field, stably. `sort()` cannot: it knows only the built-in rules, so struct sorting had to be hand-written. Also `minByIndex` / `maxByIndex`, and the predicate family `findIf` / `findLastIf` / `countIf` / `anyOf` / `allOf` / `noneOf`. |
+| `test` | `testCase(name, body)` registers a case; `testRunAll()` runs the table. A test file no longer ends in a hand-maintained call list, where adding a group meant editing two places. |
+| `cli` | `cliDispatch(a, names, handlers, n, fallback)` matches `cliCommand(a)` against a name table and calls the handler. The if-chain was fine; forgetting to add a branch was not. |
+
+`io` gained `readWholeFile` and `readLineList`, which are not about `Func` at all: every
+parser in `extralib` takes a `string`, and the only way to get one from a file was to guess
+a buffer size -- with `readTextFile` refusing rather than truncating, which made the guess a
+limit on which files a program could open.
 
 `extralib/xml.ax` is an XML parser in pure Axiom. `extralib/inflate.ax` is a DEFLATE
 decoder. `extralib/http.ax` is an HTTP/1.1 client with chunked decoding. Each declares its
@@ -315,7 +430,7 @@ module "json" version "0.1.0";
 ctest --test-dir build --output-on-failure
 ```
 
-75 tests. Three kinds matter:
+114 tests. Three kinds matter:
 
 - **`*_check.ax` programs** that assert and report pass/fail, so a failure names the
   behaviour rather than a byte offset.
@@ -356,10 +471,16 @@ The ones most likely to be noticed:
   its maximum does not fit the VM's signed 128-bit cell.
 - `doubleA.B` is accepted syntactically but stored as binary64.
 - Aggregate `<` is rejected. `==` / `!=` compare storage bytes.
-- The JIT (`--jit`) compiles a subset. String literals, globals and aggregates are not
-  lowered, so a function containing any of them stays interpreted in full — including the
-  arithmetic around it. The interpreter is always the fallback and always the definition
-  of correct behaviour.
+- The JIT (`--jit`) compiles a subset. String literals and aggregate *copies* are lowered;
+  builtins, globals, library calls and indirect calls are hand-off points, so a function is
+  compiled up to the first of them and interpreted from there. A function whose *first*
+  instruction needs the interpreter is refused instead, since compiling a prologue and
+  handing straight back costs more than it saves. The interpreter is always the fallback and
+  always the definition of correct behaviour.
+- `--jit` is turned off while `--adb` is attached: compiled code has no instruction-level
+  address mapping, so a breakpoint inside it could not stop anything.
+- A program that declares a `process` keeps its *entry function* interpreted, because
+  compiled code cannot yield and `main` finishing ends the run.
 
 Not implemented at all: tagged variants (`union` + automatic tag + `match`), operator
 overloading, and constraints on generic type parameters (`T: Comparable`).

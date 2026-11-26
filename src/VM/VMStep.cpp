@@ -223,6 +223,27 @@ bool computeBinary(OpCode op, const MemType& type, const Value& lhs, const Value
             }
             result = a % b;
             break;
+        case OpCode::Pow: {
+            // Unsigned arithmetic wraps in this VM, and the mask at the end of this
+            // branch does exactly that, so the products here are allowed to wrap too.
+            // There is no negative exponent to reject: an unsigned exponent is never
+            // negative, and one written as -1 arrives as 2^bits-1, which takes the
+            // same ~log2(exponent) steps as any other value rather than looping.
+            unsigned __int128 accumulator = 1;
+            unsigned __int128 base = a;
+            unsigned __int128 exponent = b;
+            while (exponent > 0) {
+                if ((exponent & 1) != 0) {
+                    accumulator *= base;
+                }
+                exponent >>= 1;
+                if (exponent > 0) {
+                    base *= base;
+                }
+            }
+            result = accumulator;
+            break;
+        }
         case OpCode::And: result = a & b; break;
         case OpCode::Or: result = a | b; break;
         case OpCode::Xor: result = a ^ b; break;
@@ -357,6 +378,33 @@ bool computeBinary(OpCode op, const MemType& type, const Value& lhs, const Value
             break;
         }
         result = a >> static_cast<unsigned>(b);
+        break;
+    }
+    case OpCode::Pow: {
+        // Exponentiation by squaring. The final `inRangeOf` below catches a result
+        // too wide for the operand type, so only the intermediate products need an
+        // explicit check -- they can leave Int128 even when the answer would not.
+        if (b < 0) {
+            trap = TrapKind::NegativeExponent;
+            return false;
+        }
+        Int128 accumulator = 1;
+        Int128 base = a;
+        Int128 exponent = b;
+        while (exponent > 0) {
+            if ((exponent & 1) != 0) {
+                if (__builtin_mul_overflow(accumulator, base, &accumulator)) {
+                    trap = TrapKind::IntegerOverflow;
+                    return false;
+                }
+            }
+            exponent >>= 1;
+            if (exponent > 0 && __builtin_mul_overflow(base, base, &base)) {
+                trap = TrapKind::IntegerOverflow;
+                return false;
+            }
+        }
+        result = accumulator;
         break;
     }
     default:
@@ -820,6 +868,7 @@ VM::Step VM::step(Process& process, std::string& error) {
             case OpCode::Mul:
             case OpCode::Div:
             case OpCode::Mod:
+            case OpCode::Pow:
             case OpCode::And:
             case OpCode::Or:
             case OpCode::Xor:
@@ -1018,18 +1067,36 @@ VM::Step VM::step(Process& process, std::string& error) {
                 continue;
             }
 
-            case OpCode::Call: {
-                if (inst.a < 0 || static_cast<std::size_t>(inst.a) >= m_module->functions.size()) {
+            case OpCode::Call:
+            case OpCode::CallIndirect: {
+                // One implementation for both: the only difference is where the target
+                // comes from. For CALL_INDIRECT it is a handle on the stack -- the index
+                // plus one, so a zeroed slot (which is what an uninitialised `Func` holds)
+                // traps instead of calling the first function in the module.
+                std::int32_t target = inst.a;
+                if (inst.op == OpCode::CallIndirect) {
+                    Value handle;
+                    if (!popValue(handle)) {
+                        return fail(TrapKind::Unreachable, "stack underflow in CALL_INDIRECT");
+                    }
+                    if (handle.asInt() <= 0) {
+                        return fail(TrapKind::NullPointer,
+                                    "calling a function value that was never set");
+                    }
+                    target = static_cast<std::int32_t>(handle.asInt() - 1);
+                }
+                if (target < 0 ||
+                    static_cast<std::size_t>(target) >= m_module->functions.size()) {
                     return fail(TrapKind::Unreachable, "invalid call target");
                 }
-                const Function& callee = m_module->functions[static_cast<std::size_t>(inst.a)];
+                const Function& callee = m_module->functions[static_cast<std::size_t>(target)];
                 const std::size_t argc = inst.b < 0 ? 0 : static_cast<std::size_t>(inst.b);
 
                 // A function from a `library "x";` file has no bytecode: resolve the
                 // symbol on first call, marshal the arguments, and make one native call.
                 // Control returns to the next instruction either way.
                 if (callee.isExternal()) {
-                    switch (callExternal(process, callee, static_cast<std::size_t>(inst.a), argc,
+                    switch (callExternal(process, callee, static_cast<std::size_t>(target), argc,
                                          error, fail)) {
                     case ExternalOutcome::Called:
                         continue;
@@ -1103,7 +1170,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                 // lowering refused falls through to the interpreter below, which is why the
                 // frame has to be set up first rather than inside the compiled body.
                 if (m_jit.mode == JitMode::On) {
-                    const std::size_t calleeIndex = static_cast<std::size_t>(inst.a);
+                    const std::size_t calleeIndex = static_cast<std::size_t>(target);
                     if (JitFunction native =
                             m_jit.entryFor(*m_module, calleeIndex, m_jitRefusal)) {
                         const std::int64_t outcome =

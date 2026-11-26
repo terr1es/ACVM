@@ -1,0 +1,67 @@
+//  pow_check.ax -- the `**` operator.
+//
+//  `**` is integer exponentiation. It exists because the language had no way to
+//  write one: `pow` is a builtin that takes and returns floating point, so
+//  `pow(2, 20)` does not compile and `pow(2.0, 60.0)` prints 1.15e18 instead of the
+//  exact value. `1 << 20` covers powers of two only.
+//
+//  What this file holds down:
+//
+//  1. **Right associativity.** `2 ** 3 ** 2` is 2^9 = 512, not 8^2 = 64. Getting
+//     this backwards is invisible until an exponent is itself an expression.
+//  2. **Precedence.** `**` binds tighter than `*`, so `2 * 3 ** 2` is 18.
+//  3. **Unary binds tighter than `**`.** Axiom's table puts unary at level 2 and
+//     binary operators below it, so `-2 ** 2` is `(-2) ** 2` = 4. Python says -4
+//     because its unary sits lower; this follows from the table, not a special case.
+//  4. **The edges.** `x ** 0` is 1 for every base including 0; `0 ** 0` is 1.
+//  5. **Widths.** The result takes the operands' width: int8 wraps to int8, int64
+//     reaches 2^40, unsigned wraps rather than trapping.
+
+function import (return:(test));
+
+function main():void {
+    testGroup("** operator");
+
+    // Basic values.
+    checkInt(2 ** 10, 1024, "2 ** 10");
+    checkInt(2 ** 20, 1048576, "2 ** 20");
+    checkInt(3 ** 5, 243, "3 ** 5");
+    checkInt(10 ** 3, 1000, "10 ** 3");
+
+    // The edges: any base to the zero is one, including zero itself.
+    checkInt(2 ** 0, 1, "2 ** 0");
+    checkInt(0 ** 0, 1, "0 ** 0");
+    checkInt(0 ** 5, 0, "0 ** 5");
+    checkInt(1 ** 100, 1, "1 ** 100");
+    checkInt(7 ** 1, 7, "7 ** 1");
+
+    // Right associative: the exponent groups to the right.
+    checkInt(2 ** 3 ** 2, 512, "2 ** 3 ** 2 is 2 ** 9, not 8 ** 2");
+    checkInt(2 ** (3 ** 2), 512, "explicit grouping agrees");
+
+    // Precedence: tighter than `*`, looser than unary.
+    checkInt(2 * 3 ** 2, 18, "** binds tighter than *");
+    checkInt(3 ** 2 * 2, 18, "and on the left of *");
+    checkInt(-2 ** 2, 4, "unary binds tighter than **");
+
+    // Widths. int8 keeps its own range; int64 reaches past 2^32.
+    int8 narrow = 3;
+    checkInt((narrow ** 4) as int, 81, "int8 base stays int8");
+    int64 wide = 2;
+    checkInt64(wide ** 40, 1099511627776i64, "int64 reaches 2^40");
+    unsigned int u = 2;
+    checkInt((u ** 30) as int, 1073741824, "unsigned base stays unsigned");
+
+    // A computed exponent, not just a literal: the VM path rather than folding.
+    int e = 5;
+    checkInt(2 ** e, 32, "a runtime exponent");
+    int total = 0;
+    for (int i = 0; i < 8; i++) {
+        total = total + 2 ** i;
+    }
+    checkInt(total, 255, "sum of 2^0 .. 2^7");
+
+    testFinish();
+    print("done\n");
+    eof: pass;
+}

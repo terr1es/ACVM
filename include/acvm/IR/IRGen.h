@@ -97,6 +97,15 @@ private:
     void emitReleaseArenas(int depth);
     void emitLoadValue(const Type* type);
     void emitBaseAddress(Expr& base);
+
+    /// Address of a packed bit-array element, left on the stack, with the element's
+    /// bit offset inside that byte stored in a fresh temp slot -- which is returned.
+    ///
+    /// `arr[i]` for a packing element type is not an addressable lvalue: the element
+    /// starts at a bit, not a byte. Reads shift by the returned offset and mask;
+    /// writes additionally read-modify-write the byte. Callers must check
+    /// `elem->bitElementsPerByte() != 0` before choosing this path.
+    std::uint32_t emitPackedElementAddress(Expr& indexExpr);
     void emitInitialize(Expr& init, uint32_t offset, const Type* type);
     [[nodiscard]] int ptrMemType();
 

@@ -1113,6 +1113,54 @@ bool VM::run(const Module& module, std::string& error) {
 }
 
 bool VM::runQuantum(Process& process, std::string& error) {
+    // First quantum, entry function. The interpreter reaches compiled code only through
+    // CALL, so without this the function a program *starts* in was never compiled -- and
+    // that is where a tutorial, a test or a small tool puts its whole program. Measured
+    // on a 20 000 000 iteration loop: 3.75 s in `main` against 0.84 s in a function
+    // `main` calls, for byte-identical work.
+    //
+    // Guarded by ip == 0 so a process resumed after a mid-function yield is not
+    // re-entered from the top, and by `jitEntrySpent` so a yield cannot make the next
+    // quantum start the function over.
+    //
+    // Not when the program has other processes, though. A compiled function cannot yield
+    // (it owns its own return, so it has nowhere to hand control back from), and the entry
+    // function is the one place where that changes the outcome rather than the
+    // granularity: `main` would run to completion inside a single quantum, `run()` would
+    // return the moment it finished, and a worker process would never run at all --
+    // measured as `counter` 6 interpreted against 0 compiled. A compiled *callee* only
+    // delays the other processes until it returns, which the quantum boundary still
+    // bounds, so those stay compiled.
+    if (!process.jitEntrySpent && m_module != nullptr && process.frames.size() == 1 &&
+        process.frames.front().ip == 0 && m_processes.size() <= 1) {
+        process.jitEntrySpent = true;
+        const Function* entry = process.frames.front().function;
+        const std::size_t index =
+            static_cast<std::size_t>(entry - m_module->functions.data());
+        // A refusal is not an error: it means "leave this function interpreted", and the
+        // reason goes to `m_jitRefusal` so `--stats` can report why the entry function,
+        // of all things, is running interpreted.
+        if (JitFunction native = m_jit.entryFor(*m_module, index, m_jitRefusal)) {
+            const std::int64_t outcome =
+                native(this, &process, process.frames.front().base, &error);
+            if (outcome == 0) {
+                return false;          // trap; the message is already in `error`
+            }
+            if (outcome == 2) {
+                // Yielded at a safe point with the frame intact. The next quantum
+                // continues in the interpreter from `frames.back().ip`, which the
+                // safe point wrote before returning.
+                return true;
+            }
+            // Normal return: the generated epilogue popped the frame, exactly as `Ret`
+            // does, so an empty frame stack is "finished".
+            if (process.frames.empty()) {
+                process.finished = true;
+            }
+            return true;
+        }
+    }
+
     while (true) {
         const Step result = step(process, error);
         if (result == Step::Trap) {
@@ -1416,10 +1464,23 @@ bool VM::JitBridge::callFunction(VM& vm, void* process, int functionIndex, int a
     // Compiled callees return through their own epilogue and pop their own frame, so the
     // caller only has to check whether one is still there.
     if (JitFunction native = vm.m_jit.entryFor(*vm.m_module,
-                                              static_cast<std::size_t>(functionIndex), *error)) {
-        // A nested yield cannot be honoured: the compiled caller is mid-frame on its own
-        // native stack and has nowhere to hand control back from. Treated as success.
-        return native(&vm, process, frameBase, error) != 0;
+                                              static_cast<std::size_t>(functionIndex),
+                                              vm.m_jitRefusal)) {
+        const std::int64_t outcome = native(&vm, process, frameBase, error);
+        if (outcome == 0) {
+            return false;
+        }
+        if (outcome == 2) {
+            // A nested yield cannot be honoured: the compiled caller is mid-frame on its
+            // own native stack and has nowhere to hand control back from. Treated as
+            // success.
+            return true;
+        }
+        if (outcome != 3) {
+            return true;
+        }
+        // 3: the body reached an instruction only the interpreter can execute and left
+        // its resume ip behind. Fall through and finish this one frame interpreted.
     }
 
     // No compiled entry: run exactly this frame in the interpreter.
@@ -1454,19 +1515,38 @@ bool VM::JitBridge::pushValue(void* process, std::int64_t value, bool isPtr) {
     return true;
 }
 
-bool VM::JitBridge::safePoint(VM& vm, void* process, std::uint64_t nextIp) {
+int VM::JitBridge::safePoint(VM& vm, void* process, std::uint64_t nextIp,
+                             std::string* error) {
     auto& p = *static_cast<Process*>(process);
     if (!p.frames.empty()) {
         // The interpreter resumes at the *next* instruction, because its own SAFE_POINT
         // handler has already advanced past itself when it writes ip back.
         p.frames.back().ip = static_cast<std::size_t>(nextIp);
     }
+
+    // The event phase is unconditional, exactly as it is for the interpreter. Doing it
+    // only at a yield made a compiled function miss every safe point it could not yield
+    // at -- which is all of them in a single-process program -- so an `event` condition
+    // saw a different history depending on whether `--jit` was on.
+    if (error != nullptr) {
+        if (!vm.evaluateEvents(p, *error)) {
+            return 2;
+        }
+    }
+
     // Nothing to switch to, so nothing to yield for. This is what keeps a single-process
     // program at full speed while still letting a scheduler with several processes run.
     if (vm.m_processes.size() <= 1) {
-        return false;
+        return 0;
     }
-    return true;
+    return 1;
+}
+
+void VM::JitBridge::bailToInterpreter(void* process, std::uint64_t ip) {
+    auto& p = *static_cast<Process*>(process);
+    if (!p.frames.empty()) {
+        p.frames.back().ip = static_cast<std::size_t>(ip);
+    }
 }
 
 bool VM::JitBridge::consumeBudget(VM& vm, std::uint64_t amount) {

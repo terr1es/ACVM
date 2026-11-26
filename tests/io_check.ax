@@ -14,6 +14,7 @@
 //  Run:  acvm run tests/io_check.ax
 
 function import (return:(io));
+function import (return:(str));
 
 comptime int BUFFER = 4096;
 
@@ -312,11 +313,91 @@ function private checkDirectories():void {
     eof: pass;
 }
 
+//  `readWholeFile` and `readLineList`: the two functions that turn a file into something
+//  the parsers in extralib can take. Before them, every call site had to guess a buffer
+//  size, and `readTextFile` refuses a file bigger than the buffer -- so the size guess was
+//  silently a limit on which files the program could open.
+function private checkWholeFile():void {
+    //  A multi-byte file: the length has to be bytes, not characters, or the final slice
+    //  would cut a UTF-8 sequence in half.
+    string multi = "hello\n中文\n";
+    writeTextFile("whole_multi.txt", multi);
+    string readBack = readWholeFile("whole_multi.txt");
+    print("whole: ["); print(readBack); print("]");
+    print(" bytes="); print(readBack.length);
+    print(" chars="); print(utf8CharCount(readBack));
+    print(" roundtrip="); print(readBack == multi);
+    print("\n");
+
+    //  A file larger than the 4096 buffers the rest of this test uses: readTextFile would
+    //  refuse it, readWholeFile sizes the buffer from the file.
+    string big = "";
+    for i in 0..1000 {
+        big = big + "0123456789";
+    }
+    writeTextFile("whole_big.txt", big);
+    print("big size="); print(fileSize("whole_big.txt"));
+    print(" read="); print(readWholeFile("whole_big.txt").length);
+    print(" equal="); print(readWholeFile("whole_big.txt") == big);
+    print("\n");
+
+    //  Missing file: "" rather than a trap, and no allocation left behind.
+    print("missing: ["); print(readWholeFile("no_such_file_here.txt")); print("]\n");
+
+    //  An empty file is the same answer, which is documented: use fileExists to tell them
+    //  apart. This pins that the documented behaviour is what happens.
+    writeTextFile("whole_empty.txt", "");
+    print("empty: ["); print(readWholeFile("whole_empty.txt")); print("]");
+    print(" exists="); print(fileExists("whole_empty.txt"));
+    print("\n");
+
+    //  Line lists. CRLF, LF and a missing final newline all in one file, because the three
+    //  are what a text file actually contains across platforms.
+    writeTextFile("lines.txt", "alpha\r\nbeta\ngamma");
+    SplitList lines = readLineList("lines.txt");
+    print("lines="); print(splitCount(#lines));
+    print(" [1]="); print(splitAt(#lines, 1));
+    print(" [2]="); print(splitAt(#lines, 2));
+    print("\n");
+    int longest = 0;
+    for i in 0..splitCount(#lines) {
+        if (splitAt(#lines, i).length > longest) {
+            longest = splitAt(#lines, i).length;
+        }
+    }
+    print("longest="); print(longest); print("\n");
+    splitFree(#lines);
+
+    //  A file whose last line is empty ("a\n\n") has one empty line, not two: the trailing
+    //  separator produces the artefact, the middle one is real content.
+    writeTextFile("lines_blank.txt", "a\n\nb\n");
+    SplitList blank = readLineList("lines_blank.txt");
+    print("blank count="); print(splitCount(#blank));
+    print(" middle empty="); print(splitAt(#blank, 1).length == 0);
+    print("\n");
+    splitFree(#blank);
+
+    //  Empty file: zero lines, not one empty line.
+    writeTextFile("lines_none.txt", "");
+    SplitList none = readLineList("lines_none.txt");
+    print("none count="); print(splitCount(#none)); print("\n");
+    splitFree(#none);
+
+    removeFile("whole_multi.txt");
+    removeFile("whole_big.txt");
+    removeFile("whole_empty.txt");
+    removeFile("lines.txt");
+    removeFile("lines_blank.txt");
+    removeFile("lines_none.txt");
+    eof: pass;
+}
+
 function main():void {
     checkPaths();
     checkFormatting();
     checkFiles();
     checkDirectories();
+    checkWholeFile();
     print("done\n");
     eof: pass;
 }

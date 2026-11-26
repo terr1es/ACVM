@@ -26,7 +26,7 @@ using StmtPtr = std::unique_ptr<Stmt>;
 // Types as written in source (spec §2.3)
 //===----------------------------------------------------------------------===//
 
-enum class ScalarBase : std::uint8_t { Int, Float, Char, Bool, Void };
+enum class ScalarBase : std::uint8_t { Int, Float, Char, Bool, Void, Bit };
 
 struct TypeNode {
     enum class Kind : std::uint8_t { Scalar, Named, Ptr, Array, Tuple, Vector };
@@ -38,6 +38,13 @@ struct TypeNode {
     ScalarBase base = ScalarBase::Int;
     bool isUnsigned = false;
     unsigned bits = 0;                  // 0 = type default (int 32 / float 32)
+    /// Set when a `bitN` width was written in power form (`bit2u20`): the exponent
+    /// is kept only so a rejected width can say "found 2097152 (2^21)" instead of
+    /// printing a bare number the reader has to decode.
+    unsigned powerExponent = 0;
+    /// The base of a power-form width, kept only to reject `bit3u4` with a message
+    /// that names the base instead of reporting a meaningless width.
+    unsigned powerBase = 0;
     unsigned mantissa = 0;              // doubleA.B
     unsigned exponent = 0;
     std::string spelling;               // original text, for diagnostics
@@ -114,7 +121,7 @@ inline constexpr int kMemberPtr = -3;
 
 enum class UnOp : std::uint8_t { Plus, Neg, Not, BitNot, Deref, AddrOf };
 enum class BinOp : std::uint8_t {
-    Add, Sub, Mul, Div, Mod, Shl, Shr, Lt, Le, Gt, Ge, Eq, Ne,
+    Add, Sub, Mul, Div, Mod, Pow, Shl, Shr, Lt, Le, Gt, Ge, Eq, Ne,
     BitAnd, BitXor, BitOr, LogAnd, LogOr,
 };
 enum class AssignOp : std::uint8_t {
@@ -171,6 +178,23 @@ struct Expr {
     /// Set when an unsuffixed integer literal does not fit its default type;
     /// a surrounding context may still retype it (spec §2.4.1.1).
     bool literalOutOfRange = false;
+    /// A function used as a *value*: the resolved callee, or -1.
+    ///
+    /// Only a `Func<...>` declaration may name a function without calling it, and the
+    /// declaration is where the signature is written -- which is also the only place
+    /// overload resolution can run, because a call site cannot spell type arguments
+    /// (`f<int>(x)` is indistinguishable from a comparison, see Parser.cpp). So this is
+    /// filled in by Sema and read by IRGen, which emits the handle.
+    int funcValue = -1;
+    /// Set on a call whose callee is a `Func<...>` *value* rather than a name: the
+    /// target is only known at run time, so IRGen emits CALL_INDIRECT.
+    bool indirectCall = false;
+    /// A scalar constant zero standing for a whole aggregate: `struct P p[200] = {0}`.
+    ///
+    /// Memcpy'ing from it would treat the 0 as an address, so IRGen emits nothing -- the
+    /// declaration already zeroed the slot. Only Sema sets this, and only for a constant
+    /// zero; any other scalar against an aggregate is an error there.
+    bool aggregateZeroFill = false;
 };
 
 //===----------------------------------------------------------------------===//

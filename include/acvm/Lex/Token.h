@@ -72,6 +72,10 @@ enum class TokenKind : std::uint8_t {
     Plus,
     Minus,
     Star,
+    /// `**`: exponentiation. Distinct from two `Star` tokens because the parser
+    /// has to see one operator -- `a * *b` would otherwise be indistinguishable
+    /// from `a ** b` at the point where precedence is decided.
+    StarStar,
     Slash,
     Percent,
     PlusPlus,

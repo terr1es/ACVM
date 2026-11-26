@@ -344,6 +344,16 @@ int IRGen::memTypeOf(const Type* type) {
         mem.bits = static_cast<std::uint8_t>(type->bits);
         mem.isUnsigned = type->isUnsigned;
         break;
+    case TypeKind::Bit:
+        // Same memory path as an unsigned integer of the same width: `loadScalar`
+        // already masks by `bits` and zero-extends, which is exactly what a bit
+        // string needs. The difference between the two types lives in Sema, not in
+        // how the bytes are read.
+        mem.kind = MemType::Kind::Int;
+        mem.size = static_cast<std::uint8_t>((type->bits + 7) / 8);
+        mem.bits = static_cast<std::uint8_t>(type->bits);
+        mem.isUnsigned = true;
+        break;
     default:
         mem.kind = MemType::Kind::Int;
         mem.size = 8;
@@ -1246,6 +1256,11 @@ void IRGen::emitInitialize(Expr& init, std::uint32_t offset, const Type* type) {
     }
 
     if (init.kind != ExprKind::InitList) {
+        if (init.aggregateZeroFill) {
+            // `struct P p[200] = {0}`: the slot was zeroed at declaration, so there is
+            // nothing to copy. Emitting a memcpy here would read from address 0.
+            return;
+        }
         if (type->isAggregate()) {
             emitBaseAddress(init);
             m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(offset));

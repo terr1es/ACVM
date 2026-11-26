@@ -1,0 +1,294 @@
+//  algorithm_key_check.ax — sorting and selecting by a key function.
+//
+//  `Func<int, T>` is the argument that was missing: `sort()` only knows the built-in rules,
+//  so "order these structs by one field" had to be hand-written, and the specification said
+//  so. These functions are the answer, and what they have to get right is not the comparison
+//  but three properties that are easy to break without noticing:
+//
+//    * **stability** -- equal keys keep their input order. Checked by sorting records whose
+//      key repeats, and comparing the sequence of tags rather than the keys.
+//    * **the edge cases** -- 0 and 1 elements, and an all-equal array, where a merge loop
+//      that assumes "at least two runs" writes outside the array.
+//    * **`sortBy` really moves the records.** It sorts an index permutation and then
+//      permutes `data` through a copy, so a wrong index in that second pass produces a
+//      correctly *ordered* array with the wrong payloads attached -- sorted and wrong,
+//      which no "is it sorted" check would notice.
+
+function import (return:(test));
+function import (return:(algorithm));
+
+struct Row {
+    int key;
+    int tag;      // input position, so stability is observable
+};
+
+// Three extractors over one type, which is the whole point: the same sort function, three
+// orderings, no new code.
+function byKey(Row r):int {
+    return r.key;
+}
+
+function byTag(Row r):int {
+    return r.tag;
+}
+
+// A key that is computed rather than read, so the cost model documented for `sortBy`
+// (recomputed per comparison) is exercised too.
+function byNegativeKey(Row r):int {
+    return 0 - r.key;
+}
+
+function fillRows(ptr Row rows, int count, ptr int keys, int keyCount):void {
+    for (int i = 0; i < count; i++) {
+        rows[i].key = keys[i % keyCount];
+        rows[i].tag = i;
+    }
+    eof: pass;
+}
+
+// Prints `tag` values in order, one line, so a stability break is visible as a swapped pair.
+function printTags(ptr Row rows, int count):void {
+    for (int i = 0; i < count; i++) {
+        print(itoa(rows[i].tag, 10));
+        print(" ");
+    }
+    print("\n");
+    eof: pass;
+}
+
+function printKeys(ptr Row rows, int count):void {
+    for (int i = 0; i < count; i++) {
+        print(itoa(rows[i].key, 10));
+        print(" ");
+    }
+    print("\n");
+    eof: pass;
+}
+
+function checkSortBy():void {
+    testGroup("sortBy: order and payload");
+
+    // Keys repeat (3, 1, 3, 2) so the merge has to be stable and the payload has to follow.
+    int keys[4] = {3, 1, 3, 2};
+    Row rows[4] = {0};
+    fillRows(#rows[0], 4, #keys[0], 4);
+
+    check(sortBy(#rows[0], 4, byKey), "sortBy reports success");
+    checkInt(rows[0].key, 1, "smallest key first");
+    checkInt(rows[3].key, 3, "largest key last");
+    check(isSortedBy(#rows[0], 4, byKey), "the rows report themselves sorted");
+
+    // Stable: the two rows whose key is 3 were input positions 0 and 2, so they must still
+    // be 0 then 2 -- not 2 then 0.
+    checkInt(rows[2].tag, 0, "the earlier of two equal keys stays first");
+    checkInt(rows[3].tag, 2, "the later one follows it");
+
+    // Every row is still present exactly once: the permutation pass copies, it does not drop.
+    int seen[4] = {0};
+    for i in 0..4 {
+        seen[rows[i].tag] = seen[rows[i].tag] + 1;
+    }
+    checkInt(seen[0] + seen[1] + seen[2] + seen[3], 4, "no row was lost or duplicated");
+    checkInt(seen[0], 1, "row 0 appears once");
+    checkInt(seen[3], 1, "row 3 appears once");
+}
+
+function checkReversed():void {
+    testGroup("sortBy: a different key on the same data");
+
+    int keys[5] = {1, 2, 3, 4, 5};
+    Row rows[5] = {0};
+    fillRows(#rows[0], 5, #keys[0], 5);
+
+    check(sortBy(#rows[0], 5, byNegativeKey), "sortBy with a computed key");
+    checkInt(rows[0].key, 5, "negating the key reverses the order");
+    checkInt(rows[4].key, 1, "and the smallest is last");
+
+    // Sorting by tag restores the input order -- keys 1..5 -- which also proves the payload
+    // survived the reverse sort: had the permutation pass copied the wrong row, the key
+    // would come back attached to the wrong tag.
+    check(sortBy(#rows[0], 5, byTag), "sortBy by tag");
+    checkInt(rows[0].key, 1, "the reverse sort left tag 0 holding key 1");
+    checkInt(rows[4].key, 5, "and tag 4 holding key 5");
+    checkInt(rows[0].tag, 0, "and the order is the input order again");
+}
+
+// The merge path, which the small arrays above never reach: `sortIndicesByKeyOf` uses
+// insertion sort below 20 elements, so a stability test on four rows only proves the
+// insertion sort stable. Mutating the merge's `<=` to `<` passed every other check in this
+// file, which is exactly the gap this case closes.
+//
+// The data is 40 rows whose key cycles 0..3, so every merge is full of ties and the merge
+// runs are long enough to interleave -- a hundred equal keys in two long runs would not
+// exercise the "take from the left on a tie" rule at all if the runs never met.
+function checkMergeStability():void {
+    testGroup("stability across the merge");
+
+    int keys[40] = {0};
+    for i in 0..40 {
+        keys[i] = i % 4;
+    }
+    Row rows[40] = {0};
+    fillRows(#rows[0], 40, #keys[0], 40);
+
+    check(sortBy(#rows[0], 40, byKey), "a 40-row sort succeeds");
+    check(isSortedBy(#rows[0], 40, byKey), "and is sorted");
+
+    // Every key class must appear in its original relative order, which is the definition of
+    // stability: for key k, the tags must be k, k+4, k+8, ...
+    bool stable = true;
+    for k in 0..4 {
+        int expected = k;
+        for i in 0..40 {
+            if (rows[i].key == k) {
+                if (rows[i].tag != expected) {
+                    stable = false;
+                }
+                expected = expected + 4;
+            }
+        }
+    }
+    check(stable, "each key class keeps its input order through the merge");
+
+    // The same for the index path, which is what `sortBy` calls but which a caller can use
+    // without the copy pass -- a bug in one would otherwise be masked by the other.
+    int order[40] = {0};
+    fillIdentity(#order[0], 40);
+    sortIndicesByKeyOf(#order[0], #rows[0], 40, byTag);
+    check(isSortedByKeyOf(#order[0], #rows[0], 40, byTag), "tags are already ascending");
+}
+
+function checkEdges():void {
+    testGroup("edge cases");
+
+    int keys[1] = {7};
+    Row one[1] = {0};
+    fillRows(#one[0], 1, #keys[0], 1);
+    check(sortBy(#one[0], 1, byKey), "one element sorts");
+    checkInt(one[0].key, 7, "and is unchanged");
+
+    Row none[1] = {0};
+    check(sortBy(#none[0], 0, byKey), "zero elements sorts");
+    checkInt(none[0].key, 0, "and touches nothing");
+
+    // All keys equal: every comparison is a tie, so a merge that advances the wrong run on
+    // `<=` instead of `<` still produces the right keys but the wrong tags.
+    int same[6] = {4, 4, 4, 4, 4, 4};
+    Row flat[6] = {0};
+    fillRows(#flat[0], 6, #same[0], 6);
+    check(sortBy(#flat[0], 6, byKey), "an all-equal array sorts");
+    checkInt(flat[0].tag, 0, "and keeps its order exactly");
+    checkInt(flat[5].tag, 5, "end to end");
+
+    // The index path on its own, since `sortBy` goes through it and a caller may too.
+    int order[6] = {0};
+    fillIdentity(#order[0], 6);
+    sortIndicesByKeyOf(#order[0], #flat[0], 6, byTag);
+    bool identityKept = true;
+    for i in 0..6 {
+        if (order[i] != i) {
+            identityKept = false;
+        }
+    }
+    check(identityKept, "sorting equal keys leaves the identity permutation alone");
+}
+
+function checkIndexPath():void {
+    testGroup("sortIndicesByKeyOf: order without moving the data");
+
+    int keys[5] = {50, 10, 40, 20, 30};
+    Row rows[5] = {0};
+    fillRows(#rows[0], 5, #keys[0], 5);
+
+    int order[5] = {0};
+    fillIdentity(#order[0], 5);
+    sortIndicesByKeyOf(#order[0], #rows[0], 5, byKey);
+
+    checkInt(order[0], 1, "the smallest key is at row 1");
+    checkInt(order[1], 3, "then row 3");
+    checkInt(order[4], 0, "and the largest at row 0");
+
+    // The data itself is untouched, which is the reason this function exists.
+    checkInt(rows[0].key, 50, "the records did not move");
+    checkInt(rows[1].key, 10, "in any position");
+    check(isSortedByKeyOf(#order[0], #rows[0], 5, byKey), "and the order is reported sorted");
+}
+
+function checkMinMax():void {
+    testGroup("minByIndex / maxByIndex");
+
+    int keys[4] = {5, 9, 1, 9};
+    Row rows[4] = {0};
+    fillRows(#rows[0], 4, #keys[0], 4);
+
+    checkInt(minByIndex(#rows[0], 4, byKey), 2, "the smallest key is at index 2");
+    // 9 appears at 1 and 3; the first wins, which is what "stable" means for a selection.
+    checkInt(maxByIndex(#rows[0], 4, byKey), 1, "the largest key is the first of two");
+
+    checkInt(minByIndex(#rows[0], 0, byKey), -1, "an empty range has no minimum");
+    checkInt(maxByIndex(#rows[0], 0, byKey), -1, "nor a maximum");
+    checkInt(minByIndex(#rows[0], 1, byKey), 0, "a single element is both");
+    checkInt(maxByIndex(#rows[0], 1, byKey), 0, "at index zero");
+}
+
+// The same functions over a non-struct element type, because the key extractor is generic
+// and a `T` that is one word takes a different path through `memcpy` in `sortBy`.
+function doubleIt(int v):int {
+    return v * 2;
+}
+
+function checkScalarElement():void {
+    testGroup("a scalar element type");
+
+    int values[4] = {3, 1, 4, 2};
+    check(sortBy(#values[0], 4, doubleIt), "ints sort by a computed key");
+    checkInt(values[0], 1, "ascending, since doubling preserves order");
+    checkInt(values[3], 4, "through to the end");
+}
+
+// ─── predicates ────────────────────────────────────────────────────────────
+
+function isBig(Row r):bool {
+    return r.key >= 3;
+}
+
+function checkPredicates():void {
+    testGroup("findIf / countIf / anyOf / allOf / noneOf");
+
+    int keys[6] = {1, 5, 2, 5, 9, 0};
+    Row rows[6] = {0};
+    fillRows(#rows[0], 6, #keys[0], 6);
+
+    checkInt(findIf(#rows[0], 6, isBig), 1, "the first row with key >= 3 is at index 1");
+    checkInt(findLastIf(#rows[0], 6, isBig), 4, "the last one is at index 4");
+    checkInt(countIf(#rows[0], 6, isBig), 3, "three rows have key >= 3");
+    check(anyOf(#rows[0], 6, isBig), "some row is big");
+    check(!allOf(#rows[0], 6, isBig), "not every row is");
+    check(!noneOf(#rows[0], 6, isBig), "but not none of them either");
+
+    // Not-found and empty-range answers, which is where an off-by-one in the bound shows up
+    // as index 0 or a crash rather than as -1.
+    checkInt(findIf(#rows[0], 0, isBig), -1, "an empty range has no match");
+    checkInt(findLastIf(#rows[0], 0, isBig), -1, "from either direction");
+    checkInt(countIf(#rows[0], 0, isBig), 0, "and nothing is counted");
+    check(!anyOf(#rows[0], 0, isBig), "no match in an empty range");
+    check(allOf(#rows[0], 0, isBig), "everything matches vacuously");
+
+    // A range that excludes the last element: the bound is `count`, and reading one past it
+    // would find a row that is not in range.
+    checkInt(findIf(#rows[0], 4, isBig), 1, "a truncated range still starts at the same place");
+    checkInt(findLastIf(#rows[0], 4, isBig), 3, "and stops before the excluded tail");
+}
+
+function main():void {
+    checkSortBy();
+    checkReversed();
+    checkEdges();
+    checkMergeStability();
+    checkIndexPath();
+    checkMinMax();
+    checkScalarElement();
+    checkPredicates();
+    testFinish();
+    eof: pass;
+}

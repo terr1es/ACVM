@@ -57,6 +57,7 @@ bool isScalarOrString(const Type* type) {
     case TypeKind::Bool:
     case TypeKind::Char:
     case TypeKind::Int:
+    case TypeKind::Bit:
     case TypeKind::Float:
     case TypeKind::Ptr:
     case TypeKind::Enum:
@@ -133,7 +134,7 @@ bool Sema::adaptLiteral(Expr& expr, const Type* target) {
             return true;
         }
         if (!target->isInt() && !target->isEnum() && target->kind != TypeKind::Char &&
-            target->kind != TypeKind::Bool) {
+            target->kind != TypeKind::Bool && !target->isBit()) {
             return false;
         }
         Int128 value = negated ? -core->lit.intValue : core->lit.intValue;
@@ -581,6 +582,17 @@ const Type* Sema::checkUnary(Expr& expr, Scope& scope, Flow& flow) {
             expr.type = m_types.errorType();
             return expr.type;
         }
+        // A bit field may start mid-byte, so it has no address the VM could name.
+        // C forbids `&` on bit fields for the same reason; the difference is that
+        // here it is an error at the point of use rather than a vague one later.
+        if (operandType != nullptr && operandType->isBit()) {
+            m_diagnostics.error(expr.range,
+                                "cannot take the address of '" + operandType->describe() +
+                                    "': a bit string has no address; read the value instead of "
+                                    "pointing at it");
+            expr.type = m_types.errorType();
+            return expr.type;
+        }
         Symbol* root = lvalueRoot(operand);
         if (root != nullptr && !root->isMutable) {
             m_diagnostics.error(expr.range,
@@ -609,13 +621,18 @@ const Type* Sema::checkBinary(Expr& expr, Scope& scope, Flow& flow) {
     }
 
     // A literal operand adopts the type of the other side, so that `u + 1`
-    // works for any numeric width (spec §2.4.1.1).
-    if (isLiteralExpr(*expr.kids[0]) && !isLiteralExpr(*expr.kids[1]) && rhsType->isNumeric()) {
+    // works for any numeric width (spec §2.4.1.1). A bit string takes the same
+    // treatment for comparison only: `flags[i] == 1` should not force the reader to
+    // write `1 as bit1`, even though the type refuses every arithmetic operator.
+    const auto takesLiteral = [](const Type* type) {
+        return type != nullptr && (type->isNumeric() || type->isBit());
+    };
+    if (isLiteralExpr(*expr.kids[0]) && !isLiteralExpr(*expr.kids[1]) && takesLiteral(rhsType)) {
         if (adaptLiteral(*expr.kids[0], rhsType) && expr.kids[0]->type != nullptr) {
             lhsType = expr.kids[0]->type;
         }
     } else if (isLiteralExpr(*expr.kids[1]) && !isLiteralExpr(*expr.kids[0]) &&
-               lhsType->isNumeric()) {
+               takesLiteral(lhsType)) {
         if (adaptLiteral(*expr.kids[1], lhsType) && expr.kids[1]->type != nullptr) {
             rhsType = expr.kids[1]->type;
         }
@@ -724,6 +741,7 @@ const Type* Sema::checkBinary(Expr& expr, Scope& scope, Flow& flow) {
         case BinOp::Mul:
         case BinOp::Div:
         case BinOp::Mod:
+        case BinOp::Pow:
         case BinOp::BitAnd:
         case BinOp::BitOr:
         case BinOp::BitXor:
@@ -821,6 +839,55 @@ const Type* Sema::checkBinary(Expr& expr, Scope& scope, Flow& flow) {
     }
 
     // Arithmetic.
+    //
+    // A bit string is storage, not a number: `bit3 + 1` has no meaning the language
+    // is willing to guess at (does the result wrap at 3 bits, or widen?). Saying so
+    // here keeps the generic "mixed signed and unsigned" message for the case it
+    // was written for.
+    if ((lhsType != nullptr && lhsType->isBit()) || (rhsType != nullptr && rhsType->isBit())) {
+        const Type* bitSide = (lhsType != nullptr && lhsType->isBit()) ? lhsType : rhsType;
+        m_diagnostics.error(expr.range, "operator '" + std::string(binOpName(expr.binop)) +
+                                            "' is not defined for '" + bitSide->describe() +
+                                            "': a bit string is storage, not a number; convert it "
+                                            "with 'as int' first");
+        expr.type = m_types.errorType();
+        return expr.type;
+    }
+    // `**` is integer exponentiation, and it says so: a floating point base or
+    // exponent is refused with a pointer to `pow` rather than silently routed
+    // through it. Two spellings of one operation that disagree in rounding and in
+    // result type is how a program ends up with a double where it expected an int.
+    if (expr.binop == BinOp::Pow) {
+        const auto integral = [](const Type* type) {
+            return type != nullptr && type->isNumeric() && !type->isFloat();
+        };
+        if (!integral(lhsType) || !integral(rhsType)) {
+            const Type* offender = integral(lhsType) ? rhsType : lhsType;
+            m_diagnostics.error(expr.range,
+                                "'**' is integer exponentiation; '" + offender->describe() +
+                                    "' is not an integer type");
+            m_diagnostics.help(expr.range.begin,
+                               "use 'pow(base, exponent)' for floating point, or cast with "
+                               "'as int' if an integer result is what you want");
+            expr.type = m_types.errorType();
+            return expr.type;
+        }
+        // A negative exponent has no integer result: 2 ** -1 is 0.5. Catching a
+        // constant here turns a runtime trap into a compile time error at the line
+        // that wrote it.
+        if (expr.kids[1]->isConstExpr && !expr.kids[1]->constIsFloat &&
+            expr.kids[1]->constInt < 0) {
+            m_diagnostics.error(expr.kids[1]->range,
+                                "a negative exponent has no integer result; the value would be "
+                                "a fraction, and '**' produces an integer");
+            m_diagnostics.help(expr.kids[1]->range.begin,
+                               "use 'pow' for a floating point result, or negate the whole "
+                               "expression if you meant the reciprocal");
+            expr.type = m_types.errorType();
+            return expr.type;
+        }
+    }
+
     const Type* merged = m_types.mergeArithmetic(lhsType, rhsType);
     if (merged == nullptr) {
         // `mergeArithmetic` answers null for two unrelated reasons: a signed /
@@ -947,6 +1014,49 @@ void warnAboutConstantTrap(DiagnosticEngine& diagnostics, const Expr& expr, cons
             diagnostics.warning(expr.range, "constant shift discards bits; "
                                             "this traps when reached");
         }
+        return;
+    }
+
+    if (expr.binop == BinOp::Pow) {
+        // `2 ** 40` in an `int` is the case this exists for: it reads like a literal
+        // and fails at run time. Saying so at the line that wrote it is the difference
+        // between a one second fix and a debug session.
+        if (b < 0) {
+            diagnostics.warning(expr.range, "constant exponent is negative; "
+                                            "this traps when reached");
+            return;
+        }
+        Int128 accumulator = 1;
+        Int128 base = a;
+        Int128 exponent = b;
+        bool overflowed = false;
+        while (exponent > 0 && !overflowed) {
+            if ((exponent & 1) != 0) {
+                overflowed = __builtin_mul_overflow(accumulator, base, &accumulator);
+            }
+            exponent >>= 1;
+            if (exponent > 0) {
+                overflowed = __builtin_mul_overflow(base, base, &base);
+            }
+        }
+        if (overflowed || accumulator < signedMinOf(bits) || accumulator > signedMaxOf(bits)) {
+            diagnostics.warning(expr.range,
+                                "constant exponentiation overflows the result type; "
+                                "this traps when reached");
+            // Two different problems wear the same symptom, and the advice differs.
+            // `2 ** 40` in an `int` only needs a wider type; `2 ** 128` is past the
+            // largest integer the language has, and widening cannot reach it.
+            if (overflowed) {
+                diagnostics.help(expr.range.begin,
+                                 "the value does not fit any integer type: 'int128' holds at most "
+                                 "2^127-1, so 2^128 is out of range; restate the constant or "
+                                 "compute it at run time");
+            } else {
+                diagnostics.help(expr.range.begin,
+                                 "widen the operand first, e.g. '(2 as int64) ** 40', or compute it "
+                                 "at run time where the exponent is not a constant");
+            }
+        }
     }
 }
 
@@ -990,7 +1100,12 @@ const Type* Sema::checkAssign(Expr& expr, Scope& scope, Flow& flow) {
                                 root->name + "'");
     }
 
-    const Type* valueType = checkExpr(value, scope, flow);
+    // `op = mul;` -- the same resolution as an initialiser, with the target type taken
+    // from the left side.
+    const bool assignedFunctionValue =
+        expr.assignop == AssignOp::Assign && targetType != nullptr && targetType->isFunc() &&
+        value.kind == ExprKind::Name && resolveFunctionValue(value, targetType, scope);
+    const Type* valueType = assignedFunctionValue ? value.type : checkExpr(value, scope, flow);
 
     if (expr.assignop == AssignOp::Assign) {
         const unsigned errorsBefore = m_diagnostics.errorCount();
@@ -1100,6 +1215,16 @@ const Type* Sema::checkCast(Expr& expr, Scope& scope, Flow& flow) {
         allowed = true;
     } else if (source->isInt() && target->isPtr()) {
         allowed = true;
+    } else if (source->isBit() && target->isInt()) {
+        // Reading a bit string out as a number, and writing one back with the value
+        // truncated to the declared width. This is the only way in and out: the type
+        // refuses arithmetic, so `as int` is where a caller states what it means.
+        // A width past the VM's 128 bit cell has no numeric representation at all,
+        // so it cannot be read out -- it is storage, and storage is copied, not
+        // converted.
+        allowed = source->sizeBytes <= 16;
+    } else if (source->isInt() && target->isBit()) {
+        allowed = target->sizeBytes <= 16;
     } else if (m_types.same(source, target)) {
         allowed = true;
     }
@@ -1168,6 +1293,15 @@ const Type* Sema::checkCall(Expr& expr, Scope& scope, Flow& flow) {
             }
             expr.type = m_functions[static_cast<std::size_t>(index)].ret;
             return expr.type;
+        }
+
+        // A `Func<...>` variable: the callee is a run-time value, so the signature is
+        // checked here and the call becomes CALL_INDIRECT.
+        if (symbol->type != nullptr && symbol->type->isFunc()) {
+            // IRGen reads the signature off the callee expression to convert the arguments,
+            // and the callee is not visited as a value elsewhere.
+            callee.type = symbol->type;
+            return checkIndirectCallOf(expr, callee, symbol->type, args, scope, flow);
         }
 
         m_diagnostics.error(callee.range, "'" + callee.text + "' is not callable; it has type '" +
@@ -1239,6 +1373,37 @@ const Type* Sema::checkCall(Expr& expr, Scope& scope, Flow& flow) {
 
         const Type* objectType = checkExpr(*callee.kids[0], scope, flow);
 
+        // A `Func<...>` stored in a field, called as a method: `table.run(x)`. This has to
+        // come before method resolution, because `run` is a field and not a method -- the
+        // method path would report "has no method 'run'" for something that works.
+        //
+        // The callee stays the member expression, so IRGen's indirect path emits the field
+        // load and then CALL_INDIRECT, exactly as it does for a local.
+        {
+            const Type* holder = objectType;
+            if (callee.kind == ExprKind::Arrow && objectType != nullptr && objectType->isPtr()) {
+                holder = objectType->elem;
+            }
+            if (holder != nullptr &&
+                (holder->kind == TypeKind::Struct || holder->kind == TypeKind::Union)) {
+                int fieldIndex = -1;
+                for (std::size_t i = 0; i < holder->fields.size(); ++i) {
+                    if (holder->fields[i].name == callee.text) {
+                        fieldIndex = static_cast<int>(i);
+                        break;
+                    }
+                }
+                if (fieldIndex >= 0 && holder->fields[static_cast<std::size_t>(fieldIndex)]
+                                           .type->isFunc()) {
+                    // Check the member expression itself so it carries the field's type and
+                    // the index IRGen needs.
+                    callee.type = holder->fields[static_cast<std::size_t>(fieldIndex)].type;
+                    callee.memberIndex = fieldIndex;
+                    return checkIndirectCallOf(expr, callee, callee.type, args, scope, flow);
+                }
+            }
+        }
+
         // `p->m()` takes the receiver from the pointee; `v.m()` from the value.
         const Type* receiverType = objectType;
         if (callee.kind == ExprKind::Arrow) {
@@ -1294,6 +1459,20 @@ const Type* Sema::checkCall(Expr& expr, Scope& scope, Flow& flow) {
         }
         expr.type = m_types.errorType();
         return expr.type;
+    }
+
+    // A `Func<...>` reached any other way than a bare name: `table[0](x)`, `s.handler(x)`,
+    // `p->callback(x)`. The value's type already carries the signature, so the check is
+    // the same as the named case -- only the callee expression differs, and IRGen reads
+    // the signature off it.
+    // The callee was not a name, a member or an arrow, so nothing has typed it yet --
+    // `table[0](4)` is an Index. Checking it here is what makes the value's signature
+    // available at all.
+    if (callee.type == nullptr) {
+        checkExpr(callee, scope, flow);
+    }
+    if (callee.type != nullptr && callee.type->isFunc()) {
+        return checkIndirectCallOf(expr, callee, callee.type, args, scope, flow);
     }
 
     m_diagnostics.error(callee.range, "this expression is not callable");

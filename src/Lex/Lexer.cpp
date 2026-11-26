@@ -127,6 +127,7 @@ std::string_view tokenKindSpelling(TokenKind kind) {
     case TokenKind::Plus: return "+";
     case TokenKind::Minus: return "-";
     case TokenKind::Star: return "*";
+    case TokenKind::StarStar: return "**";
     case TokenKind::Slash: return "/";
     case TokenKind::Percent: return "%";
     case TokenKind::PlusPlus: return "++";
@@ -278,7 +279,39 @@ bool isTypeNameKeyword(std::string_view word) {
         return digits > 0 && index == rest.size();
     };
 
-    return matchesWidth("int") || matchesWidth("float") || matchesWidth("double");
+    // `bit3`, `bit2u20`: a bit-string width. The `u` form is a power of two --
+    // `bit2u20` is 2^20 bits, not "2, unsigned 20" (which is what the same
+    // characters mean in an expression). The two readings cannot collide because
+    // this one is a single token in type position; the spec spells both out.
+    const auto matchesBitWidth = [&](std::string_view prefix) {
+        if (word.rfind(prefix, 0) != 0) {
+            return false;
+        }
+        const std::string_view rest = word.substr(prefix.size());
+        std::size_t index = 0;
+        while (index < rest.size() && isDigit(rest[index])) {
+            ++index;
+        }
+        if (index == 0) {
+            return false;   // bare `bit` is not a type name -- it is a common variable name
+        }
+        if (index == rest.size()) {
+            return true;    // bit3
+        }
+        if (rest[index] != 'u') {
+            return false;   // bit3x: trailing junk, reported below
+        }
+        ++index;
+        std::size_t digits = 0;
+        while (index < rest.size() && isDigit(rest[index])) {
+            ++index;
+            ++digits;
+        }
+        return digits > 0 && index == rest.size();   // bit2u20
+    };
+
+    return matchesWidth("int") || matchesWidth("float") || matchesWidth("double") ||
+           matchesBitWidth("bit");
 }
 
 namespace {
@@ -286,7 +319,7 @@ namespace {
 /// `int8x` / `float32_t` must be a hard error instead of silently splitting
 /// into a type name and an identifier (spec §2.3).
 bool typeNameWithTrailingJunk(std::string_view word) {
-    const std::string_view prefixes[] = {"int", "float", "double"};
+    const std::string_view prefixes[] = {"int", "float", "double", "bit"};
     for (const std::string_view prefix : prefixes) {
         if (word.rfind(prefix, 0) != 0) {
             continue;
@@ -705,6 +738,7 @@ Token Lexer::lexOperator(std::uint32_t start) {
         if (match('>')) return makeToken(TokenKind::Arrow, start);
         return makeToken(TokenKind::Minus, start);
     case '*':
+        if (match('*')) return makeToken(TokenKind::StarStar, start);
         if (match('=')) return makeToken(TokenKind::StarAssign, start);
         return makeToken(TokenKind::Star, start);
     case '/':

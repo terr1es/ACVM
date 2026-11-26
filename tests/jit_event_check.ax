@@ -1,0 +1,66 @@
+//  jit_event_check.ax — a preemptive program means the same thing with and without --jit.
+//
+//  Compiling the entry function is what made this necessary. `main` used to be interpreted
+//  by accident, which meant it yielded at every safe point and the worker process got its
+//  turns. Compiled, `main` ran to completion in a single quantum and `run()` returned the
+//  moment it finished -- so the worker never ran at all. Measured: `counter` was 6
+//  interpreted and 0 compiled, and `fired` 1 and 0.
+//
+//  A compiled body cannot yield (it owns its own return, so it has nowhere to hand control
+//  back from), so the fix is a policy rather than a patch: a program that declares any
+//  `process` is left to the interpreter in full, and `--stats` says so. This program is
+//  the check that the policy holds -- the numbers below are only identical because nothing
+//  was compiled, and any future change that starts compiling here has to keep them
+//  identical rather than merely plausible.
+//
+//  The event is part of the check, not decoration: the phase runs at safe points, so a
+//  compiled body that skipped it changed how often an event fired.
+
+global int counter = 0;
+global int fired = 0;
+
+function process worker():void {
+    while (counter < 6) {
+        counter = counter + 1;
+        if (counter >= 6) {
+            return;
+        }
+        yield();
+    }
+    eof: pass;
+}
+
+// Rising edge: fires once, when the worker first reaches 3.
+function event atThree()(counter == 3):void {
+    fired = fired + 1;
+    eof: pass;
+}
+
+// Pure arithmetic, so this is compiled whole and its loop crosses many safe points --
+// each of which is a chance for the worker to run and for the event phase to look.
+function churn(int64 n):int64 {
+    int64 total = 0;
+    int64 i = 0;
+    while (i < n) {
+        total = total + i % 13;
+        i = i + 1;
+    }
+    return total;
+}
+
+function main():void {
+    // The loop is in the entry function: this is the body that has to yield and resume.
+    int64 total = 0;
+    int64 i = 0;
+    while (i < 40000) {
+        total = total + churn(5);
+        i = i + 1;
+    }
+    print(total);
+    print(" ");
+    print(counter);
+    print(" ");
+    print(fired);
+    print("\n");
+    eof: pass;
+}

@@ -764,6 +764,77 @@ function cliProgram(ptr CliArgs a):string {
     eof: pass;
 }
 
+// ─── subcommand dispatch ───────────────────────────────────────────────────
+//
+//  A program with several subcommands ends up with the same if-chain everywhere:
+//
+//      if (cliCommand(a) == "serve") { return serve(a); }
+//      if (cliCommand(a) == "build") { return build(a); }
+//      ...
+//
+//  The chain is fine; what it costs is that adding a subcommand needs two edits and that
+//  nothing checks the two lists agree. A table turns it into one edit:
+
+//      function serve(ptr CliArgs a):int { ... }
+//      function build(ptr CliArgs a):int { ... }
+//
+//      function main():void {
+//          Doc d = docNew(0);
+//          ptr CliArgs a = cliParse(#d, join(#argv[0], 0, " "));   // "tool build x"
+//          string names[2] = {"serve", "build"};
+//          Func<int, ptr CliArgs> handlers[2] = {serve, build};
+//          int code = cliDispatch(a, #names[0], #handlers[0], 2, onUnknown);
+//          docFree(#d);
+//          exit(code);
+//      }
+//
+//  The two arrays are parallel -- `names[i]` is handled by `handlers[i]` -- because there is
+//  no generic struct to hold the pair (`CliCommand<T>` would need `Map<K, V>`-style generic
+//  structs, which the language does not have yet). Keeping them adjacent in the source is
+//  the discipline the type system cannot enforce here; nothing stops the lists from being
+//  different lengths, which is why `count` is explicit instead of inferred from one of them.
+
+//  Calls the handler whose name matches `cliCommand(a)`, or `unknown` when none does.
+//  Returns the handler's value, which is normally the process exit code.
+//
+//  The lookup is linear: a subcommand list is short enough that a hash table would cost
+//  more than it saves, and `cliCommand` is a single positional read.
+function cliDispatch(ptr CliArgs a, ptr string names, ptr Func<int, ptr CliArgs> handlers,
+                     int count, Func<int, ptr CliArgs> unknown):int {
+    if (a == null) {
+        return 2;
+    }
+    string command = cliCommand(a);
+    for i in 0..count {
+        if (@(names + i) == command) {
+            // Through a value: a `ptr Func<...>` is not callable -- only the value is.
+            Func<int, ptr CliArgs> handler = @(handlers + i);
+            return handler(a);
+        }
+    }
+    return unknown(a);
+    eof: pass;
+}
+
+//  The usual "no such subcommand" handler: writes one line to stderr and returns 2.
+//
+//      int code = cliDispatch(a, #names[0], #handlers[0], n, cliUnknownCommand);
+//
+//  It prints instead of setting `a->error` because recording an error needs the allocation
+//  arena, and a handler of this shape gets only the parsed args. A program that wants the
+//  message in `cliErrorText` should write its own handler and keep its `Doc` reachable --
+//  which is a global or a parameter away, and not worth making every handler take a `Doc`.
+function cliUnknownCommand(ptr CliArgs a):int {
+    string command = cliCommand(a);
+    if (command.length == 0) {
+        eprint("no command given\n");
+    } else {
+        eprint("unknown command '" + command + "'\n");
+    }
+    return 2;
+    eof: pass;
+}
+
 //  Requires at least `count` positionals; records an error and returns false
 //  otherwise. Saves the "did the user forget the file argument" branch at every
 //  call site.

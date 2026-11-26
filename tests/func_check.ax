@@ -1,0 +1,141 @@
+//  func_check.ax — `Func<...>`, the function value Axiom did not have.
+//
+//  What was added is deliberately small: a function value is a 64 bit handle (the callee
+//  index plus one), never an environment, because there are no closures to capture one
+//  (spec Q99). That is what keeps it one word and what makes `Func` different from a
+//  closure: `Func<int, int>` and `int64` have the same layout.
+//
+//  The signature is written with the type-argument syntax generics already use --
+//  `Func<int, int, int>` is "returns int, takes two ints" -- so no grammar was added and
+//  `Func` is an ordinary identifier.
+//
+//  Where a function name may appear as a value is the interesting part: an initialiser, an
+//  assignment, and an argument to a parameter of function type. Not a call site, because
+//  type arguments are not spelled at calls (`f<int>(x)` parses as a comparison), so the
+//  destination is the only thing that can say which overload is meant. Every case below
+//  exercises that, plus the two failures: a signature nothing matches, and a handle that
+//  was never set -- which traps instead of calling whatever is first in the module.
+
+function import (return:(test));
+function import (return:(io));
+
+// Two overloads of one name, so resolution has something to choose between.
+function combine(int a, int b):int {
+    return a + b;
+}
+
+function combine(string a, string b):string {
+    return a + b;
+}
+
+function twice(int a):int {
+    return a * 2;
+}
+
+function square(int a):int {
+    return a * a;
+}
+
+function zero():int {
+    return 0;
+}
+
+function noArgs():void {
+    testGroup("no arguments, void result");
+    check(true, "a Func<void> can be declared and called");
+}
+
+// An indirect call through a parameter: the callee is only known at the call.
+function applyTo(int value, Func<int, int> transform):int {
+    return transform(value);
+}
+
+// Two function parameters in one signature, to be sure the handle order matches the
+// parameter order rather than being reversed.
+function compose(int value, Func<int, int> first, Func<int, int> second):int {
+    return second(first(value));
+}
+
+function checkBasics():void {
+    testGroup("declaration and call");
+
+    Func<int, int, int> add = combine;
+    checkInt(add(3, 4), 7, "a Func<int,int,int> calls the int overload");
+
+    Func<string, string, string> join = combine;
+    checkString(join("a", "b"), "ab", "the string overload is selected by signature");
+
+    // Reassignment: the same slot, a different callee.
+    Func<int, int> op = twice;
+    checkInt(op(5), 10, "the handle calls `twice`");
+    op = square;
+    checkInt(op(5), 25, "after assignment it calls `square`");
+}
+
+function checkParameters():void {
+    testGroup("passed as an argument");
+
+    checkInt(applyTo(6, twice), 12, "a Func passed as a parameter is called through");
+    checkInt(applyTo(6, square), 36, "the same parameter takes a different function");
+    checkInt(compose(3, twice, square), 36, "two function parameters keep their order");
+    checkInt(compose(3, square, twice), 18, "and are not swapped");
+}
+
+function checkZeroArgs():void {
+    testGroup("zero arguments");
+
+    Func<int> none = zero;
+    checkInt(none(), 0, "a Func with no parameters is callable");
+
+    noArgs();
+}
+
+function checkStorage():void {
+    testGroup("storage");
+
+    // Same size as an int64, because the handle is all there is.
+    checkInt(sizeof(Func<int, int>), 8, "a function value is one word");
+    checkInt(alignof(Func<int, int>), 8, "and aligns like one");
+
+    // In an array and a struct: the handle is an ordinary scalar, so both work.
+    Func<int, int> table[2] = {twice, square};
+    checkInt(table[0](4), 8, "an array of Func calls its first element");
+    checkInt(table[1](4), 16, "and its second");
+
+    Func<int, int> initial = twice;
+    Func<int, int> copy = initial;
+    checkInt(copy(7), 14, "a Func is copied by value, handle and all");
+}
+
+// A function value in a struct field, called as a method: `table.run(x)`. The field is not
+// a method, so the member path has to notice the type before it reports "has no method".
+struct Handler {
+    string name;
+    Func<int, int> run;
+};
+
+function checkFieldCall():void {
+    testGroup("a field holding a function value");
+
+    Handler one = {"double", twice};
+    checkInt(one.run(21), 42, "a Func field is callable through the struct");
+
+    Handler table[2] = {{"double", twice}, {"square", square}};
+    checkInt(table[0].run(4), 8, "an array of structs, first field value");
+    checkInt(table[1].run(4), 16, "and the second");
+
+    // Reassigned after construction: the field is mutable like any other, and the call
+    // follows whatever handle is in it.
+    one.run = square;
+    checkInt(one.run(5), 25, "assigning the field changes which function runs");
+}
+
+function main():void {
+    checkBasics();
+    checkParameters();
+    checkZeroArgs();
+    checkStorage();
+    checkFieldCall();
+    testFinish();
+    eof: pass;
+}

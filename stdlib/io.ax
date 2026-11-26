@@ -22,6 +22,83 @@
 //  `substring` operates on byte offsets, and `s.length` is a byte count -- so an
 //  offset computed here and fed back into `s[a..b]` is consistent with itself.
 
+function import (return:(vec));
+function import (return:(str));
+
+// ─── reading a whole file ──────────────────────────────────────────────────
+//
+//  `readTextFile` needs a buffer, and its `capacity` is also the largest file it will
+//  accept -- a buffer that is too small is refused rather than truncated, which is the
+//  right call but leaves the caller with the size question. Every parser in `extralib`
+//  (`csv`, `json`, `yaml`, `toml`, `ini`, `xml`) takes a `string`, so without this the
+//  answer at each call site is "pick 4096 and hope".
+
+//  Reads `path` into a string. Returns "" when the file cannot be read, so an empty file
+//  and a missing one are the same result -- use `fileExists` first when they must be told
+//  apart.
+//
+//  The buffer is sized from `fileSize` and is one byte per element (`unsigned int8`),
+//  because the content is UTF-8 bytes and `char` here is two bytes wide: allocating
+//  `size` chars would double the peak memory of a large file for nothing. The extra byte
+//  is for the terminator `readTextFile` may want; the length returned is what gets copied,
+//  so a file containing a lone `\0` still round-trips.
+function readWholeFile(string path):string {
+    int size = fileSize(path);
+    if (size < 0) {
+        return "";
+    }
+    ptr unsigned int8 buffer = alloc(size + 1) as ptr unsigned int8;
+    if (buffer == 0 as ptr unsigned int8) {
+        return "";
+    }
+    int got = readTextFile(path, buffer as ptr char, size);
+    string result = "";
+    if (got >= 0) {
+        result = makeString(buffer as ptr char, got);
+    }
+    free(buffer);
+    return result;
+    eof: pass;
+}
+
+//  Reads `path` and splits it into lines, dropping the separators. Returns an empty list
+//  for a file that cannot be read.
+//
+//  `\n` is the separator and one trailing `\r` is removed per line, so a CRLF file reads
+//  the same as an LF one -- the usual Windows/Unix trap, and the reason a line list is
+//  worth a function instead of "just call makeSplit".
+//
+//  A text ending in a newline splits into a final empty piece; that is the separator, not a
+//  last line, so it is dropped. An empty file therefore gives an empty list rather than one
+//  empty line, which is what makes `for i in 0..splitCount(#lines)` mean "every line".
+function readLineList(string path):SplitList {
+    SplitList lines;
+    lines.items = makeVecHeap(16, sizeof(string));
+
+    string text = readWholeFile(path);
+    if (text.length == 0) {
+        return lines;
+    }
+
+    // Split into a temporary and rebuild, rather than editing in place: `SplitList` has no
+    // removal, and a `Vec` of strings would have to shift its tail anyway.
+    SplitList raw = makeSplit(text, "\n");
+    int count = splitCount(#raw);
+    if (count > 0 && splitAt(#raw, count - 1).length == 0) {
+        count = count - 1;
+    }
+    for i in 0..count {
+        string line = splitAt(#raw, i);
+        if (line.length > 0 && endsWith(line, "\r")) {
+            line = line[0 .. line.length - 1];
+        }
+        vecPushStr(#lines.items, line);
+    }
+    splitFree(#raw);
+    return lines;
+    eof: pass;
+}
+
 // ─── paths ─────────────────────────────────────────────────────────────────
 //
 // Both separators are understood on every platform. A Windows path reaching a

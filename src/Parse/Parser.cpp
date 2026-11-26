@@ -66,6 +66,14 @@ int precedenceOf(TokenKind kind) {
     // Larger binds tighter. The spec table has level 1 (postfix) at the top;
     // binary operators occupy levels 4..14, so the value is 15 - level.
     switch (kind) {
+    // `**` sits between `as` (level 3, handled by parseCast) and `*` (level 4), so
+    // it binds tighter than multiplication and looser than a cast: `x as int ** 2`
+    // is `(x as int) ** 2`. Unary operators are level 2 and therefore bind tighter
+    // still, which makes `-2 ** 2` equal `(-2) ** 2` = 4. That differs from Python,
+    // where unary binds looser and the answer is -4; here it follows from the table
+    // rather than being a special case.
+    case TokenKind::StarStar:
+        return 12;
     case TokenKind::Star:
     case TokenKind::Slash:
     case TokenKind::Percent:
@@ -104,6 +112,7 @@ int precedenceOf(TokenKind kind) {
 BinOp binOpOf(TokenKind kind) {
     switch (kind) {
     case TokenKind::Star: return BinOp::Mul;
+    case TokenKind::StarStar: return BinOp::Pow;
     case TokenKind::Slash: return BinOp::Div;
     case TokenKind::Percent: return BinOp::Mod;
     case TokenKind::Plus: return BinOp::Add;
@@ -1108,6 +1117,36 @@ TypeNodePtr Parser::makeScalarType(const Token& token) {
         return node;
     }
 
+    // `bit3` / `bit2u20`: a fixed-length bit string. The `u` form is a power of
+    // two, so `bit2u20` is 2^20 bits. Widths are computed here rather than in
+    // Sema so that `bit2u40` -- which overflows `unsigned` -- is caught as a
+    // rejected width instead of silently wrapping to a small number.
+    if (text.rfind("bit", 0) == 0) {
+        node->base = ScalarBase::Bit;
+        const std::string rest(text.substr(3));
+        const std::size_t u = rest.find('u');
+        if (u == std::string::npos) {
+            node->bits = static_cast<unsigned>(std::strtoul(rest.c_str(), nullptr, 10));
+        } else {
+            const unsigned base = static_cast<unsigned>(std::strtoul(rest.substr(0, u).c_str(),
+                                                                     nullptr, 10));
+            const unsigned exponent =
+                static_cast<unsigned>(std::strtoul(rest.substr(u + 1).c_str(), nullptr, 10));
+            node->powerExponent = exponent;
+            node->powerBase = base;
+            // Only base 2 is meaningful: `bit3u4` would read as "3, unsigned 4" in
+            // an expression, and 81 bits has no use that `bit81` does not cover.
+            if (base != 2) {
+                node->bits = 0;   // Sema reports the base, not a width
+            } else if (exponent > 31) {
+                node->bits = 0xFFFFFFFFu;   // saturated: Sema reports it as out of range
+            } else {
+                node->bits = 1u << exponent;
+            }
+        }
+        return node;
+    }
+
     // `int` / `intN`
     node->base = ScalarBase::Int;
     node->bits = text.size() > 3 ? static_cast<unsigned>(std::strtoul(text.c_str() + 3, nullptr, 10)) : 32;
@@ -1766,7 +1805,12 @@ ExprPtr Parser::parseBinary(int minPrecedence) {
         }
 
         const Token op = advance();
-        ExprPtr rhs = parseBinary(precedence + 1);
+        // `**` is the only right associative binary operator: `2 ** 3 ** 2` is
+        // 2 ** (3 ** 2) = 512, not (2 ** 3) ** 2 = 64. Recursing at the same
+        // precedence instead of precedence+1 is what makes it right associative.
+        const int rhsMinPrecedence =
+            op.kind == TokenKind::StarStar ? precedence : precedence + 1;
+        ExprPtr rhs = parseBinary(rhsMinPrecedence);
 
         if (op.kind == TokenKind::DotDot) {
             auto range = std::make_unique<Expr>(ExprKind::Range, join(lhs->range, rhs->range));

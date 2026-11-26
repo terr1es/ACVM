@@ -1,0 +1,50 @@
+//  jit_frame_check.ax — a frame too large to pin is refused, not trapped.
+//
+//  Compiled code pins the pages its frame touches into a small table at entry and addresses
+//  every slot through it, so the frame has to fit. `int big[200000]` is 800 KB, which spans
+//  more than the eight pages the table holds.
+//
+//  Before this was checked at compile time, `pinFramePages` failed at run time and the exit
+//  path had nothing to say: the program died with `runtime error: ` and an empty message.
+//  An empty diagnostic is worse than the failure itself -- it says nothing about which
+//  function or why.
+//
+//  What this file pins is that the refusal *exists* and that the program still runs: the
+//  large frame is exercised under `--jit` and the output has to match the interpreter. The
+//  loop at the end is a second, smaller function so the file still compiles something --
+//  a run where every function is refused would agree with the interpreter for the wrong
+//  reason.
+
+function fillLarge(ptr int data, int count):void {
+    for i in 0..count {
+        @(data + i) = i % 7;
+    }
+    eof: pass;
+}
+
+function sumOf(ptr int data, int count):int {
+    int64 total = 0;
+    int i = 0;
+    while (i < count) {
+        total = total + @(data + i);
+        i = i + 1;
+    }
+    return total as int;
+    eof: pass;
+}
+
+function main():void {
+    // 800 KB of stack: too wide for the pinned page table, so this body must be refused.
+    int big[200000];
+    fillLarge(#big[0], 200000);
+    print(sumOf(#big[0], 200000));
+    print(" ");
+
+    // A second array in the same frame, to be sure the refusal is about the frame rather
+    // than about one array, and that nothing reads past it.
+    int small[16];
+    fillLarge(#small[0], 16);
+    print(sumOf(#small[0], 16));
+    print("\n");
+    eof: pass;
+}

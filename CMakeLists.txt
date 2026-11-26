@@ -455,6 +455,12 @@ if(ACVM_BUILD_TESTS)
     acvm_add_legacy_check(timsort_check)
     acvm_add_legacy_check(time_check)
     acvm_add_legacy_check(astl_check)   # vector / set / map / hash: pure Axiom
+    # `bitN` storage: the layout rule (five bit fields into one byte), the
+    # read-modify-write that keeps neighbours intact, and the truncating cast.
+    acvm_add_legacy_check(bit_check)
+    # `**`: right associativity, precedence against `*` and unary, the 0-exponent
+    # edges, and the per-width result types.
+    acvm_add_legacy_check(pow_check)
     acvm_add_legacy_check(random_check)
 
     # The I/O check creates and deletes real files, so it runs in a scratch
@@ -488,7 +494,8 @@ if(ACVM_BUILD_TESTS)
     # Pairs of "check:module it needs". `formats_check` exercises the whole
     # format family, whose shared foundation is value.ax.
     set(ACVM_EXTRALIB_CHECKS "")
-    foreach(pair net_check:net formats_check:value tools_check:cli import_forms_check:json)
+    foreach(pair net_check:net formats_check:value tools_check:cli cli_dispatch_check:cli
+                 import_forms_check:json)
         string(REPLACE ":" ";" parts "${pair}")
         list(GET parts 0 extra_check)
         list(GET parts 1 extra_module)
@@ -499,7 +506,8 @@ if(ACVM_BUILD_TESTS)
         endif()
     endforeach()
 
-    foreach(check_name str_check codec_check strsort_check map_check
+    foreach(check_name func_check algorithm_key_check testcases_check
+                            str_check codec_check strsort_check map_check
                             fmt_check sort_index_check os_check sync_check
                             parallel_check threadpool_check generics_check union_check
                             generic_struct_check address_assign_check
@@ -566,7 +574,7 @@ if(ACVM_BUILD_TESTS)
     # than on anything the programs do.
     if(ACVM_HOST_IS_X64)
         foreach(checked
-                jit_check ternary_check generics_check union_check generic_struct_check
+                func_check algorithm_key_check jit_check ternary_check generics_check union_check generic_struct_check
                 methods_check int128_check astl_check algorithm_check
                 sync_check address_assign_check)
             acvm_add_jit_diff_check(${checked})
@@ -598,6 +606,44 @@ if(ACVM_BUILD_TESTS)
         # the interpreter. The count is the file's five compilable functions; a sixth
         # exists only to be refused, as the callee in the mixed-direction check.
         acvm_add_jit_diff_check(jit_string_check -DEXPECT_COMPILED=5)
+
+        # The entry function. The interpreter only ever reached compiled code through
+        # CALL, so `main` was interpreted no matter how much arithmetic it did -- and
+        # since `main` is where a small program puts everything, that made the JIT
+        # invisible exactly where it was most likely to be tried. Two functions here
+        # compile: `main` and `work`.
+        #
+        # `report` is the third and is deliberately *not* counted: it opens with a
+        # `print`, so there is no compiled prefix to speak of, and a hand-off at its first
+        # instruction would compile a prologue and hand straight back. That case is
+        # refused instead, and the count here is what notices if it stops being refused.
+        acvm_add_jit_diff_check(jit_entry_check -DEXPECT_COMPILED=2)
+
+        # A hand-off point inside a conditional inside a loop. The false branch jumps
+        # *over* the hand-off, and a jump target past it that was bound to the wrong
+        # place fell into the epilogue and returned a garbage result code -- a wrong
+        # answer rather than a crash, which is why it needs a test and not an eye. This
+        # one failed with "instruction budget exhausted" before the fix.
+        acvm_add_jit_diff_check(jit_bail_check -DEXPECT_COMPILED=3)
+
+        # Range loops, which are `LOCAL_ADDR; SWAP; STORE` and `LOCAL_ADDR; LOAD` pairs:
+        # 216 and 112 of them across the example programs, each access a bridge call plus
+        # a memType lookup plus a 32 byte Value. Those two pairs are now a single move.
+        # Four functions compile; a mutation that writes the fused store at the wrong
+        # offset fails here, which is the reason the widths and the nesting are varied.
+        acvm_add_jit_diff_check(jit_range_check -DEXPECT_COMPILED=4)
+
+        # No EXPECT_COMPILED on purpose: a program that declares a `process` is left to
+        # the interpreter in full, because compiled code cannot yield and the scheduler
+        # would never run the worker. What this pins is that the policy keeps the
+        # program's meaning identical -- compiling `main` here made `counter` come out 0
+        # instead of 6.
+        acvm_add_jit_diff_check(jit_event_check)
+
+        # A frame too large to pin must be refused at compile time. Before that check
+        # existed the program died under `--jit` with an empty trap message, because
+        # `pinFramePages` failed at run time and the exit path had nothing to say.
+        acvm_add_jit_diff_check(jit_frame_check -DEXPECT_COMPILED=2)
     endif()
 
     # Passing arguments is the point of this one, so it runs with some.
@@ -640,7 +686,8 @@ if(ACVM_BUILD_TESTS)
     # scheduling ("no worker saw an incomplete phase"), which is exactly what O4
     # stops providing. It still runs at O0-O3; at O4 its counters are right and
     # only that one scheduling assertion fails, which is the documented trade.
-    foreach(check_name str_check codec_check strsort_check map_check
+    foreach(check_name func_check algorithm_key_check testcases_check
+                            str_check codec_check strsort_check map_check
                             fmt_check sort_index_check os_check
                             parallel_check threadpool_check generics_check union_check
                             generic_struct_check address_assign_check

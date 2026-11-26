@@ -10,6 +10,37 @@
 namespace acvm {
 namespace {
 
+/// The bit-field a member access names, or null when it names an ordinary field.
+///
+/// Bit fields are the one place where "the address of this value" is not enough to
+/// read or write it: the value starts at a bit inside the byte. Everything that
+/// touches a member has to ask this first.
+const FieldInfo* bitFieldOf(const Expr& expr) {
+    if (expr.kind != ExprKind::Member && expr.kind != ExprKind::Arrow) {
+        return nullptr;
+    }
+    if (expr.kids.empty() || expr.kids[0] == nullptr) {
+        return nullptr;
+    }
+    const Type* base = expr.kids[0]->type;
+    if (expr.kind == ExprKind::Arrow) {
+        if (base == nullptr || !base->isPtr()) {
+            return nullptr;
+        }
+        base = base->elem;
+    }
+    if (base == nullptr ||
+        (base->kind != TypeKind::Struct && base->kind != TypeKind::Union)) {
+        return nullptr;
+    }
+    if (expr.memberIndex < 0 ||
+        static_cast<std::size_t>(expr.memberIndex) >= base->fields.size()) {
+        return nullptr;
+    }
+    const FieldInfo& field = base->fields[static_cast<std::size_t>(expr.memberIndex)];
+    return field.bitWidth != 0 ? &field : nullptr;
+}
+
 bool isComparisonBinOp(BinOp op) {
     switch (op) {
     case BinOp::Lt:
@@ -31,6 +62,7 @@ OpCode arithmeticOpCode(BinOp op) {
     case BinOp::Mul: return OpCode::Mul;
     case BinOp::Div: return OpCode::Div;
     case BinOp::Mod: return OpCode::Mod;
+    case BinOp::Pow: return OpCode::Pow;
     case BinOp::BitAnd: return OpCode::And;
     case BinOp::BitOr: return OpCode::Or;
     case BinOp::BitXor: return OpCode::Xor;
@@ -267,6 +299,47 @@ void IRGen::emitAddress(Expr& expr) {
 // Expressions
 //===----------------------------------------------------------------------===//
 
+std::uint32_t IRGen::emitPackedElementAddress(Expr& expr) {
+    const Type* baseType = expr.kids[0]->type;
+    const Type* elem = baseType->elem;
+    const unsigned perByte = elem->bitElementsPerByte();
+
+    unsigned shift = 0;
+    while ((1u << shift) < perByte) {
+        ++shift;
+    }
+    const std::uint32_t perByteMask = perByte - 1;
+
+    const std::uint32_t indexSlot = stageIndex(*expr.kids[1]);
+    emitBoundsCheck(indexSlot, false, static_cast<std::uint32_t>(baseType->length));
+
+    const std::uint32_t bitSlot = allocRawTemp(8, 8);
+
+    // bitOffset = (i & (perByte-1)) * bits -- the position inside the byte.
+    m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(indexSlot));
+    m_fn->emit(OpCode::Load, int64MemType());
+    emitConstInt(perByteMask);
+    m_fn->emit(OpCode::And, int64MemType());
+    if (elem->bits != 1) {
+        emitConstInt(elem->bits);
+        m_fn->emit(OpCode::Mul, int64MemType());
+    }
+    m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(bitSlot));
+    m_fn->emit(OpCode::Swap);
+    m_fn->emit(OpCode::Store, int64MemType());
+
+    // Address = base + (i >> shift), the byte that holds the element.
+    emitBaseAddress(*expr.kids[0]);
+    m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(indexSlot));
+    m_fn->emit(OpCode::Load, int64MemType());
+    if (shift != 0) {
+        emitConstInt(shift);
+        m_fn->emit(OpCode::Shr, int64MemType());
+    }
+    m_fn->emit(OpCode::Add, ptrMemType());
+    return bitSlot;
+}
+
 void IRGen::emitExpr(Expr& expr) {
     switch (expr.kind) {
     case ExprKind::IntLit:
@@ -300,6 +373,15 @@ void IRGen::emitExpr(Expr& expr) {
     }
 
     case ExprKind::Name: {
+        // Before the symbol test: a function value resolves to a handle and has no slot
+        // of its own, so the ordinary paths below would emit a load through a null symbol.
+        if (expr.funcValue >= 0) {
+            // The handle is the index plus one, so a zeroed slot means "no function" and
+            // CALL_INDIRECT can trap on it instead of calling whatever happens to be first
+            // in the module.
+            emitConstInt(static_cast<Int128>(expr.funcValue) + 1);
+            return;
+        }
         Symbol* symbol = expr.sym;
         if (symbol == nullptr) {
             emitConstInt(0);
@@ -557,6 +639,25 @@ void IRGen::emitExpr(Expr& expr) {
         const Type* to = expr.type;
         emitExpr(*expr.kids[0]);
         if (from != nullptr && to != nullptr) {
+            if (to->isBit()) {
+                // `as bitN` truncates: the low N bits are kept and the rest dropped,
+                // which is what a bit string means. The VM's cast *traps* on an
+                // out-of-range integer, and that rule is right for `as int8` -- so
+                // the mask is emitted here instead of weakening it. Widening to
+                // int128 first keeps the cast itself from tripping the range check.
+                MemType wide;
+                wide.kind = MemType::Kind::Int;
+                wide.size = 16;
+                wide.bits = 128;
+                wide.isUnsigned = false;
+                const int wideType = m_module->internMemoryType(wide);
+                m_fn->emit(OpCode::Cast, memTypeOf(from), wideType);
+                if (to->bits < 128) {
+                    emitConstInt((static_cast<Int128>(1) << to->bits) - 1);
+                    m_fn->emit(OpCode::And, wideType);
+                }
+                return;
+            }
             m_fn->emit(OpCode::Cast, memTypeOf(from), memTypeOf(to));
         }
         return;
@@ -593,6 +694,42 @@ void IRGen::emitExpr(Expr& expr) {
             return;
         }
 
+        if (expr.indirectCall) {
+            // Arguments first, then the handle: CALL_INDIRECT pops the callee and then
+            // the arguments, which is the same order the interpreter's CALL expects
+            // (last pushed, first popped) with the target on top.
+            const Type* signature = expr.kids[0]->type;
+            if (signature == nullptr || !signature->isFunc()) {
+                m_diagnostics.error(expr.range, "internal error: indirect call to a non-Func");
+                emitConstInt(0);
+                return;
+            }
+            // An aggregate result is returned into a destination the caller supplies,
+            // exactly as the direct call does: the callee's epilogue writes through it,
+            // and without one the interpreter's CALL reports a missing destination.
+            const Type* returnType = signature->funcReturn();
+            if (returnType != nullptr && returnType->isAggregate()) {
+                const std::uint32_t destination = allocTemp(returnType);
+                emitMemZero(destination, returnType->sizeBytes);
+                m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(destination));
+            }
+            const std::size_t argc = expr.kids.size() - 1;
+            for (std::size_t i = 0; i < argc; ++i) {
+                Expr& argument = *expr.kids[i + 1];
+                if (signature->funcParam(i) != nullptr &&
+                    signature->funcParam(i)->isAggregate()) {
+                    emitBaseAddress(argument);
+                } else {
+                    emitExpr(argument);
+                    emitConvert(argument.type, signature->funcParam(i));
+                }
+            }
+            emitExpr(*expr.kids[0]);
+            m_fn->emit(OpCode::SafePoint);
+            m_fn->emit(OpCode::CallIndirect, 0, static_cast<std::int32_t>(argc));
+            return;
+        }
+
         if (expr.funcIndex < 0 ||
             static_cast<std::size_t>(expr.funcIndex) >= m_sema.functions().size()) {
             m_diagnostics.error(expr.range, "internal error: unresolved call");
@@ -625,10 +762,32 @@ void IRGen::emitExpr(Expr& expr) {
         return;
     }
 
-    case ExprKind::Index:
+    case ExprKind::Index: {
+        const Type* baseType = expr.kids[0]->type;
+        if (baseType != nullptr && baseType->kind == TypeKind::Array &&
+            baseType->elem->bitElementsPerByte() > 0) {
+            // Packed element: the byte address alone does not name it, so the shift
+            // happens here rather than in `emitLoadValue`.
+            const std::uint32_t bitSlot = emitPackedElementAddress(expr);
+            MemType byteType;
+            byteType.kind = MemType::Kind::Int;
+            byteType.size = 1;
+            byteType.bits = 8;
+            byteType.isUnsigned = true;
+            const int byteMemType = m_module->internMemoryType(byteType);
+
+            m_fn->emit(OpCode::Load, byteMemType);
+            m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(bitSlot));
+            m_fn->emit(OpCode::Load, int64MemType());
+            m_fn->emit(OpCode::Shr, int64MemType());
+            emitConstInt((static_cast<Int128>(1) << baseType->elem->bits) - 1);
+            m_fn->emit(OpCode::And, int64MemType());
+            return;
+        }
         emitAddress(expr);
         emitLoadValue(expr.type);
         return;
+    }
 
     case ExprKind::Slice:
         emitBaseAddress(*expr.kids[0]);
@@ -653,6 +812,28 @@ void IRGen::emitExpr(Expr& expr) {
         if (expr.memberIndex == kMemberPtr) {
             emitBaseAddress(*expr.kids[0]);
             m_fn->emit(OpCode::Load, ptrMemType());
+            return;
+        }
+        if (const FieldInfo* bitField = bitFieldOf(expr)) {
+            // Read the byte that holds the field, shift the field down to bit 0 and
+            // drop everything above it. `loadScalar` cannot do this for us: it masks
+            // by the *type's* width at the byte's own offset, while a bit field sits
+            // at an offset inside the byte.
+            MemType byteType;
+            byteType.kind = MemType::Kind::Int;
+            byteType.size = 1;
+            byteType.bits = 8;
+            byteType.isUnsigned = true;
+            const int byteMemType = m_module->internMemoryType(byteType);
+
+            emitAddress(expr);
+            m_fn->emit(OpCode::Load, byteMemType);
+            if (bitField->bitOffset != 0) {
+                emitConstInt(bitField->bitOffset);
+                m_fn->emit(OpCode::Shr, int64MemType());
+            }
+            emitConstInt((static_cast<Int128>(1) << bitField->bitWidth) - 1);
+            m_fn->emit(OpCode::And, int64MemType());
             return;
         }
         emitAddress(expr);
@@ -718,6 +899,96 @@ void IRGen::emitAssign(Expr& expr) {
     m_discardResult = false;
 
     if (expr.assignop == AssignOp::Assign) {
+        if (expr.kids[0]->kind == ExprKind::Index) {
+            const Type* baseType = expr.kids[0]->kids[0]->type;
+            if (baseType != nullptr && baseType->kind == TypeKind::Array &&
+                baseType->elem->bitElementsPerByte() > 0) {
+                // Same read-modify-write as a struct bit field, except the field's
+                // position is a runtime value here: the mask has to be shifted by it
+                // rather than baked in.
+                const Type* elem = baseType->elem;
+                const Int128 fieldMask = (static_cast<Int128>(1) << elem->bits) - 1;
+                MemType byteType;
+                byteType.kind = MemType::Kind::Int;
+                byteType.size = 1;
+                byteType.bits = 8;
+                byteType.isUnsigned = true;
+                const int byteMemType = m_module->internMemoryType(byteType);
+
+                const std::uint32_t bitSlot = emitPackedElementAddress(*expr.kids[0]);
+                const std::uint32_t maskSlot = allocRawTemp(8, 8);
+
+                m_fn->emit(OpCode::Dup);                        // [addr, addr]
+                m_fn->emit(OpCode::Load, byteMemType);          // [addr, byte]
+
+                // shiftedMask = fieldMask << bitOffset
+                emitConstInt(fieldMask);                        // [addr, byte, fm]
+                m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(bitSlot));
+                m_fn->emit(OpCode::Load, int64MemType());       // [addr, byte, fm, off]
+                m_fn->emit(OpCode::Shl, int64MemType());        // [addr, byte, shifted]
+                m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(maskSlot));
+                m_fn->emit(OpCode::Swap);
+                m_fn->emit(OpCode::Store, int64MemType());      // [addr, byte]
+
+                // byte & ~shifted
+                emitConstInt(-1);
+                m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(maskSlot));
+                m_fn->emit(OpCode::Load, int64MemType());
+                m_fn->emit(OpCode::Xor, int64MemType());        // [addr, byte, ~shifted]
+                m_fn->emit(OpCode::And, int64MemType());        // [addr, cleared]
+
+                emitExpr(*expr.kids[1]);
+                emitConvert(valueType, targetType);
+                if (!discard) {
+                    m_fn->emit(OpCode::Dup);
+                }
+                m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(bitSlot));
+                m_fn->emit(OpCode::Load, int64MemType());
+                m_fn->emit(OpCode::Shl, int64MemType());        // [addr, cleared, placed]
+                m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(maskSlot));
+                m_fn->emit(OpCode::Load, int64MemType());
+                m_fn->emit(OpCode::And, int64MemType());        // [addr, cleared, placed]
+                m_fn->emit(OpCode::Or, int64MemType());         // [addr, merged]
+                m_fn->emit(OpCode::Store, byteMemType);
+                return;
+            }
+        }
+        if (const FieldInfo* bitField = bitFieldOf(*expr.kids[0])) {
+            // A bit field cannot be stored to: a store would overwrite the seven
+            // neighbouring fields that share the byte. So this is a read-modify-write
+            // -- load the byte, clear the field's bits, or in the new value, store the
+            // byte back. That is also why a bit field never straddles a byte: with one
+            // byte involved, the sequence cannot tear across a boundary.
+            const Int128 fieldMask = (static_cast<Int128>(1) << bitField->bitWidth) - 1;
+            const Int128 shiftedMask = fieldMask << bitField->bitOffset;
+            MemType byteType;
+            byteType.kind = MemType::Kind::Int;
+            byteType.size = 1;
+            byteType.bits = 8;
+            byteType.isUnsigned = true;
+            const int byteMemType = m_module->internMemoryType(byteType);
+
+            emitAddress(*expr.kids[0]);                        // [addr]
+            m_fn->emit(OpCode::Dup);                           // [addr, addr]
+            m_fn->emit(OpCode::Load, byteMemType);             // [addr, byte]
+            emitConstInt(~shiftedMask);                        // [addr, byte, ~mask]
+            m_fn->emit(OpCode::And, int64MemType());           // [addr, cleared]
+            emitExpr(*expr.kids[1]);
+            emitConvert(valueType, targetType);
+            if (!discard) {
+                // The assignment's value is the value assigned, not the merged byte.
+                m_fn->emit(OpCode::Dup);
+            }
+            if (bitField->bitOffset != 0) {
+                emitConstInt(bitField->bitOffset);
+                m_fn->emit(OpCode::Shl, int64MemType());
+            }
+            emitConstInt(shiftedMask);
+            m_fn->emit(OpCode::And, int64MemType());           // [addr, cleared, placed]
+            m_fn->emit(OpCode::Or, int64MemType());            // [addr, merged]
+            m_fn->emit(OpCode::Store, byteMemType);
+            return;
+        }
         if (targetType != nullptr && targetType->isAggregate()) {
             // MEM_COPY pops the destination first, so the stack has to be
             // [source, destination] with the destination on top. Duplicating

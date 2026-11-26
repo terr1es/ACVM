@@ -1,0 +1,66 @@
+//  jit_entry_check.ax — the entry function is compiled too.
+//
+//  The interpreter reached compiled code only through CALL, so `main` ran interpreted no
+//  matter how much arithmetic it did. Measured before the fix: a 20 000 000 iteration
+//  loop cost 3.75 s in `main` and 0.84 s in a function `main` called, for byte-identical
+//  work.
+//
+//  What this pins down is the *semantics*, not the speed. A process has no caller to
+//  return to, so "finished" has to come from the generated epilogue popping the last
+//  frame -- a `Ret` the interpreter executed is exactly what does not happen here. The
+//  same applies to the calls below: both sides of a compiled-to-compiled call are in
+//  machine code, with the interpreter nowhere in the chain.
+//
+//  `main` holds no builtin, so it is compiled whole. Reporting goes through `report`,
+//  which hands its own tail back to the interpreter -- so this file also covers the
+//  hand-off, without letting it hide a main that failed to compile.
+
+function work(int64 n):int64 {
+    int64 total = 0;
+    int64 i = 0;
+    while (i < n) {
+        total = total + i * 3;
+        i = i + 1;
+    }
+    return total;
+}
+
+// Prints and nothing else. The builtin is at the tail, so the hand-off point is the
+// statement boundary just before it and everything before that runs compiled.
+function report(int64 first, int64 second, int64 third):void {
+    print(first);
+    print(" ");
+    print(second);
+    print(" ");
+    print(third);
+    print("\n");
+    eof: pass;
+}
+
+function main():void {
+    // The loop is in the entry function itself, which is the point: this body never left
+    // the interpreter before the entry function was compiled.
+    int64 total = 0;
+    int64 i = 0;
+    while (i < 2000) {
+        total = total + work(i);
+        i = i + 1;
+    }
+
+    // Compiled caller to compiled callee, entered from the entry function rather than
+    // through the interpreter's CALL.
+    int64 spanned = work(100) + work(200) + work(400);
+
+    // A value whose derivation is checked twice: once by a second loop that accumulates
+    // in a different order, and once by the interpreter in the -O0 run. A hand-off that
+    // lost a frame slot or popped one too many shows up as a number here.
+    int64 again = 0;
+    int64 j = 1999;
+    while (j >= 0) {
+        again = again + work(j);
+        j = j - 1;
+    }
+
+    report(total, spanned, again);
+    eof: pass;
+}

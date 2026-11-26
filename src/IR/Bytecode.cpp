@@ -45,6 +45,7 @@ std::string_view opCodeName(OpCode op) {
     case OpCode::JumpIfFalse: return "JUMP_IF_FALSE";
     case OpCode::JumpIfTrue: return "JUMP_IF_TRUE";
     case OpCode::Call: return "CALL";
+    case OpCode::CallIndirect: return "CALL_INDIRECT";
     case OpCode::Ret: return "RET";
     case OpCode::MemCopy: return "MEM_COPY";
     case OpCode::MemZero: return "MEM_ZERO";
@@ -62,6 +63,7 @@ std::string_view opCodeName(OpCode op) {
     case OpCode::DerefLocal: return "DEREF_LOCAL";
     case OpCode::StepLocal: return "STEP_LOCAL";
     case OpCode::CopyStep: return "COPY_STEP";
+    case OpCode::Pow: return "POW";
     }
     return "??";
 }
@@ -79,6 +81,9 @@ const char* trapKindName(TrapKind kind) {
     case TrapKind::AssertionFailed: return "assertion failed";
     case TrapKind::Unreachable: return "unreachable";
     case TrapKind::ExternalCallFailed: return "external call failed";
+    case TrapKind::NegativeExponent:
+        return "negative exponent: '**' produces an integer, and a negative power has no "
+               "integer result; use 'pow' for a floating point value";
     }
     return "trap";
 }

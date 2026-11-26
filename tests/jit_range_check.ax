@@ -1,0 +1,104 @@
+//  jit_range_check.ax — the fused local access, which is what a range loop is made of.
+//
+//  IRGen emits a local's *address* for every store and for the generic pointer load, so
+//  `for i in 0..n` became `LOCAL_ADDR; SWAP; STORE` and `LOCAL_ADDR; LOAD` pairs -- 216
+//  and 112 of them across the example programs. Each access went through a bridge call,
+//  a memType lookup and a 32 byte Value construction. A 20 000 000 iteration range loop
+//  measured 4.7x compiled, against 21x for the same loop written with LOAD_LOCAL.
+//
+//  The lowering now recognises both pairs and emits the move directly, falling back to
+//  the bridge only when a slot straddles a page boundary. That fallback is the reason
+//  this file uses several widths: 1, 2 and 4 byte stores go through `mov` with the width
+//  in the opcode, and a wrong width or a missing sign extension shows up here as a wrong
+//  number rather than as a crash.
+//
+//  The loop bounds also matter: `for i in a..b` compares an i32 counter against an i64
+//  bound, so an unsigned compare, a 32 bit truncation or a sign extension bug changes
+//  when the loop stops.
+
+// Range loops of every integer width the lowering inlines, with the counter stored into
+// a local of a narrower type than the accumulator.
+function mixWidths(int n):int64 {
+    int64 wide = 0;
+    int32 narrow = 0;
+    int8 tiny = 0;
+    int16 small = 0;
+
+    for i in 0..n {
+        wide = wide + i;
+        narrow = narrow + 1;
+        if (i % 3 == 0) {
+            tiny = tiny + 1;
+        }
+        if (i % 5 == 0) {
+            small = small + 1;
+        }
+    }
+    return wide + narrow + tiny + small;
+}
+
+// A range loop that writes through a pointer, which is the shape the lowering can emit
+// -- `values[i]` carries a bounds check, and a check is a `TRAP`, which is not a hand-off
+// point when it sits inside an expression. Writing through `@(base + i)` has no check and
+// so the whole body compiles, which is what makes this the case that would catch a wrong
+// store width or a wrong page offset.
+function fillAndSum(int n):int64 {
+    int values[64] = {0};
+    ptr int base = #values[0];
+    for i in 0..n {
+        @(base + i) = i * 3;
+    }
+    int64 total = 0;
+    for i in 0..n {
+        total = total + @(base + i);
+    }
+    return total;
+}
+
+// Nested range loops: the inner counter is re-initialised on every outer iteration, so a
+// fused store that wrote to the wrong slot shows up as a count that is too high or too
+// low rather than as garbage.
+function nested(int rows, int columns):int64 {
+    int64 total = 0;
+    for r in 0..rows {
+        for c in 0..columns {
+            total = total + r * c;
+        }
+    }
+    return total;
+}
+
+// Printing lives here so `main` itself holds no builtin and is compiled whole: a
+// refused `main` would make this file prove nothing about the entry function.
+function show(int64 first, int64 second, int64 third):void {
+    print(first);
+    print(" ");
+    print(second);
+    print(" ");
+    print(third);
+    print("\n");
+    eof: pass;
+}
+
+// Negative values through a narrow pointer. A fused load that zero-extends instead of
+// sign-extending turns -1 into 255, which is why the values here are negative and why
+// this function exists at all: the other loops are all positive, where the two
+// extensions agree and a sign bug would go unnoticed.
+function signedNarrow(int n):int64 {
+    int8 values[32] = {0};
+    ptr int8 base = #values[0];
+    for i in 0..n {
+        @(base + i) = (0 - i) as int8;
+    }
+    int64 total = 0;
+    for i in 0..n {
+        total = total + @(base + i);
+    }
+    return total;
+}
+
+function main():void {
+    show(mixWidths(200), fillAndSum(64), nested(20, 30));
+    show(signedNarrow(20), 0, 0);
+    eof: pass;
+}

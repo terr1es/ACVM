@@ -33,6 +33,7 @@ const char* binOpName(BinOp op) {
     case BinOp::Mul: return "*";
     case BinOp::Div: return "/";
     case BinOp::Mod: return "%";
+    case BinOp::Pow: return "**";
     case BinOp::Shl: return "<<";
     case BinOp::Shr: return ">>";
     case BinOp::Lt: return "<";
@@ -116,6 +117,8 @@ private:
             return "float" + std::to_string(node.bits == 0 ? 32 : node.bits);
         case ScalarBase::Int:
             break;
+        case ScalarBase::Bit:
+            return "bit" + std::to_string(node.bits);
         }
         return (node.isUnsigned ? "unsigned int" : "int") +
                std::to_string(node.bits == 0 ? 32 : node.bits);

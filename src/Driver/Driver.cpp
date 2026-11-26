@@ -817,7 +817,15 @@ int Driver::runSource(const std::string& path, const DriverOptions& options) {
     VM vm(m_out, m_err);
     vm.setAssertionsEnabled(options.assertions);
     vm.setProgramArgs(m_programArgs);
-    vm.setJitMode(options.jit ? JitMode::On : JitMode::Off);
+    // A breakpoint inside compiled code cannot stop anything: the lowering emits whole
+    // functions and has no mapping back to instruction addresses. Debugging is not the
+    // moment to be fast, so asking for both turns the JIT off and says so, rather than
+    // letting the debugger silently miss breakpoints in the very function being debugged.
+    if (options.jit && options.adb) {
+        m_err << "note: --jit is off while --adb is attached (compiled code has no "
+                  "breakpoints)\n";
+    }
+    vm.setJitMode(options.jit && !options.adb ? JitMode::On : JitMode::Off);
     vm.setLibrarySearchPath(librarySearchDirs(path));
     std::string error;
     if (options.adb) {
@@ -942,7 +950,11 @@ int Driver::runBytecode(const std::string& path, const DriverOptions& options) {
 
     VM vm(m_out, m_err);
     vm.setProgramArgs(m_programArgs);
-    vm.setJitMode(options.jit ? JitMode::On : JitMode::Off);
+    if (options.jit && options.adb) {
+        m_err << "note: --jit is off while --adb is attached (compiled code has no "
+                  "breakpoints)\n";
+    }
+    vm.setJitMode(options.jit && !options.adb ? JitMode::On : JitMode::Off);
     vm.setLibrarySearchPath(librarySearchDirs(path));
     if (options.adb) {
         if (!attachDebugger(vm, options, error)) {
