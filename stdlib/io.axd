@@ -134,6 +134,29 @@ function removeDir(string path):int;
 //  Reads one line from stdin, without the newline. -1 at end of file.
 function readLineInto(ptr char buffer, int capacity):int;
 
+//  Reads one whitespace-delimited token from stdin.
+//
+//  Returns the length (>= 1), -1 at end of input, -2 when the token does not fit
+//  (the rest of it is discarded).
+//
+//  Leading whitespace is skipped, so blank lines are invisible. The byte that ends
+//  the token is consumed, which is what makes consecutive calls read consecutive
+//  tokens -- and means a token at the end of a line leaves the stream at the start
+//  of the next line, so `inputInto` then `readLineInto` reads the *following* line.
+//
+//      char word[64] = {};
+//      int n = inputInto(#word[0], 64);
+//      while (n > 0) {
+//          string token = makeString(#word[0], n);
+//          n = inputInto(#word[0], 64);
+//      }
+function inputInto(ptr char buffer, int capacity):int;
+
+//  Flushes buffered output. Needed before reading when a prompt was printed
+//  without a newline: stdout is line-buffered, so `print("name? ")` alone leaves
+//  the cursor waiting on a blank line. Call it before `readLineInto`/`inputInto`.
+function flushStdout():int;
+
 //  Reads everything left on stdin. Returns the byte count, or -1 when the buffer
 //  is too small.
 function readStdinAll(ptr char buffer, int capacity):int;

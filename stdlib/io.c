@@ -337,6 +337,15 @@ int64_t makeDir(const char* path, int64_t pathLength) {
 
 //===--- line input -------------------------------------------------------===//
 
+/// True for the bytes that separate input tokens.
+///
+/// Written out rather than calling `isspace`, which is locale-dependent: in a
+/// locale where byte 0xA0 is a space, a UTF-8 continuation byte could end a token
+/// in the middle of a character. Input tokens are ASCII whitespace, always.
+static int acvm_is_space(int ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\v' || ch == '\f';
+}
+
 /// Reads one line from stdin into `buffer`, without the newline. One byte per
 /// element, like the file functions.
 ///
@@ -374,6 +383,68 @@ int64_t readLineInto(uint16_t* buffer, int64_t capacity) {
         --length;   // CRLF input behaves like LF input
     }
     return length;
+}
+
+/// Reads one whitespace-delimited token from stdin.
+///
+/// Returns the byte count (always >= 1), **-1 at end of input**, or **-2** when the
+/// token does not fit -- in which case the rest of that token is discarded so that
+/// the next call starts at a token boundary instead of mid-word.
+///
+/// Leading whitespace is skipped, so empty lines and runs of spaces are invisible
+/// to a token reader. The single whitespace byte that *ends* the token is consumed;
+/// that is what makes consecutive calls read consecutive tokens, and it also means
+/// a token at the end of a line leaves the stream at the start of the next line --
+/// so `inputInto` then `readLineInto` reads the following line, not the remains of
+/// this one.
+int64_t inputInto(uint16_t* buffer, int64_t capacity) {
+    if (buffer == NULL || capacity <= 0) {
+        return -1;
+    }
+
+    int ch = fgetc(stdin);
+    while (ch != EOF && acvm_is_space(ch)) {
+        ch = fgetc(stdin);
+    }
+    if (ch == EOF) {
+        return -1;   // only whitespace left: nothing to report
+    }
+
+    int64_t length = 0;
+    int truncated = 0;
+    while (ch != EOF && !acvm_is_space(ch)) {
+        if (length >= capacity) {
+            truncated = 1;
+        } else {
+            ((uint8_t*)buffer)[length++] = (uint8_t)ch;
+        }
+        ch = fgetc(stdin);
+    }
+    // The delimiter has been read and is deliberately not pushed back: consuming it
+    // is what lets consecutive calls see consecutive tokens. Nothing else is
+    // touched, so the byte after it is still there for `readLineInto`.
+    //
+    // CRLF is one terminator, not two. Leaving the '\n' behind after eating the
+    // '\r' made the next line reader return an empty line -- so `input()` then
+    // `readLine()` on a CRLF file silently skipped a line. The '\n' is consumed
+    // here, and anything else is pushed back so CR-only input still works.
+    if (ch == '\r') {
+        const int next = fgetc(stdin);
+        if (next != '\n' && next != EOF) {
+            ungetc(next, stdin);
+        }
+    }
+    return truncated ? -2 : length;
+}
+
+/// Flushes buffered output.
+///
+/// Needed before reading when a prompt was printed without a newline: stdout is
+/// line-buffered, so `print("name? ")` alone would leave the cursor on an empty
+/// screen until something else flushed. A program that prints its own prompt has
+/// to call this before `readLineInto` or `inputInto`.
+int64_t flushStdout(void) {
+    return fflush(stdout) == 0 ? 0 : -1;
 }
 
 /// Reads everything left on stdin into `buffer`, one byte per element.
