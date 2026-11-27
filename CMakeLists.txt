@@ -341,7 +341,13 @@ endforeach()
 add_executable(acvm_static tools/acvm/main.cpp ${ACVM_STATIC_SOURCES})
 target_link_libraries(acvm_static PRIVATE acvm_driver)
 set_target_properties(acvm_static PROPERTIES OUTPUT_NAME "acvm-static")
-target_link_options(acvm_static PRIVATE "LINKER:--export-all-symbols")
+# `--export-all-symbols` is a PE/COFF concept. An ELF or Mach-O image exports its
+# global symbols by default, and both GNU ld and Apple's ld64 reject the flag outright
+# ("unrecognized option"), so leaving it unconditional broke the Linux and macOS builds
+# the first time this target was compiled anywhere but a MinGW host.
+if(WIN32)
+    target_link_options(acvm_static PRIVATE "LINKER:--export-all-symbols")
+endif()
 
 # The same platform libraries the individual modules need, gathered here because this
 # binary contains all of them.

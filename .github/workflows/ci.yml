@@ -1,0 +1,97 @@
+# Builds and tests every supported platform on every push to `main`.
+#
+# Why this exists separately from `release.yml`: a tag is a bad place to discover that
+# a file does not compile on Linux. The first tagged build of this project failed on
+# all three platforms -- one portability bug in the build files and one missing
+# package -- and each discovery cost a tag that had to be deleted and re-pushed. A tag
+# should mark a commit already known to build everywhere; this workflow establishes
+# that, and `release.yml` then only packages.
+#
+# Nothing is uploaded or published here. It compiles, it runs `ctest`, it installs into
+# a scratch prefix and runs one program from there, and it stops.
+#
+# Three explicit jobs rather than a matrix: the Windows job needs the MSYS2 shell for
+# every step (`shell: msys2 {0}`), and a matrix cannot vary the shell per entry. The
+# repetition is the price of not having a build that silently uses a different compiler
+# than the one it named.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    # gcc, deliberately: the release build uses clang, and a second compiler is the
+    # cheapest way to catch a header or a language extension that only one accepts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Install and run one program
+        run: |
+          cmake --install build --prefix stage
+          printf 'function main():void { print("ok\\n"); eof: pass; }\n' > hello.ax
+          ./stage/bin/acvm run hello.ax
+          ./stage/bin/acvm run hello.ax --jit
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Install and run one program
+        run: |
+          cmake --install build --prefix stage
+          printf 'function main():void { print("ok\\n"); eof: pass; }\n' > hello.ax
+          ./stage/bin/acvm run hello.ax
+          ./stage/bin/acvm run hello.ax --jit
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          # `gcc-libs` carries the static libstdc++/libgcc archives. The MSYS2 clang
+          # defaults to libstdc++, and `-static` (which the release needs, or the
+          # executable asks the user for libc++.dll) has nothing to link without it.
+          install: >-
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-gcc-libs
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Install and run one program
+        run: |
+          cmake --install build --prefix stage
+          printf 'function main():void { print("ok\\n"); eof: pass; }\n' > hello.ax
+          ./stage/bin/acvm run hello.ax
+          ./stage/bin/acvm run hello.ax --jit
