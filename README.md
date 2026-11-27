@@ -70,6 +70,20 @@ acvm check examples/tour.ax                    # lex, parse and type-check only
 acvm ir    examples/tour.ax -O2                # disassemble after optimizing
 ```
 
+Four commands inspect or scaffold a project rather than compile it:
+
+```bash
+acvm size examples/tour.ax                     # bytecode size per function, largest first
+acvm doc  stdlib -o docs/api.md                # Markdown reference from `//` comments
+acvm test tests                                # run every *_check.ax in a directory
+acvm init myproject                            # a program, a test, and nothing else
+```
+
+`size` answers "why is this module big" by sorting the functions, `doc` reads the source
+rather than the syntax tree (so it works on a file that does not compile), `test` runs each
+file in its own process so one trap does not take the rest down, and `init` writes two files
+that already pass.
+
 Optimization levels are `-O0` (none), `-O1`, `-O2` (default), `-O3`, and `-O4`.
 **O0–O3 preserve observable semantics; O4 does not** — it removes safety checks and safe
 points, so programs that depend on preemption or on an assertion firing behave
