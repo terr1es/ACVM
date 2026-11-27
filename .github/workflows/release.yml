@@ -98,6 +98,10 @@ jobs:
             mingw-w64-ucrt-x86_64-clang
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
+            # The static libstdc++/libgcc archives. `-static` needs them, and the MSYS2
+            # clang defaults to libstdc++ rather than libc++, so a toolchain without
+            # this package links the DLL form only and the whole archive fails here.
+            mingw-w64-ucrt-x86_64-gcc-libs
             zip
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
