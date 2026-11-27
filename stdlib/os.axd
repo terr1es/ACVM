@@ -208,6 +208,13 @@ function homeDirInto(ptr char buffer, int capacity):int;
 //  Permissions and timestamps are not preserved: this moves bytes, which is what
 //  a build step wants.
 function copyFile(string from, string to):int;
+// True when the shared object can be loaded, with its own directory as the search root.
+//
+// This is the question a deployment asks and a build never does: a library that exists but
+// cannot find a dependency of its own fails at load time, on the machine it was copied to,
+// long after the copy reported success. Loading is not running the program -- it runs the
+// library's static initialisers and nothing else.
+function libraryLoads(string path):bool;
 
 //  File size as a 64-bit value, or -1 when it does not exist or is a directory.
 //  `io.fileSize` returns an `int` and therefore caps at 2 GB; this one does not.

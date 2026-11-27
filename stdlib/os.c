@@ -60,6 +60,7 @@
 #include <windows.h>
 #include <wchar.h>
 #else
+#include <dlfcn.h>
 #include <errno.h>
 #include <pwd.h>
 #include <sys/stat.h>
@@ -968,6 +969,41 @@ int64_t homeDirInto(uint16_t* buffer, int64_t capacity) {
 /// Permissions and timestamps are not preserved: this is "get the bytes there",
 /// which is what a build step or a backup wants. A caller who needs attributes
 /// kept needs a platform-specific tool.
+/// True when the shared object can be loaded, with its own directory as the search root.
+///
+/// This is the question a deployment asks and a build never does: a library that exists but
+/// cannot find a dependency of its own fails at load time, on the machine it was copied to,
+/// long after the copy reported success. Loading is not running the program -- it runs the
+/// library's static initialisers and nothing else -- and the search root is pinned to the
+/// file's own directory so the answer describes that directory rather than this machine's
+/// loader path.
+int64_t libraryLoads(const char* path, int64_t pathLength) {
+    (void)pathLength;
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+#ifdef _WIN32
+    wchar_t* wide = os_wide_from_utf8(path);
+    if (wide == NULL) {
+        return 0;
+    }
+    HMODULE handle = LoadLibraryExW(wide, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    free(wide);
+    if (handle == NULL) {
+        return 0;
+    }
+    FreeLibrary(handle);
+    return 1;
+#else
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) {
+        return 0;
+    }
+    dlclose(handle);
+    return 1;
+#endif
+}
+
 int64_t copyFile(const char* from, int64_t fromLength, const char* to, int64_t toLength) {
     (void)fromLength;
     (void)toLength;

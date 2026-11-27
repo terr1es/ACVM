@@ -100,6 +100,20 @@ std::string executableDir() {
 ///
 /// Only consulted when no arguments were given, so `acvm run x.ax` in a directory that
 /// happens to contain `acvm.acvm` still does what was typed.
+/// The executable's own name, without a directory or an extension.
+std::string executableStem(const std::string& argv0) {
+    std::string name = argv0;
+    const std::size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        name = name.substr(slash + 1);
+    }
+    const std::size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos) {
+        name = name.substr(0, dot);
+    }
+    return name;
+}
+
 std::string siblingPayload(const std::string& argv0) {
     std::string dir = executableDir();
     std::string name = argv0;
@@ -183,13 +197,18 @@ int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(acvmCrashFilter);
 #endif
     const std::vector<std::string> args(argv + 1, argv + argc);
-    if (args.empty()) {
-        // A single-file bundle carries its program inside this executable.
+
+    // A single-file bundle carries its program inside this executable, so there is nothing
+    // to decide: the file is the application, and every argument belongs to it. Running the
+    // compiler's own command line instead would mean a bundled tool could not take
+    // arguments at all -- `app.exe --help` would answer with the compiler's help.
+    {
         const std::string self = acvm::vmExecutablePath();
         std::string payload;
         std::string payloadError;
         if (!self.empty() && acvm::readEmbeddedPayload(self, payload, payloadError)) {
             acvm::Driver driver(std::cout, std::cerr);
+            driver.setProgramArgs(args);
             return driver.runBytecodeFromMemory(payload.data(), payload.size(), self,
                                                 acvm::DriverOptions{});
         }
@@ -200,10 +219,12 @@ int main(int argc, char** argv) {
             std::cerr << "error: " << payloadError << '\n';
             return 1;
         }
+    }
 
-        // A directory bundle: this executable under the application's name, with the
-        // program beside it. Running it here rather than requiring `exec <file>` is what
-        // makes a bundle a double-click instead of a command line.
+    if (args.empty()) {
+        // A directory bundle with no arguments: the program sits beside the launcher under
+        // the same name, and running it here is what makes a bundle a double-click instead
+        // of a command line.
         const std::string sibling = siblingPayload(argc > 0 ? argv[0] : "");
         std::error_code error;
         if (!sibling.empty() && std::filesystem::exists(sibling, error)) {
@@ -212,6 +233,24 @@ int main(int argc, char** argv) {
         }
         printUsage(std::cout);
         return 0;
+    }
+
+    // The same directory bundle, invoked with arguments. Every argument belongs to the
+    // program -- `MyApp.exe --help` is the application's help, and a launcher that answered
+    // with the compiler's would make a packaged command-line tool unable to take one.
+    //
+    // The exception is the compiler itself: `acvm.exe` beside an `acvm.acvm` is still the
+    // compiler, and its arguments are its own. That is a file someone would have to place
+    // deliberately, and the alternative -- deciding by whether the executable was renamed --
+    // would make the behaviour depend on the file name it was copied to.
+    if (executableStem(argc > 0 ? argv[0] : "") != "acvm") {
+        const std::string sibling = siblingPayload(argc > 0 ? argv[0] : "");
+        std::error_code error;
+        if (!sibling.empty() && std::filesystem::exists(sibling, error)) {
+            acvm::Driver driver(std::cout, std::cerr);
+            driver.setProgramArgs(args);
+            return driver.runBytecode(sibling, acvm::DriverOptions{});
+        }
     }
 
     const std::string command = args[0];
@@ -338,16 +377,18 @@ int main(int argc, char** argv) {
         return driver.checkSource(input, options);
     }
     if (command == "deps") {
-        // The modules a program reaches, one shared-library name per line, deduplicated.
+        // The modules a program reaches: the shared-library name, a tab, and the path of
+        // the file that declared it.
         //
         // Exists so that a packager written in Axiom can answer the same question the
         // native one answers by calling `Driver::dependencies()` directly. The list comes
         // from the import walk either way; what changes is only how it crosses the
         // boundary, and a line of text is the crossing that needs no bindings.
         //
-        // The compile is a check, not a build: nothing is written. Its output goes
-        // elsewhere because `check` reports success on stdout, and a caller reading this
-        // command's stdout is parsing a list -- one stray line makes every line suspect.
+        // The path is not decoration. A module that lives in the project rather than in
+        // the standard library keeps its shared object beside its own `.axd`, so a packer
+        // that knew only the name would look in the wrong directory and report a missing
+        // library that is right there.
         std::ostringstream quiet;
         acvm::Driver dependencyDriver(quiet, std::cerr);
         const int status = dependencyDriver.checkSource(input, options);
@@ -363,9 +404,20 @@ int main(int argc, char** argv) {
                 continue;
             }
             seen.push_back(dependency.library);
-            std::cout << dependency.library << '\n';
+            std::cout << dependency.library << '\t' << dependency.path << '\n';
         }
         return 0;
+    }
+    if (command == "verify") {
+        // Parses a module without running it, and says so with the exit code alone.
+        //
+        // A packager cannot verify by executing: a GUI program would open a window and one
+        // that reads input would block. What it can do is read the payload back through the
+        // same reader the VM uses, which catches truncation, a bad container version, and
+        // the case where what was written is not what was compiled.
+        std::ostringstream quiet;
+        acvm::Driver verifier(quiet, std::cerr);
+        return verifier.disassembleBytecode(input) == 0 ? 0 : 1;
     }
     if (command == "tokens") {
         return driver.dumpTokenStream(input);
