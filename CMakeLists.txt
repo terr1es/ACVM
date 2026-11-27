@@ -613,6 +613,21 @@ if(ACVM_BUILD_TESTS)
         acvm_add_script_check(cli_argv_check -- alpha -o beta --name gamma)
     endif()
 
+    # The peephole pass has to be seen to be working, not merely not to break anything.
+    #
+    # Every other test here compares what a program prints, and a pass that rewrites nothing
+    # keeps the output identical by construction -- which is how the pass spent an unknown
+    # amount of time reporting "0 rewrites" on every program while the interpreter executed
+    # a third more instructions than the work required. The disassembly cannot lie about it:
+    # `StepLocal` exists only because the increment fused, and `Swap` can only disappear
+    # because the return fused.
+    add_test(NAME optimize_check
+             COMMAND $<TARGET_FILE:acvm> ir
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/optimize_fixture.ax -O2)
+    set_tests_properties(optimize_check PROPERTIES
+        PASS_REGULAR_EXPRESSION "STEP_LOCAL"
+        FAIL_REGULAR_EXPRESSION "LOCAL_ADDR|SWAP")
+
     # Every other check invokes `acvm` with an absolute path, so the invocation form
     # was never a variable -- which is how a regression that dropped the importing
     # file's own directory for relative paths (`acvm run prog.ax`) got in: ctest

@@ -1,0 +1,29 @@
+//  optimize_fixture.ax -- the shapes the peephole pass exists to rewrite.
+//
+//  Not a program: a subject for `optimize_check`, which reads the -O2 disassembly of this
+//  file and asserts that the fused opcodes are there. The pass once reported "0 rewrites" on
+//  every program and nothing noticed, because every existing test compares what a program
+//  prints -- and a pass that does nothing keeps the output identical by construction.
+//
+//  Run:  acvm ir tests/optimize_fixture.ax -O2
+
+function fib(int n):int {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+    eof: pass;
+}
+
+function sumLoop():int {
+    int sum = 0;
+    for (int i = 0; i < 10; i++) {
+        sum = sum + i;
+    }
+    return sum;
+    eof: pass;
+}
+
+function main():void {
+    print(fib(10)); print("\n");
+    print(sumLoop()); print("\n");
+    eof: pass;
+}
