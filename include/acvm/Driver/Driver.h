@@ -103,8 +103,15 @@ public:
                               const DriverOptions& options = {});
     int disassembleBytecode(const std::string& path);
 
-private:
+    /// Compiles without running or writing anything, and hands back the module.
+    ///
+    /// Public because a tool that reports on a program -- how large it is, what its functions
+    /// cost -- needs the same module the VM would have run, and building it a second way would
+    /// be a second answer to "what did the compiler produce". Returns false with the
+    /// diagnostics already printed.
     bool compile(const std::string& path, Module& module, const DriverOptions& options);
+
+private:
 
     /// Loads `adb` next to the standard library and installs its hooks into the
     /// VM. Returns false with a message when `--adb` was requested but the library

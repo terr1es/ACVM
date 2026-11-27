@@ -335,7 +335,7 @@ if(WIN32 AND TARGET acvm_random)
     target_link_libraries(acvm_random PRIVATE bcrypt)
 endif()
 
-add_executable(acvm tools/acvm/main.cpp)
+add_executable(acvm tools/acvm/main.cpp tools/acvm/Tooling.cpp)
 target_link_libraries(acvm PRIVATE acvm_driver)
 
 # A release archive has to run on a machine that has never seen this toolchain. With the
@@ -371,7 +371,7 @@ foreach(module IN LISTS ACVM_EXTRALIB_MODULES)
     list(APPEND ACVM_STATIC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/extralib/${module}.c")
 endforeach()
 
-add_executable(acvm_static tools/acvm/main.cpp ${ACVM_STATIC_SOURCES})
+add_executable(acvm_static tools/acvm/main.cpp tools/acvm/Tooling.cpp ${ACVM_STATIC_SOURCES})
 target_link_libraries(acvm_static PRIVATE acvm_driver)
 set_target_properties(acvm_static PROPERTIES OUTPUT_NAME "acvm-static")
 # `--export-all-symbols` is a PE/COFF concept. An ELF or Mach-O image exports its
@@ -629,6 +629,41 @@ if(ACVM_BUILD_TESTS)
         PASS_REGULAR_EXPRESSION "STEP_LOCAL|STEP_JUMP"
         FAIL_REGULAR_EXPRESSION "LOCAL_ADDR|SWAP")
 
+    # The reporting commands. `size` and `doc` read a program without running it, so they can
+    # be checked against the same fixture without a golden file: what matters is that the
+    # numbers are there, that the table is sorted, and that a documented function produces a
+    # heading while an undocumented one does not.
+    add_test(NAME size_check
+             COMMAND $<TARGET_FILE:acvm> size
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/tooling_fixture.ax)
+    set_tests_properties(size_check PROPERTIES
+        PASS_REGULAR_EXPRESSION "largest: main"
+        FAIL_REGULAR_EXPRESSION "0 function")
+
+    add_test(NAME doc_check
+             COMMAND $<TARGET_FILE:acvm> doc
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/tooling_fixture.ax)
+    # `first` and `second` are documented with an adjacent comment; `third` has one separated by
+    # a blank line and `main` has none. Both must be absent, which is what makes this a check on
+    # the attachment rule rather than on "did it find some comments".
+    set_tests_properties(doc_check PROPERTIES
+        PASS_REGULAR_EXPRESSION "### .function first"
+        FAIL_REGULAR_EXPRESSION "function third")
+
+    # `init` writes files, so it runs in the build tree rather than beside the sources.
+    add_test(NAME init_check
+             COMMAND $<TARGET_FILE:acvm> init ${CMAKE_CURRENT_BINARY_DIR}/scaffold)
+    set_tests_properties(init_check PROPERTIES
+        PASS_REGULAR_EXPRESSION "tests/main_check.ax")
+
+    # The runner, checked against what `init` produces: discovery finds one file, it passes, and
+    # the exit code is 0 -- which is what a build script reads. A runner that printed the right
+    # words and exited 0 on a failure would pass a regex and fail its caller.
+    add_test(NAME test_cmd_check
+             COMMAND $<TARGET_FILE:acvm> test ${CMAKE_CURRENT_BINARY_DIR}/scaffold/tests)
+    set_tests_properties(test_cmd_check PROPERTIES
+        DEPENDS init_check
+        PASS_REGULAR_EXPRESSION "1/1 passed")
 
     # Every other check invokes `acvm` with an absolute path, so the invocation form
     # was never a variable -- which is how a regression that dropped the importing

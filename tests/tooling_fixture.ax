@@ -1,0 +1,40 @@
+//  tooling_fixture.ax -- read by `acvm size` and `acvm doc`, never executed.
+//
+//  Both commands read this file and report on it, so it needs the two properties they depend
+//  on: more than one function, so `size` has something to sort, and comment blocks attached to
+//  declarations, so `doc` has something to attach. The header above is deliberately separated
+//  from the first declaration by a blank line -- it is prose about the file, and a generator
+//  that attached it to `first` would be wrong in the way every real module would expose.
+
+//  Adds two numbers.
+//
+//  Documented with the double-slash style this tree actually uses, and across a blank comment
+//  line, which is the case a naive "take the previous comment line" reader gets wrong.
+function first(int a, int b):int {
+    return a + b;
+    eof: pass;
+}
+
+//  The larger of two numbers.
+function second(int a, int b):int {
+    if (a > b) { return a; }
+    return b;
+    eof: pass;
+}
+
+//  `third` below is undocumented on purpose, with the explanation separated from it by a blank
+//  line. The blank line is the point: attachment is adjacency, so this paragraph is prose about
+//  the file and must not become `third`'s documentation. If the generator ever starts attaching
+//  through blank lines, `doc_check` will show a `###` heading for `third` that should not exist.
+
+function third():int {
+    return 3;
+    eof: pass;
+}
+
+function main():void {
+    print(first(1, 2)); print("\n");
+    print(second(3, 4)); print("\n");
+    print(third()); print("\n");
+    eof: pass;
+}
