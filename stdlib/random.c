@@ -50,6 +50,19 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+// `getrandom` is declared in <sys/random.h>, which exists from glibc 2.25 -- the same
+// version the call site guards on. Leaving it out made the call an implicit declaration,
+// which C99 and later forbid and every current compiler treats as an error, so the
+// module built only where the declaration happened to arrive by another route.
+//
+// `__has_include` rather than a glibc version test: musl also provides the header, and
+// reporting a version is a property of libc while providing the header is a property
+// of the platform, which is what the include actually depends on.
+#if defined(__has_include)
+#if __has_include(<sys/random.h>)
+#include <sys/random.h>
+#endif
+#endif
 #endif
 
 /// One step of xorshift32. `*s` must be non-zero; a zero is replaced rather than
