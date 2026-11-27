@@ -36,10 +36,18 @@ option(ACVM_WERROR "Treat compiler warnings as errors" OFF)
 # Windows/MSVC and some MinGW builds report `AMD64`, Linux and macOS report `x86_64`, and
 # `x64` shows up from a few generators.
 string(TOUPPER "${CMAKE_SYSTEM_PROCESSOR}" ACVM_PROCESSOR_UPPER)
-if(ACVM_PROCESSOR_UPPER MATCHES "^(X86_64|AMD64|X64|EM64T)$")
-    set(ACVM_HOST_IS_X64 TRUE CACHE INTERNAL "Host executes x86-64 (JIT target)")
+# Two conditions, not one. The backend emits Microsoft x64 code, so an x86-64 Linux or
+# macOS host cannot run its output even though the architecture matches -- see the comment
+# on `kJitSupported` in `include/acvm/VM/Jit.h`. Gating only on the processor is what let
+# the JIT tests run on Linux and fail there, which looked like a broken test suite rather
+# than a backend that does not target that ABI.
+if(ACVM_PROCESSOR_UPPER MATCHES "^(X86_64|AMD64|X64|EM64T)$" AND WIN32)
+    set(ACVM_HOST_IS_X64 TRUE CACHE INTERNAL "Host can run the JIT's output")
 else()
-    set(ACVM_HOST_IS_X64 FALSE CACHE INTERNAL "Host executes x86-64 (JIT target)")
+    set(ACVM_HOST_IS_X64 FALSE CACHE INTERNAL "Host can run the JIT's output")
+    message(STATUS
+        "Skipping JIT tests: the backend emits x86-64 Microsoft ABI code, and this "
+        "platform is ${CMAKE_SYSTEM_PROCESSOR} / ${CMAKE_SYSTEM_NAME}")
 endif()
 
 if(MSVC)
@@ -476,10 +484,6 @@ if(ACVM_BUILD_TESTS)
         target_include_directories(test_jit_assembler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(test_jit_assembler PRIVATE acvm_jit)
         add_test(NAME test_jit_assembler COMMAND test_jit_assembler)
-    else()
-        message(STATUS
-            "Skipping JIT tests: this host is ${CMAKE_SYSTEM_PROCESSOR}, and the JIT emits "
-            "x86-64 machine code only")
     endif()
 
     # Script checks come in two flavours.

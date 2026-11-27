@@ -37,10 +37,24 @@ enum class JitMode {
 /// hosts. The CLI turns an explicit `--jit` there into an error rather than a silent
 /// fallback, because asking for the JIT and silently getting the interpreter reads as
 /// "the JIT made no difference".
-#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
-inline constexpr bool kTargetIsX64 = true;
+/// A second constraint sits on top of the architecture, and it is the one that is easy to
+/// miss: the generated code uses the **Microsoft x64** convention -- arguments in
+/// RCX, RDX, R8, R9, 32 bytes of shadow space reserved by every caller, and a return value
+/// in RAX. System V, which is what Linux and macOS x86-64 use, passes arguments in RDI,
+/// RSI, RDX, RCX, R8, R9 and reserves no shadow space.
+///
+/// So an x86-64 Linux or macOS host is *not* a target, even though the encoder would
+/// produce bytes for it. Those bytes would call the VM's C++ entry points with the
+/// arguments in registers the callee never reads, and the callee would return whatever
+/// happened to be in RAX. That is worse than a refusal: the first differential test to
+/// run found it, but only because `func_check_jitdiff` compares output.
+///
+/// `kTargetIsX64` was the old name and it was the reason this went unnoticed -- the check
+/// answered a narrower question than the code required.
+#if (defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)) && defined(_WIN32)
+inline constexpr bool kJitSupported = true;
 #else
-inline constexpr bool kTargetIsX64 = false;
+inline constexpr bool kJitSupported = false;
 #endif
 
 /// The calling convention shared by the VM and generated code.

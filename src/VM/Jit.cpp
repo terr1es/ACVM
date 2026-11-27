@@ -288,10 +288,10 @@ void emitWidthCheck(X64Assembler& assembler, X64Assembler::Label trapExit,
 std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                                                      const Function& function,
                                                      std::string& whyNot) {
-    if (!kTargetIsX64) {
-        // First check, so the reason names the real cause on any non-x86-64 host. Every
-        // other refusal below would be about the program rather than about the machine.
-        whyNot = "no JIT for this architecture (x86-64 only)";
+    if (!kJitSupported) {
+        // First check, so the reason names the real cause on any host that cannot run the
+        // output. Every other refusal below would be about the program, not the machine.
+        whyNot = "no JIT for this platform (the backend emits x86-64 Microsoft ABI code)";
         return nullptr;
     }
     if (function.isExternal()) {
