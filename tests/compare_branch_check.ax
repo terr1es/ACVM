@@ -1,0 +1,90 @@
+//  compare_branch_check.ax -- every comparison, every operand kind, through the fused form.
+//
+//  `CMP_BRANCH` replaces `LT; JUMP_IF_FALSE`, and it packs the comparison and the operand type
+//  into one operand. A packing mistake does not crash: it silently compares the wrong thing,
+//  or compares as the wrong width. Both are visible only as a wrong answer somewhere far
+//  away -- the first attempt at a related fusion in this VM truncated int64 values to 32 bits
+//  and was found by an unrelated test.
+//
+//  So this file asks every comparison to answer for itself, at the widths the language has,
+//  in the shape that produces the fused instruction: a comparison as the condition of a
+//  branch.
+//
+//  Run:  acvm run tests/compare_branch_check.ax
+
+function fail(string what):void {
+    print("MISMATCH: "); print(what); print("\n");
+    trap();
+    eof: pass;
+}
+
+// Each of these has the comparison directly in a branch, which is what makes it fusable.
+function ltI32(int a, int b):bool { if (a < b) { return true; } return false; eof: pass; }
+function leI32(int a, int b):bool { if (a <= b) { return true; } return false; eof: pass; }
+function gtI32(int a, int b):bool { if (a > b) { return true; } return false; eof: pass; }
+function geI32(int a, int b):bool { if (a >= b) { return true; } return false; eof: pass; }
+function eqI32(int a, int b):bool { if (a == b) { return true; } return false; eof: pass; }
+function neI32(int a, int b):bool { if (a != b) { return true; } return false; eof: pass; }
+
+function ltI64(int64 a, int64 b):bool { if (a < b) { return true; } return false; eof: pass; }
+function gtI64(int64 a, int64 b):bool { if (a > b) { return true; } return false; eof: pass; }
+function eqI64(int64 a, int64 b):bool { if (a == b) { return true; } return false; eof: pass; }
+
+function ltF64(float a, float b):bool { if (a < b) { return true; } return false; eof: pass; }
+function geF64(float a, float b):bool { if (a >= b) { return true; } return false; eof: pass; }
+
+/// A comparison inside a loop, which is the shape whose header this instruction replaces.
+/// The count is returned so the boundary conditions cannot pass by accident.
+function countBelow(int limit):int {
+    int n = 0;
+    for (int i = 0; i < limit; i++) { n = n + 1; }
+    return n;
+    eof: pass;
+}
+
+function countAbove(int start, int limit):int {
+    int n = 0;
+    for (int i = start; i > limit; i--) { n = n + 1; }
+    return n;
+    eof: pass;
+}
+
+function main():void {
+    // 32 bit signed: every comparison, both sides of equality, and negative operands.
+    if (!ltI32(-5, 3)) { fail("ltI32 negative"); }
+    if (ltI32(3, -5)) { fail("ltI32 reversed"); }
+    if (ltI32(4, 4)) { fail("ltI32 equal"); }
+    if (!leI32(4, 4)) { fail("leI32 equal"); }
+    if (leI32(5, 4)) { fail("leI32 greater"); }
+    if (!gtI32(-1, -2)) { fail("gtI32 negatives"); }
+    if (gtI32(-2, -1)) { fail("gtI32 reversed"); }
+    if (!geI32(-2, -2)) { fail("geI32 equal"); }
+    if (!eqI32(-7, -7)) { fail("eqI32 negatives"); }
+    if (eqI32(-7, 7)) { fail("eqI32 sign"); }
+    if (!neI32(-7, 7)) { fail("neI32"); }
+    if (neI32(0, 0)) { fail("neI32 equal"); }
+
+    // 64 bit: the width that a mis-packed operand type would truncate.
+    int64 big = 5000000000;
+    if (!ltI64(4000000000, big)) { fail("ltI64 truncation"); }
+    if (ltI64(big, 4000000000)) { fail("ltI64 reversed"); }
+    if (!gtI64(big, 4000000000)) { fail("gtI64 truncation"); }
+    if (!eqI64(big, 5000000000)) { fail("eqI64 truncation"); }
+    if (eqI64(big, 705032704)) { fail("eqI64 compared as 32 bit"); }
+
+    // Floating point, which takes a different path inside the same instruction.
+    if (!ltF64(0.5, 1.5)) { fail("ltF64"); }
+    if (ltF64(1.5, 0.5)) { fail("ltF64 reversed"); }
+    if (!geF64(1.5, 1.5)) { fail("geF64 equal"); }
+    if (geF64(-0.5, 0.0)) { fail("geF64 negatives"); }
+
+    // Loops: zero iterations, one iteration, and the boundary itself.
+    if (countBelow(0) != 0) { fail("countBelow(0)"); }
+    if (countBelow(1) != 1) { fail("countBelow(1)"); }
+    if (countBelow(100) != 100) { fail("countBelow(100)"); }
+    if (countAbove(100, 0) != 100) { fail("countAbove(100, 0)"); }
+    if (countAbove(0, 0) != 0) { fail("countAbove(0, 0)"); }
+
+    print("done\n");
+    eof: pass;
+}

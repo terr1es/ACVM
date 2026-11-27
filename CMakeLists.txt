@@ -602,7 +602,8 @@ if(ACVM_BUILD_TESTS)
                             fmt_check sort_index_check os_check sync_check
                             parallel_check threadpool_check generics_check union_check
                             generic_struct_check address_assign_check
-                            ternary_check int128_check methods_check ${ACVM_EXTRALIB_CHECKS})
+                            ternary_check int128_check methods_check
+                            compare_branch_check ${ACVM_EXTRALIB_CHECKS})
         acvm_add_script_check(${check_name})
     endforeach()
 
@@ -625,8 +626,9 @@ if(ACVM_BUILD_TESTS)
              COMMAND $<TARGET_FILE:acvm> ir
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/optimize_fixture.ax -O2)
     set_tests_properties(optimize_check PROPERTIES
-        PASS_REGULAR_EXPRESSION "STEP_LOCAL"
+        PASS_REGULAR_EXPRESSION "STEP_LOCAL|STEP_JUMP"
         FAIL_REGULAR_EXPRESSION "LOCAL_ADDR|SWAP")
+
 
     # Every other check invokes `acvm` with an absolute path, so the invocation form
     # was never a variable -- which is how a regression that dropped the importing

@@ -112,6 +112,37 @@ enum class OpCode : std::uint8_t {
     /// Traps on a negative exponent (no integer result) and on overflow, so the
     /// exponentiation does not need a wrapping variant.
     Pow,
+
+    /// Compare two stack values and branch, replacing a comparison followed by a conditional
+    /// jump.
+    ///
+    /// `a` is the jump target. `b` packs three fields, because an `Instruction` has two
+    /// operands and this fuses three instructions into one:
+    ///
+    ///     bits 0-7    memType index
+    ///     bits 8-10   which comparison, in the order Eq, Ne, Lt, Le, Gt, Ge
+    ///     bit  11     branch when the comparison is *true* rather than false
+    ///
+    /// The direction bit exists because both `JUMP_IF_TRUE` and `JUMP_IF_FALSE` are emitted.
+    /// Inverting the comparison instead would be equivalent -- all six have a complement in
+    /// the set -- but it would make the fused instruction not a faithful record of what the
+    /// two original instructions did, and the disassembly is read by people.
+    ///
+    /// The shape it replaces is the header of every loop, so it is four instructions of every
+    /// iteration: `LOAD_LOCAL i; CONST_INT N; LT; JUMP_IF_FALSE`. Appended at the end of the
+    /// enum for the reason given above `Pow`.
+    CompareBranch,
+
+    /// `STEP_LOCAL; JUMP` -- step a local by one and jump.
+    ///
+    /// This is the closing pair of every `for` loop: the third clause is a step, and the loop
+    /// ends with a jump back to its header. `a` is the jump target -- kept in `a` because every
+    /// other branch in this instruction set puts it there, and `jumpTargets`/`compact` rely on
+    /// that. `b` packs what the step needs; see `stepJump` below.
+    ///
+    /// Only ±1 is encoded, and the peephole refuses anything else: a general delta would not
+    /// fit beside the slot and the type, and the loops worth fusing count by one.
+    StepJump,
 };
 
 enum class TrapKind : std::int32_t {
@@ -138,6 +169,94 @@ enum class TrapKind : std::int32_t {
 
 std::string_view opCodeName(OpCode op);
 const char* trapKindName(TrapKind kind);
+
+//===--- CompareBranch operand packing -----------------------------------===//
+//
+// Named rather than written by hand at each site: the two halves of this encoding are set in
+// the optimizer and read in the VM and the disassembler, and a mask that disagrees by one bit
+// between them is a wrong comparison rather than a crash.
+namespace compareBranch {
+
+inline constexpr int kMemTypeShift = 0;
+inline constexpr int kComparisonShift = 8;
+inline constexpr int kBranchOnTrueShift = 11;
+
+inline constexpr std::int32_t kMemTypeMask = 0xFF;
+inline constexpr std::int32_t kComparisonMask = 0x7 << kComparisonShift;
+
+/// The comparisons this instruction can carry, in the order the packed field stores them.
+enum class Comparison : std::int32_t { Eq = 0, Ne = 1, Lt = 2, Le = 3, Gt = 4, Ge = 5 };
+
+[[nodiscard]] inline OpCode toOpCode(Comparison comparison) {
+    switch (comparison) {
+    case Comparison::Eq: return OpCode::Eq;
+    case Comparison::Ne: return OpCode::Ne;
+    case Comparison::Lt: return OpCode::Lt;
+    case Comparison::Le: return OpCode::Le;
+    case Comparison::Gt: return OpCode::Gt;
+    case Comparison::Ge: return OpCode::Ge;
+    }
+    return OpCode::Eq;
+}
+
+[[nodiscard]] inline std::int32_t pack(int memType, Comparison comparison, bool branchOnTrue) {
+    return ((memType & kMemTypeMask) << kMemTypeShift) |
+           ((static_cast<std::int32_t>(comparison) << kComparisonShift) & kComparisonMask) |
+           (branchOnTrue ? (1 << kBranchOnTrueShift) : 0);
+}
+
+[[nodiscard]] inline int memTypeOf(std::int32_t b) {
+    return (b >> kMemTypeShift) & kMemTypeMask;
+}
+[[nodiscard]] inline Comparison comparisonOf(std::int32_t b) {
+    return static_cast<Comparison>((b & kComparisonMask) >> kComparisonShift);
+}
+[[nodiscard]] inline bool branchesOnTrue(std::int32_t b) {
+    return (b & (1 << kBranchOnTrueShift)) != 0;
+}
+
+} // namespace compareBranch
+
+//===--- StepJump operand packing ----------------------------------------===//
+//
+// `b` carries three fields, because a 32 bit operand is all there is and a step needs to know
+// where it writes, what width it writes at, and which direction it counts:
+//
+//     bits 0-23    frame offset              (frames up to 16 MB)
+//     bits 24-29   memType index             (64 distinct types)
+//     bit  30      step is negative
+//
+// The optimizer refuses to fuse anything that does not fit, rather than truncating: a loop
+// whose counter lives 16 MB into a frame, or whose type is the 65th interned one, keeps the
+// unfused pair and runs at the old speed. Silently masking here would be the third variant of
+// the mistake that truncated int64 values in an earlier fusion.
+namespace stepJump {
+
+inline constexpr int kSlotBits = 24;
+inline constexpr std::int32_t kSlotMask = (1 << kSlotBits) - 1;
+inline constexpr int kMemTypeShift = kSlotBits;
+inline constexpr std::int32_t kMemTypeMask = 0x3F << kMemTypeShift;
+inline constexpr std::int32_t kNegativeStepBit = 1 << 30;
+inline constexpr int kMaxMemType = 0x3F;
+
+/// True when this instruction can carry the requested step. False means "do not fuse".
+[[nodiscard]] inline bool encodable(std::int32_t slot, int memType) {
+    return slot >= 0 && slot <= kSlotMask && memType >= 0 && memType <= kMaxMemType;
+}
+
+[[nodiscard]] inline std::int32_t pack(std::int32_t slot, int memType, bool negative) {
+    return (slot & kSlotMask) | ((memType << kMemTypeShift) & kMemTypeMask) |
+           (negative ? kNegativeStepBit : 0);
+}
+[[nodiscard]] inline std::int32_t slotOf(std::int32_t b) { return b & kSlotMask; }
+[[nodiscard]] inline int memTypeOf(std::int32_t b) {
+    return (b & kMemTypeMask) >> kMemTypeShift;
+}
+[[nodiscard]] inline bool isNegative(std::int32_t b) {
+    return (b & kNegativeStepBit) != 0;
+}
+
+} // namespace stepJump
 
 struct Instruction {
     OpCode op = OpCode::Halt;

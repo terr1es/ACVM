@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <ostream>
 #include <vector>
 
@@ -39,8 +40,17 @@ namespace {
 
 //===--- helpers ---------------------------------------------------------===//
 
+/// True for every instruction whose `a` operand is a jump target.
+///
+/// **This list has to be complete.** It is asked three different questions -- does this
+/// instruction carry a target that must be remapped by `compact`, is its destination
+/// reachable, and may control leave here -- and a missing entry answers all three wrongly.
+/// `CompareBranch` was missing on the first attempt and the symptom was not a wrong jump but
+/// a deleted program: `removeUnreachable` walked from index 0, saw no branch out of the loop,
+/// and removed everything after it.
 bool isJump(OpCode op) {
-    return op == OpCode::Jump || op == OpCode::JumpIfFalse || op == OpCode::JumpIfTrue;
+    return op == OpCode::Jump || op == OpCode::JumpIfFalse || op == OpCode::JumpIfTrue ||
+           op == OpCode::CompareBranch || op == OpCode::StepJump;
 }
 
 /// True when control does not fall through to the next instruction. `Trap`
@@ -71,9 +81,45 @@ bool isBarrier(OpCode op) {
 }
 
 /// A push with no observable effect when its result is immediately discarded.
+/// The frame slot an instruction writes, or -1 when it writes none.
+///
+/// One place to answer "does this instruction change a local", so that adding an opcode is one
+/// edit rather than an exercise in finding every pass that cared. Both bugs of this shape so
+/// far -- `StepLocal` originally, then `StepJump` after it -- were a pass that kept a value
+/// alive across an instruction it did not know wrote it.
+///
+/// Deliberately narrow: it reports the slot an instruction is *known* to write, and says
+/// nothing about the ones that write through a pointer. Callers that need soundness for
+/// escaping addresses must still treat `LocalAddr` and calls as clobbering everything.
+[[nodiscard]] std::int32_t writesSlot(const Instruction& ins) {
+    switch (ins.op) {
+    case OpCode::StoreLocal:
+        return ins.a;
+    case OpCode::StepLocal:
+        return ins.a;
+    case OpCode::StepJump:
+        return stepJump::slotOf(ins.b);
+    default:
+        return -1;
+    }
+}
+
 bool isPurePush(OpCode op) {
     return op == OpCode::ConstInt || op == OpCode::ConstFloat || op == OpCode::ConstStr ||
            op == OpCode::LocalAddr || op == OpCode::GlobalAddr || op == OpCode::Dup;
+}
+
+/// The comparison `op` performs, if it is one. The inverse of `compareBranch::toOpCode`.
+[[nodiscard]] std::optional<compareBranch::Comparison> comparisonOf(OpCode op) {
+    switch (op) {
+    case OpCode::Eq: return compareBranch::Comparison::Eq;
+    case OpCode::Ne: return compareBranch::Comparison::Ne;
+    case OpCode::Lt: return compareBranch::Comparison::Lt;
+    case OpCode::Le: return compareBranch::Comparison::Le;
+    case OpCode::Gt: return compareBranch::Comparison::Gt;
+    case OpCode::Ge: return compareBranch::Comparison::Ge;
+    default: return std::nullopt;
+    }
 }
 
 const Value* constantAt(const Function& fn, std::int32_t index) {
@@ -388,6 +434,55 @@ int peephole(Function& fn, int& forwardedOut) {
                 continue;
             }
 
+            // `LT; JUMP_IF_FALSE` -> `CMP_BRANCH`.
+            //
+            // The header of every loop, and four instructions of every iteration. The fused
+            // form keeps the comparison's memType and direction inside `b`, so what runs is
+            // the same `computeBinary` the pair ran.
+            //
+            // Only when the comparison is not a jump target itself: a jump landing on the
+            // `LT` would otherwise arrive at an instruction that also consumes the branch
+            // target, which the original pair did not.
+            if (i + 1 < n && !drop[i + 1] && !targets[i + 1] &&
+                (second.op == OpCode::JumpIfFalse || second.op == OpCode::JumpIfTrue)) {
+                const auto comparison = comparisonOf(first.op);
+                if (comparison.has_value()) {
+                    fn.code[i] = Instruction{
+                        OpCode::CompareBranch, second.a,
+                        compareBranch::pack(first.a, *comparison,
+                                            second.op == OpCode::JumpIfTrue)};
+                    drop[i + 1] = 1;
+                    changes += 1;
+                    i += 2;
+                    continue;
+                }
+            }
+
+            // `STEP_LOCAL; JUMP` -> `STEP_JUMP`.
+            //
+            // The closing pair of a `for` loop. Fusing it is what takes a loop iteration from
+            // five instructions to four, and a loop is where a program spends its time.
+            //
+            // Only ±1 steps, and only when the slot, the type and the negation fit the packed
+            // operand -- `stepJump::encodable` is the check, and refusing means the pair stays
+            // as it was. The delta lives in the high bits of `StepLocal`'s `b`, where an
+            // arithmetic shift keeps the sign; it is read back the same way here.
+            if (first.op == OpCode::StepLocal && second.op == OpCode::Jump &&
+                !targets[i + 1]) {
+                const std::int32_t delta = second.op == OpCode::Jump ? (first.b >> 8) : 0;
+                const int memType = first.b & 0xFF;
+                if ((delta == 1 || delta == -1) &&
+                    stepJump::encodable(first.a, memType)) {
+                    fn.code[i] = Instruction{
+                        OpCode::StepJump, second.a,
+                        stepJump::pack(first.a, memType, delta < 0)};
+                    drop[i + 1] = 1;
+                    changes += 1;
+                    i += 2;
+                    continue;
+                }
+            }
+
             // Address-then-dereference, the pair the fused opcodes exist for.
             if (first.op == OpCode::LocalAddr && second.op == OpCode::Load) {
                 fn.code[i] = Instruction{OpCode::LoadLocal, first.a, second.a};
@@ -519,18 +614,20 @@ int propagateLocals(Function& fn) {
                 addEdge(i, static_cast<std::size_t>(ins.a));
             }
             break;
-        case OpCode::JumpIfFalse:
-        case OpCode::JumpIfTrue:
-            if (ins.a >= 0) {
-                addEdge(i, static_cast<std::size_t>(ins.a));
-            }
-            addEdge(i, i + 1);
-            break;
         case OpCode::Ret:
         case OpCode::Halt:
         case OpCode::Trap:
             break;   // no successors
         default:
+            // A conditional branch has two successors; everything else falls through.
+            // Written as `isJump` rather than by naming the branch opcodes again, because
+            // this list has already been out of date once: `CompareBranch` was added and this
+            // switch still sent it down the fall-through arm, so the loop's back edge went
+            // missing and the forwarder drew conclusions from a graph that did not contain it.
+            // One predicate, asked everywhere, cannot disagree with itself.
+            if (isJump(ins.op) && ins.a >= 0) {
+                addEdge(i, static_cast<std::size_t>(ins.a));
+            }
             addEdge(i, i + 1);
             break;
         }
@@ -611,6 +708,19 @@ int propagateLocals(Function& fn) {
             // optimization: the loop counter would be replaced by the constant it
             // started at, and the loop would run the wrong number of times.
             clearSlot(out, ins.a);
+        } else if (ins.op == OpCode::StepJump) {
+            // Same write, but the slot is packed into `b` because `a` carries the jump
+            // target. Leaving it out reproduced the bug the comment above describes, in the
+            // same pass, one opcode later: the header's `LOAD_LOCAL i` was replaced by the
+            // constant the loop started from, and `for (i = 0; i < 5; i++)` printed `0`
+            // forever.
+            //
+            // The lesson is not "remember StepJump here" -- it is that a pass which must know
+            // about every writer will be told about the next one late. `writesSlot` below is
+            // the single place that answers the question now.
+            if (const std::int32_t written = writesSlot(ins); written >= 0) {
+                clearSlot(out, written);
+            }
         } else if (ins.op == OpCode::CopyStep) {
             // Steps *both* pointer slots after copying through them.
             clearSlot(out, ins.a);

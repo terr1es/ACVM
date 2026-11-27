@@ -139,6 +139,21 @@ void formatInstruction(const Module& module, const Function& function, std::size
     case OpCode::Cast:
         out << memTypeText(module, inst.a) << " -> " << memTypeText(module, inst.b);
         break;
+    case OpCode::StepJump:
+        out << "frame+" << stepJump::slotOf(inst.b) << ' '
+            << memTypeText(module, stepJump::memTypeOf(inst.b)) << ' '
+            << (stepJump::isNegative(inst.b) ? "-= 1" : "+= 1") << " goto " << inst.a;
+        break;
+    case OpCode::CompareBranch: {
+        // Printed as the pair it stands for, so the disassembly reads the way the source
+        // does: `if a < b goto 20` rather than three packed numbers.
+        static const char* const kNames[] = {"==", "!=", "<", "<=", ">", ">="};
+        const auto comparison = compareBranch::comparisonOf(inst.b);
+        out << memTypeText(module, compareBranch::memTypeOf(inst.b)) << ' '
+            << kNames[static_cast<int>(comparison)] << ' '
+            << (compareBranch::branchesOnTrue(inst.b) ? "goto " : "else goto ") << inst.a;
+        break;
+    }
     case OpCode::MemEq:
         out << inst.a << " bytes";
         break;
