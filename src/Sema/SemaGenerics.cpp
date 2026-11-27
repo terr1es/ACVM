@@ -36,6 +36,12 @@
 #include "acvm/Common/Diagnostic.h"
 #include "acvm/Sema/Sema.h"
 
+// `std::find` lives in <algorithm>. It used to arrive through libc++'s <memory>, so
+// this file compiled on the one toolchain it was built with and failed under libstdc++
+// with "no matching function for call to find" -- the only candidate left was the
+// istreambuf_iterator overload that <string> pulls in. Named explicitly so the
+// dependency is visible instead of inherited.
+#include <algorithm>
 #include <functional>
 #include <string>
 

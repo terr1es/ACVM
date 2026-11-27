@@ -10,11 +10,16 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
 #else
+// POSIX. macOS needs these as much as Linux does: `dlopen` and friends are
+// declared in <dlfcn.h> and `readlink` in <unistd.h> on both. The Apple branch
+// used to include only <mach-o/dyld.h>, which happens to work when the SDK
+// pulls the others in transitively and stops working when it does not.
 #include <dlfcn.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 #include <algorithm>
