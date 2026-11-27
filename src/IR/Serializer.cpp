@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -217,7 +218,12 @@ bool saveModule(const Module& module, const std::string& path, std::string& erro
             writeI32(out, function.externalReturnKind);
             writeU32(out, static_cast<std::uint32_t>(function.externalParams.size()));
             for (const ExternalParam& param : function.externalParams) {
-                writeU8(out, param.isArray ? 1 : 0);
+                // Bit 0 is `isArray`, bit 1 is `isString`. Packing them into one byte
+                // rather than adding a second keeps the record the same size, so a file
+                // written before this bit existed still reads back with `isString` false
+                // instead of shifting every following field.
+                writeU8(out, static_cast<std::uint8_t>((param.isArray ? 1 : 0) |
+                                                       (param.isString ? 2 : 0)));
                 writeU32(out, param.elemSize);
             }
         }
@@ -272,22 +278,23 @@ bool saveModule(const Module& module, const std::string& path, std::string& erro
     return true;
 }
 
-bool loadModule(Module& module, const std::string& path, std::string& error) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        error = "cannot open '" + path + "'";
-        return false;
-    }
-
+/// Reads a module from a stream.
+///
+/// Shared by the file and memory entry points rather than duplicated, because a container
+/// format that parses one way from disk and another from memory is two formats. `name` is
+/// only used in diagnostics: it is what the reader calls the thing it is looking at, and a
+/// payload embedded in an executable has no path of its own.
+static bool loadModuleStream(std::istream& in, const std::string& name, Module& module,
+                             std::string& error) {
     char magic[4] = {};
     if (!in.read(magic, 4) || std::memcmp(magic, kModuleMagic, 4) != 0) {
-        error = "'" + path + "' is not an ACVM module";
+        error = "'" + name + "' is not an ACVM module";
         return false;
     }
 
     std::uint32_t version = 0;
     if (!readU32(in, version)) {
-        error = "unexpected end of file in '" + path + "'";
+        error = "unexpected end of file in '" + name + "'";
         return false;
     }
     if (version != kModuleVersion) {
@@ -410,12 +417,18 @@ bool loadModule(Module& module, const std::string& path, std::string& error) {
             }
             function.externalParams.resize(externalParamCount);
             for (ExternalParam& param : function.externalParams) {
-                std::uint8_t isArray = 0;
-                if (!readU8(in, isArray) || !readU32(in, param.elemSize)) {
+                std::uint8_t bits = 0;
+                if (!readU8(in, bits) || !readU32(in, param.elemSize)) {
                     error = "truncated external parameter table";
                     return false;
                 }
-                param.isArray = isArray != 0;
+                param.isArray = (bits & 1) != 0;
+                // Without this the plan says "one scalar" for what is really a string, so
+                // the callee is handed the VM's descriptor address where it expects
+                // characters. `acvm run` marshals correctly because it never round-trips
+                // through the file; `acvm exec` did, and crashed on the first call that
+                // took a `string`.
+                param.isString = (bits & 2) != 0;
             }
         }
 
@@ -509,10 +522,33 @@ bool loadModule(Module& module, const std::string& path, std::string& error) {
     }
 
     if (module.entryPoint < 0) {
-        error = "'" + path + "' does not define 'main'";
+        error = "'" + name + "' does not define 'main'";
         return false;
     }
     return true;
+}
+
+bool loadModule(Module& module, const std::string& path, std::string& error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        error = "cannot open '" + path + "'";
+        return false;
+    }
+    return loadModuleStream(in, path, module, error);
+}
+
+bool loadModuleFromMemory(Module& module, const void* data, std::size_t size,
+                          const std::string& name, std::string& error) {
+    if (data == nullptr || size == 0) {
+        error = "'" + name + "' is empty";
+        return false;
+    }
+    // Copied into a stream rather than parsed in place. A module is kilobytes, the copy is
+    // paid once at startup, and reusing the one reader is worth more than the allocation:
+    // a second parser over a raw pointer is where the two entry points would start to
+    // disagree about bounds.
+    std::istringstream in(std::string(static_cast<const char*>(data), size));
+    return loadModuleStream(in, name, module, error);
 }
 
 } // namespace acvm

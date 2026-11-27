@@ -1,12 +1,19 @@
 //===--- main.cpp - The acvm command line driver -----------------------===//
 #include "acvm/Driver/CommandLine.h"
 #include "acvm/Driver/Driver.h"
+#include "acvm/Driver/Payload.h"
 #include "acvm/VM/Jit.h"
+#include "acvm/VM/VM.h"
 
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -60,6 +67,57 @@ std::string withExtension(const std::string& path, const std::string& extension)
     return path.substr(0, dot) + extension;
 }
 
+/// The directory holding this executable, or an empty path when it cannot be determined.
+///
+/// From the module rather than `argv[0]`: a bare `acvm` found on `PATH` carries no
+/// directory, and a relative one is relative to the caller's working directory.
+std::string executableDir() {
+#if defined(_WIN32)
+    wchar_t buffer[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+    if (length == 0 || length == MAX_PATH) {
+        return {};
+    }
+    const std::wstring wide(buffer, length);
+    // The function returns the executable's full path, not its directory -- the first
+    // version of this returned it unchanged and produced `<exe>/<name>.acvm`.
+    return std::filesystem::path(wide).parent_path().string();
+#else
+    std::error_code error;
+    const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", error);
+    return error ? std::string() : self.parent_path().string();
+#endif
+}
+
+/// The payload a packaged application carries beside it, or an empty path.
+///
+/// A bundle is this executable renamed to the application's name, with `<name>.acvm` in the
+/// same directory -- `MyApp.exe` next to `MyApp.acvm`. The check is on the *sibling file*,
+/// not on this executable's own name: nothing here needs to know that it was renamed, and a
+/// rule keyed on the name would break the moment someone renamed the tool itself.
+///
+/// Only consulted when no arguments were given, so `acvm run x.ax` in a directory that
+/// happens to contain `acvm.acvm` still does what was typed.
+std::string siblingPayload(const std::string& argv0) {
+    std::string dir = executableDir();
+    std::string name = argv0;
+    const std::size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        name = name.substr(slash + 1);
+    }
+    if (dir.empty()) {
+        dir = ".";
+    }
+    const std::size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos) {
+        name = name.substr(0, dot);
+    }
+    if (name.empty()) {
+        return {};
+    }
+    return withExtension(dir + "/" + name, ".acvm");
+}
+
 int usageError(const std::string& message) {
     std::cerr << "acvm: " << message << "\n\n";
     printUsage(std::cerr);
@@ -69,7 +127,29 @@ int usageError(const std::string& message) {
 } // namespace
 
 #ifdef _WIN32
-#include <windows.h>
+/// Points the console at UTF-8 before anything is printed.
+///
+/// Axiom strings are UTF-8 bytes -- `string` is a `{ptr,len}` pair over raw bytes and
+/// nothing in the VM ever transcodes. A Windows console, however, interprets whatever
+/// bytes it is handed according to its own code page, which on a Chinese system defaults
+/// to 936 (GBK). Every non-ASCII character then comes out as mojibake: `中文` is nine
+/// bytes of UTF-8 read as nine GBK lead/trail bytes, and the result is not recoverable by
+/// the reader.
+///
+/// Setting the code page here rather than transcoding at every write keeps one rule:
+/// **what the language stores is what goes out**. A redirected stream is unaffected --
+/// `SetConsoleOutputCP` only changes how a console renders bytes, so a file written by
+/// `acvm` stays UTF-8, which is what every tool downstream expects.
+///
+/// Input is switched for the same reason in the other direction: `readLineInto` reads
+/// bytes from stdin, and under CP936 a typed `中` arrives as GBK. Leaving input at the
+/// system default would mean the same program sees UTF-8 from a file and GBK from a
+/// keyboard.
+static void useUtf8Console() {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+}
+
 /// 崩溃时把异常码、访问类型和目标地址打到 stderr，而不是让进程静默消失。
 ///
 /// 保留它是因为一个真实的教训：`parallel` 的线程池有一个偶发崩溃，表现是
@@ -97,10 +177,37 @@ static LONG WINAPI acvmCrashFilter(EXCEPTION_POINTERS* info) {
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
+    useUtf8Console();
     SetUnhandledExceptionFilter(acvmCrashFilter);
 #endif
     const std::vector<std::string> args(argv + 1, argv + argc);
     if (args.empty()) {
+        // A single-file bundle carries its program inside this executable.
+        const std::string self = acvm::vmExecutablePath();
+        std::string payload;
+        std::string payloadError;
+        if (!self.empty() && acvm::readEmbeddedPayload(self, payload, payloadError)) {
+            acvm::Driver driver(std::cout, std::cerr);
+            return driver.runBytecodeFromMemory(payload.data(), payload.size(), self,
+                                                acvm::DriverOptions{});
+        }
+        if (!payloadError.empty()) {
+            // A footer that does not match the file is worth reporting: running the usage
+            // text instead would leave the reader wondering why their application printed
+            // a compiler banner.
+            std::cerr << "error: " << payloadError << '\n';
+            return 1;
+        }
+
+        // A directory bundle: this executable under the application's name, with the
+        // program beside it. Running it here rather than requiring `exec <file>` is what
+        // makes a bundle a double-click instead of a command line.
+        const std::string sibling = siblingPayload(argc > 0 ? argv[0] : "");
+        std::error_code error;
+        if (!sibling.empty() && std::filesystem::exists(sibling, error)) {
+            acvm::Driver driver(std::cout, std::cerr);
+            return driver.runBytecode(sibling, acvm::DriverOptions{});
+        }
         printUsage(std::cout);
         return 0;
     }

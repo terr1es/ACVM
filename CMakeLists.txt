@@ -195,7 +195,8 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/OfficialExtraModules.h.in"
 
 add_library(acvm_driver STATIC
     src/Driver/Driver.cpp
-    src/Driver/CommandLine.cpp)
+    src/Driver/CommandLine.cpp
+    src/Driver/Payload.cpp)
 target_link_libraries(acvm_driver PUBLIC acvm_vm)
 target_include_directories(acvm_driver PRIVATE "${ACVM_GENERATED_DIR}")
 # Where `import (name)` looks after the importing file's own directory. The
@@ -317,6 +318,42 @@ if(MINGW)
     target_link_options(acvm PRIVATE -static)
 endif()
 add_dependencies(acvm ${ACVM_STDLIB_TARGETS} ${ACVM_EXTRALIB_TARGETS})
+
+# The statically linked runtime. `apack --single` copies this one instead of `acvm.exe`, so
+# the bundle needs no shared objects beside it: one file, no extraction, no temp directory.
+#
+# The standard library is compiled in rather than loaded, and every symbol it defines is
+# exported so `vmMainModule()` can resolve it. `--export-all-symbols` rather than a
+# generated .def: the set to export is exactly what the .c files define, and a list kept by
+# hand is a list that goes stale the first time a function is added.
+#
+# All ten modules are linked rather than only the ones a given program reaches. Selecting
+# per program would save a few hundred kilobytes and cost a link step at pack time -- which
+# needs a linker on the machine doing the packing, and that machine is the user's.
+set(ACVM_STATIC_SOURCES "")
+foreach(module IN LISTS ACVM_STDLIB_MODULES)
+    list(APPEND ACVM_STATIC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/stdlib/${module}.c")
+endforeach()
+foreach(module IN LISTS ACVM_EXTRALIB_MODULES)
+    list(APPEND ACVM_STATIC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/extralib/${module}.c")
+endforeach()
+
+add_executable(acvm_static tools/acvm/main.cpp ${ACVM_STATIC_SOURCES})
+target_link_libraries(acvm_static PRIVATE acvm_driver)
+set_target_properties(acvm_static PROPERTIES OUTPUT_NAME "acvm-static")
+target_link_options(acvm_static PRIVATE "LINKER:--export-all-symbols")
+
+# The same platform libraries the individual modules need, gathered here because this
+# binary contains all of them.
+if(Threads_FOUND)
+    target_link_libraries(acvm_static PRIVATE Threads::Threads)
+endif()
+if(WIN32)
+    target_link_libraries(acvm_static PRIVATE bcrypt ws2_32 psapi)
+endif()
+if(MINGW)
+    target_link_options(acvm_static PRIVATE -static)
+endif()
 
 # Copying the binaries and the shared libraries to a user directory is a
 # convenience, not part of building the project -- so it is its own target.

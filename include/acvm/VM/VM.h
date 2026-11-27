@@ -26,6 +26,14 @@ void* vmOpenLibrary(const std::string& name);
 void* vmLookupSymbol(void* handle, const std::string& symbol);
 void vmCloseLibrary(void* handle);
 
+/// Handle for the running executable, for looking up symbols in itself.
+///
+/// A statically linked build has no `io.dll` to open: the standard library is part of the
+/// executable and exported from it. Symbol resolution falls back to this handle so that
+/// such a build needs no separate code path -- the same `GetProcAddress` finds the same
+/// function, one module earlier.
+void* vmMainModule();
+
 /// Absolute path of the running executable, or "" when the platform will not say.
 ///
 /// Declared here rather than in a utility header because this is the one file that

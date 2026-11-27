@@ -48,6 +48,24 @@ struct DriverOptions {
     bool adbQuiet = false;
 };
 
+/// One module a compile pulled in, and where it was found.
+///
+/// Recorded by the same walk that resolves imports, which is the point: a packager that
+/// recomputed this from the sources would be a second implementation of module resolution,
+/// and the two would drift the first time a search rule changed. The compiler already knows
+/// the answer, so it says it.
+struct ModuleDependency {
+    /// The `library "name";` the module declares, empty when the module is pure Axiom.
+    /// A non-empty value names a shared library that must ship with the program.
+    std::string library;
+    /// Absolute path of the `.ax` / `.axd` file, which is also where a project-local
+    /// library's shared object lives.
+    std::string path;
+    /// `module "name" version "x.y.z";`, when the file declared one.
+    std::string module;
+    std::string version;
+};
+
 /// Wires the stages together:
 ///
 ///   source -> Lexer -> Parser -> Sema -> IRGen -> Module -> VM / container
@@ -56,6 +74,12 @@ struct DriverOptions {
 class Driver {
 public:
     Driver(std::ostream& out, std::ostream& err);
+
+    /// Every module the last compile loaded, in load order. Empty before a compile, and
+    /// left untouched by an entry point that failed before resolution.
+    [[nodiscard]] const std::vector<ModuleDependency>& dependencies() const {
+        return m_dependencies;
+    }
 
     /// Program arguments given after `--`; visible to the program through
     /// `argCount()` / `argAt(i)`. Applies to `runSource` and `runBytecode`.
@@ -69,6 +93,14 @@ public:
     int dumpSyntaxTree(const std::string& path);
     int dumpBytecode(const std::string& path, const DriverOptions& options = {});
     int runBytecode(const std::string& path, const DriverOptions& options = {});
+
+    /// Runs a module that is already in memory.
+    ///
+    /// `origin` names the payload in diagnostics and, more importantly, is what the shared
+    /// library search path is derived from -- so a payload appended to an executable looks
+    /// for its libraries beside that executable, exactly as a file beside it would.
+    int runBytecodeFromMemory(const void* data, std::size_t size, const std::string& origin,
+                              const DriverOptions& options = {});
     int disassembleBytecode(const std::string& path);
 
 private:
@@ -81,6 +113,7 @@ private:
     bool attachDebugger(VM& vm, const DriverOptions& options, std::string& error);
 
     std::vector<std::string> m_programArgs;
+    std::vector<ModuleDependency> m_dependencies;
     /// Loads every file reachable from `root`'s import declarations and merges
     /// their declarations into `root`, dependencies first (spec §6.3).
     bool expandImports(Unit& root, const std::string& rootPath, SourceManager& sources,
@@ -91,6 +124,9 @@ private:
     std::ostream& m_err;
     bool m_stats = false;
     bool m_statsDetail = false;
+
+    /// The part of running a module that does not depend on where its bytes came from.
+    int runLoaded(Module& module, const std::string& origin, const DriverOptions& options);
 };
 
 } // namespace acvm

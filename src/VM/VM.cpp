@@ -194,6 +194,17 @@ void* vmOpenLibrary(const std::string& name) {
 #endif
 }
 
+void* vmMainModule() {
+#if defined(_WIN32)
+    return reinterpret_cast<void*>(::GetModuleHandleW(nullptr));
+#else
+    // On ELF the main program is addressable as a library handle, but only its exported
+    // symbols are reachable -- which is exactly the set a static build would have to
+    // export anyway.
+    return ::dlopen(nullptr, RTLD_LAZY | RTLD_LOCAL);
+#endif
+}
+
 void* vmLookupSymbol(void* handle, const std::string& symbol) {
     if (handle == nullptr) {
         return nullptr;
@@ -330,9 +341,10 @@ void* VM::resolveExternal(const Function& function, std::size_t functionIndex,
         m_libraryHandles.resize(m_module->externalLibraries.size(), nullptr);
     }
 
+    const std::string& declared = m_module->externalLibraries[static_cast<std::size_t>(library)];
+    std::string lastDetail;
+
     if (m_libraryHandles[static_cast<std::size_t>(library)] == nullptr) {
-        const std::string& declared = m_module->externalLibraries[static_cast<std::size_t>(library)];
-        std::string lastDetail;
         for (const std::string& candidate : libraryFileNames(declared)) {
             // Explicit directories first (module directory, then the
             // toolchain's), then the platform loader path.
@@ -355,19 +367,27 @@ void* VM::resolveExternal(const Function& function, std::size_t functionIndex,
             }
             lastDetail = loaderError();
         }
-        if (m_libraryHandles[static_cast<std::size_t>(library)] == nullptr) {
-            error = "cannot load library '" + declared + "' (" + lastDetail +
-                    "); build it next to the module or add it to the loader search path";
-            return nullptr;
-        }
     }
 
     void* handle = m_libraryHandles[static_cast<std::size_t>(library)];
-    void* symbol = vmLookupSymbol(handle, function.externalSymbol);
+    void* symbol = handle != nullptr ? vmLookupSymbol(handle, function.externalSymbol) : nullptr;
+
+    // A statically linked build has no such shared object to open: the standard library is
+    // part of the executable and exported from it. Looking there before reporting a
+    // deployment error keeps one resolution path for both builds -- the same lookup, one
+    // module earlier -- rather than a second strategy that only the static build takes.
     if (symbol == nullptr) {
-        error = "library '" + m_module->externalLibraries[static_cast<std::size_t>(library)] +
-                "' does not export '" + function.externalSymbol +
-                "'; it must have C linkage (extern \"C\")";
+        symbol = vmLookupSymbol(vmMainModule(), function.externalSymbol);
+    }
+
+    if (symbol == nullptr) {
+        if (handle == nullptr) {
+            error = "cannot load library '" + declared + "' (" + lastDetail +
+                    "); build it next to the module or add it to the loader search path";
+        } else {
+            error = "library '" + declared + "' does not export '" + function.externalSymbol +
+                    "'; it must have C linkage (extern \"C\")";
+        }
         return nullptr;
     }
 

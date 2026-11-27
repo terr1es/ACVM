@@ -2,6 +2,8 @@
 #include "TestHarness.hpp"
 
 #include "acvm/Driver/Driver.h"
+#include "acvm/Driver/Payload.h"
+#include "acvm/IR/Serializer.h"
 
 #include <filesystem>
 #include <fstream>
@@ -747,6 +749,79 @@ TEST(a_pointer_followed_by_a_count_is_accepted) {
     acvm::Driver driver(out, err);
     CHECK_EQ(driver.checkSource(source.path(), {}), 0);
     CHECK(err.str().empty());
+}
+
+TEST(a_saved_module_keeps_the_string_flag_of_external_parameters) {
+    // `acvm run` marshals a call straight from the AST, so it never exercises the stored
+    // parameter plan. `acvm exec` does, and v4 wrote only the array flag: `isString` came
+    // back false, a `string` argument was passed as one scalar, and the callee read the
+    // VM's descriptor address as characters. The program crashed on the first external
+    // call that took a string -- which is most of `io`.
+    //
+    // The assertion is on the plan rather than on a run because the bug is in the plan:
+    // a run would also need a file on disk to pass to `fileExists`, and the failure it
+    // would report is a segfault rather than a mismatch.
+    TempFile source("acvm_e2e_strparam.ax");
+    source.write("function import (return:(io));\n"
+                 "function main():void {\n"
+                 "    print(fileExists(\"anything\"));\n"
+                 "    eof: pass;\n"
+                 "}\n");
+    TempFile module("acvm_e2e_strparam.acvm");
+
+    std::ostringstream out;
+    std::ostringstream err;
+    acvm::Driver driver(out, err);
+    CHECK_EQ(driver.buildSource(source.path(), module.path(), {}), 0);
+
+    acvm::Module loaded;
+    std::string error;
+    CHECK(acvm::loadModule(loaded, module.path(), error));
+
+    const acvm::Function* found = nullptr;
+    for (const acvm::Function& function : loaded.functions) {
+        if (function.name == "fileExists") {
+            found = &function;
+        }
+    }
+    CHECK(found != nullptr);
+    if (found != nullptr) {
+        CHECK_EQ(found->externalParams.size(), std::size_t(1));
+        if (!found->externalParams.empty()) {
+            CHECK(found->externalParams[0].isString);
+        }
+    }
+}
+
+TEST(a_payload_round_trips_through_the_executable_it_was_appended_to) {
+    // The whole of single-file bundling is this round trip: bytes appended after the last
+    // section, located again by a fixed-size footer at the end. If the offset or the size
+    // is written wrong, the bundle still looks like a working executable and the failure
+    // appears as a parse error on someone else's machine.
+    TempFile host("acvm_e2e_host.bin");
+    host.write("MZ this stands in for an executable");
+    TempFile payload("acvm_e2e_payload.bin");
+    payload.write("the program bytes");
+
+    std::string error;
+    CHECK(acvm::appendPayload(host.path(), payload.path(), error));
+
+    std::string read;
+    CHECK(acvm::readEmbeddedPayload(host.path(), read, error));
+    CHECK_EQ(read, std::string("the program bytes"));
+    CHECK(error.empty());
+}
+
+TEST(an_executable_without_a_payload_is_not_an_error) {
+    // Every ordinary run of the runtime takes this path, so it has to be quiet: a missing
+    // payload is the normal case, not a failure to report.
+    TempFile plain("acvm_e2e_plain.bin");
+    plain.write("MZ an ordinary executable, nothing appended");
+
+    std::string payload;
+    std::string error;
+    CHECK(!acvm::readEmbeddedPayload(plain.path(), payload, error));
+    CHECK(error.empty());
 }
 
 TEST_MAIN()

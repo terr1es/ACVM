@@ -308,6 +308,7 @@ std::filesystem::path findLibraryFallback(const std::string& libraryName,
 bool Driver::expandImports(Unit& root, const std::string& rootPath, SourceManager& sources,
                            DiagnosticEngine& diagnostics) {
     ModuleGraph graph;
+    m_dependencies.clear();
 
     // Depth first, post order: a module's own imports are emitted before it, so
     // the merged declaration list follows the load order of spec §6.3.
@@ -315,6 +316,12 @@ bool Driver::expandImports(Unit& root, const std::string& rootPath, SourceManage
         [&](Unit& unit, const std::filesystem::path& self) -> bool {
         const std::filesystem::path dir = self.parent_path();
         const std::string selfKey = canonicalPath(self);
+        // Recorded here rather than after the merge because the merge throws away which
+        // file each declaration came from, and a packager needs the file to find the
+        // shared object next to it. `self` is the path this unit was actually loaded
+        // from, which is the only answer that accounts for the search order.
+        m_dependencies.push_back(ModuleDependency{unit.libraryName, selfKey, unit.moduleName,
+                                                  unit.moduleVersion});
         bool ok = true;
         for (StmtPtr& decl : unit.decls) {
             if (!decl || decl->kind != StmtKind::ImportDecl) {
@@ -947,7 +954,24 @@ int Driver::runBytecode(const std::string& path, const DriverOptions& options) {
         m_err << "error: " << error << '\n';
         return 1;
     }
+    return runLoaded(module, path, options);
+}
 
+int Driver::runBytecodeFromMemory(const void* data, std::size_t size, const std::string& origin,
+                                  const DriverOptions& options) {
+    m_stats = options.stats;
+    m_statsDetail = options.statsDetail;
+    Module module;
+    std::string error;
+    if (!loadModuleFromMemory(module, data, size, origin, error)) {
+        m_err << "error: " << error << '\n';
+        return 1;
+    }
+    return runLoaded(module, origin, options);
+}
+
+int Driver::runLoaded(Module& module, const std::string& origin, const DriverOptions& options) {
+    std::string error;
     VM vm(m_out, m_err);
     vm.setProgramArgs(m_programArgs);
     if (options.jit && options.adb) {
@@ -955,7 +979,7 @@ int Driver::runBytecode(const std::string& path, const DriverOptions& options) {
                   "breakpoints)\n";
     }
     vm.setJitMode(options.jit && !options.adb ? JitMode::On : JitMode::Off);
-    vm.setLibrarySearchPath(librarySearchDirs(path));
+    vm.setLibrarySearchPath(librarySearchDirs(origin));
     if (options.adb) {
         if (!attachDebugger(vm, options, error)) {
             m_err << "error: " << error << '\n';
