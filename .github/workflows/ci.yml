@@ -36,8 +36,21 @@ jobs:
           sudo apt-get install -y cmake ninja-build
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      # The log endpoint needs a token, and `check-runs/*/annotations` only reports
+      # "exit code 1" -- which step, never why. Annotations *are* public, so the failure
+      # is written back through `::error::` here: the compiler's own lines, not a summary.
       - name: Build
-        run: cmake --build build
+        run: |
+          set +e
+          cmake --build build > build.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "::error::build exited $status"
+            grep -nE "error:|Error [0-9]|undefined reference|cannot find|fatal error|FAILED:" build.log \
+              | head -12 | while IFS= read -r l; do echo "::error::$l"; done
+            tail -20 build.log | while IFS= read -r l; do echo "::error::tail| $l"; done
+          fi
+          exit $status
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Install and run one program
@@ -53,8 +66,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      # The log endpoint needs a token, and `check-runs/*/annotations` only reports
+      # "exit code 1" -- which step, never why. Annotations *are* public, so the failure
+      # is written back through `::error::` here: the compiler's own lines, not a summary.
       - name: Build
-        run: cmake --build build
+        run: |
+          set +e
+          cmake --build build > build.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "::error::build exited $status"
+            grep -nE "error:|Error [0-9]|undefined reference|cannot find|fatal error|FAILED:" build.log \
+              | head -12 | while IFS= read -r l; do echo "::error::$l"; done
+            tail -20 build.log | while IFS= read -r l; do echo "::error::tail| $l"; done
+          fi
+          exit $status
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Install and run one program
@@ -85,8 +111,21 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc-libs
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      # The log endpoint needs a token, and `check-runs/*/annotations` only reports
+      # "exit code 1" -- which step, never why. Annotations *are* public, so the failure
+      # is written back through `::error::` here: the compiler's own lines, not a summary.
       - name: Build
-        run: cmake --build build
+        run: |
+          set +e
+          cmake --build build > build.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "::error::build exited $status"
+            grep -nE "error:|Error [0-9]|undefined reference|cannot find|fatal error|FAILED:" build.log \
+              | head -12 | while IFS= read -r l; do echo "::error::$l"; done
+            tail -20 build.log | while IFS= read -r l; do echo "::error::tail| $l"; done
+          fi
+          exit $status
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Install and run one program
