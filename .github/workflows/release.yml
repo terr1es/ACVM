@@ -1,0 +1,147 @@
+# Builds a release archive for each supported platform when a version tag is
+# pushed, and attaches them to the release.
+#
+# Why CI at all: a local build here produces exactly one binary, and a compiler
+# that only runs where it was built is not much of a compiler. The three jobs
+# below are the only place the Linux and macOS binaries come from -- neither can
+# be produced on the Windows machine the project is developed on, and
+# cross-compiling would not prove anything about the platforms it claims.
+#
+# Every job runs `ctest` before packaging. A release built from a tree whose
+# tests fail is worse than no release: the archive is what people measure the
+# project by, and "it compiled" is not the bar the test suite sets.
+#
+# The archives carry the same layout `cmake --install` produces, so the paths in
+# RELEASE-NOTES.txt are true on all three platforms:
+#
+#     bin/acvm            compiler, VM, JIT
+#     bin/*.dll|*.so      native halves of the stdlib modules
+#     share/acvm/stdlib   the modules
+#     share/acvm/extralib the extra modules
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write      # needed to create the release and upload assets
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j$(nproc)
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          cmake --install build --prefix stage
+          cp README.md TUTORIAL.md LICENSE stage/
+          tar -C stage -czf acvm-${{ github.ref_name }}-linux-x86_64.tar.gz .
+          sha256sum acvm-*.tar.gz > SHA256SUMS-linux.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            acvm-*.tar.gz
+            SHA256SUMS-linux.txt
+
+  macos:
+    # The VM and the JIT use mmap with W^X flipping, which is why this is a
+    # separate job rather than a cross build: macOS enforces the flags at run
+    # time, so only a macOS runner can say whether it works.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.ncpu)
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          cmake --install build --prefix stage
+          cp README.md TUTORIAL.md LICENSE stage/
+          tar -C stage -czf acvm-${{ github.ref_name }}-macos-arm64.tar.gz .
+          shasum -a 256 acvm-*.tar.gz > SHA256SUMS-macos.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            acvm-*.tar.gz
+            SHA256SUMS-macos.txt
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            zip
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j$(nproc)
+      - name: Test
+        # `net_check` listens on port 0 and talks to 127.0.0.1 only, so it needs no
+        # inbound firewall rule and cannot collide with another job's port. If a
+        # runner ever forbids loopback the check fails rather than skips -- that is
+        # deliberate, because a silently skipped networking check is how a broken
+        # socket layer reaches a release.
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          cmake --install build --prefix stage
+          cp README.md TUTORIAL.md LICENSE stage/
+          # `zip` rather than 7z: the UCRT64 environment has no 7-Zip, and `zip -r`
+          # keeps the directory structure the notes describe.
+          (cd stage && zip -qr ../acvm-${{ github.ref_name }}-windows-x86_64.zip .)
+          sha256sum acvm-*.zip > SHA256SUMS-windows.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            acvm-*.zip
+            SHA256SUMS-windows.txt
+
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Collect
+        run: |
+          mkdir -p assets
+          find dist -type f \( -name 'acvm-*' -o -name 'SHA256SUMS-*' \) -exec mv {} assets/ \;
+          cat assets/SHA256SUMS-*.txt > assets/SHA256SUMS.txt
+          rm assets/SHA256SUMS-*.txt
+          ls -l assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

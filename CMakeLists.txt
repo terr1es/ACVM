@@ -303,6 +303,19 @@ endif()
 
 add_executable(acvm tools/acvm/main.cpp)
 target_link_libraries(acvm PRIVATE acvm_driver)
+
+# A release archive has to run on a machine that has never seen this toolchain. With the
+# default llvm-mingw settings the executable imports `libc++.dll` and `libunwind.dll`,
+# which live in the toolchain's directory -- so a zip built without this starts on the
+# build machine and fails on the user's with "the code execution cannot proceed because
+# libc++.dll was not found". Found by inspecting the import table of an installed copy,
+# not by running it, because running it here finds the DLLs.
+#
+# Only the executable: the module libraries under `stdlib/` and `extralib/` are C, and
+# adding `-static` to a shared library would be ignored on Windows anyway.
+if(MINGW)
+    target_link_options(acvm PRIVATE -static)
+endif()
 add_dependencies(acvm ${ACVM_STDLIB_TARGETS} ${ACVM_EXTRALIB_TARGETS})
 
 # Copying the binaries and the shared libraries to a user directory is a
@@ -366,7 +379,13 @@ endif()
 
 # Standard install rule, for `cmake --install build --prefix <somewhere>`.
 include(GNUInstallDirs)
-install(TARGETS acvm ${ACVM_STDLIB_TARGETS}
+# `${ACVM_EXTRALIB_TARGETS}` belongs here too. The extralib modules are mostly pure
+# Axiom, but `net` has a native half (`library "net"`) and ships as `net.dll` -- and
+# leaving it out produced an install where `extralib/net.axd` was present and the
+# library it declares was not, so `import (net)` failed on a fresh install while
+# working fine in the build tree. A missing extralib source only removes the target
+# from this list, so an extralib-less checkout still installs cleanly.
+install(TARGETS acvm ${ACVM_STDLIB_TARGETS} ${ACVM_EXTRALIB_TARGETS}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR})
 
