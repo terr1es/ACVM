@@ -344,6 +344,16 @@ private:
     /// of them -- `f<int>(x)` would parse as a comparison -- so the signature has to come
     /// from the destination, which is why this takes one.
     bool resolveFunctionValue(Expr& expr, const Type* target, Scope& scope);
+    /// Handles "a scalar initialises an aggregate", which is legal for exactly one value.
+    ///
+    /// `struct P p[200] = {0}` and `bit256 digest = 0` are the same thing: a constant zero
+    /// standing for "all bytes zero". Returning true means the expression has been accepted
+    /// and marked `aggregateZeroFill`, so IRGen emits nothing -- the declaration already
+    /// zeroed the slot. Returning false means the caller should report the type mismatch it
+    /// would have reported anyway; a non-zero constant is never a valid aggregate
+    /// initialiser, because there is no rule for which field a `5` would mean.
+    bool acceptAggregateZeroFill(Expr& expr, const Type* target);
+
     /// Type-checks the arguments of a call through a `Func<...>` value and marks the call
     /// indirect. `callee` is whatever named the value -- a local, a field, an element --
     /// and its type is `signature`.

@@ -1,0 +1,7 @@
+//  A non-zero scalar cannot initialise a wide bit string: there is no rule saying which
+//  bit a `5` would set, and `bit256 d = 0` is only meaningful because zero is "all clear".
+//  `bit256` is 32 bytes, so it is an aggregate and goes through the same check a struct does.
+function main():void {
+    bit256 digest = 5;
+    eof: pass;
+}

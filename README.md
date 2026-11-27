@@ -215,17 +215,17 @@ arguments pushed onto the value stack one helper call at a time, a frame zeroed,
 table consulted — so the win there is bounded by call overhead rather than by arithmetic.
 `quicksort.ax` is dominated by startup and printing and gets almost nothing.
 
-**Compilation is all or nothing, per function.** A half-compiled body would have to flush
-every live register back to memory at the unsupported instruction and reload afterwards,
-which is where a JIT stops being simple and starts producing wrong answers at the edges.
-So when the lowering meets something it cannot emit, the body stops *there* — the frame is
-handed back to the interpreter at the nearest instruction that starts with an empty
-expression stack, and the rest of the function runs interpreted. An empty stack is the
-only state that needs no translation: a compiled body keeps operands in frame slots with
-no type tags, while the interpreter reads `process.stack`.
+**Compilation stops at the first instruction the interpreter owns.** A half-compiled body
+would have to flush every live register back to memory at the unsupported instruction and
+reload afterwards, which is where a JIT stops being simple and starts producing wrong
+answers at the edges. So when the lowering meets something it cannot emit, the body stops
+*there*: the frame goes back to the interpreter at the nearest instruction that starts with
+an empty expression stack, and the rest of the function runs interpreted. An empty stack is
+the only state that needs no translation -- a compiled body keeps operands in frame slots
+with no type tags, while the interpreter reads `process.stack`.
 
-That covers 51% of the functions in `examples/` now, against 38% before, and the rest are
-refused outright for these reasons:
+Each of those is a property of the code rather than unfinished work. What is left is the
+list below, and it is short because everything else became a hand-off point:
 
 | Refusal | Why |
 |---|---|
@@ -236,14 +236,6 @@ refused outright for these reasons:
 | needs the interpreter at the first instruction | the hand-off point is the function's first instruction, so compiling it would be a prologue and nothing else |
 | an indirect call (`CALL_INDIRECT`) | the target is a run-time value; see `Func<...>` below |
 | a frame wider than eight pages | the frame's pages are pinned at entry and addressed through a table; 800 KB of stack arrays does not fit |
-
-`print`, `CONCAT`, `STR_EQ`, globals and `library` calls are no longer refusals: each is a
-hand-off point now, so a function is compiled up to the first one and executed interpreted
-from there.
-
-The first row is the one most often met in practice, and it is also the one that limits the
-measured speedup: a function is refused for containing a single `print`, so programs that
-report their own progress stay interpreted however much arithmetic they do.
 
 **String literals and aggregates are compiled.** A string is not a register value: it is a
 16 byte `{ptr, len}` descriptor, so `string s = "hi";` is four instructions --

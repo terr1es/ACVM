@@ -401,6 +401,9 @@ void Sema::checkGlobalInitializers(Scope& scope) {
             continue;
         }
         checkExpr(*decl->init, scope, flow);
+        if (acceptAggregateZeroFill(*decl->init, type)) {
+            continue;
+        }
         adaptLiteral(*decl->init, type);
         const Type* initType = decl->init->type;
         if (initType != nullptr && !initType->isError() &&

@@ -1,0 +1,8 @@
+//  The string operations are builtin *functions*, not methods: `startsWith(s, x)`, not
+//  `s.startsWith(x)`. Fourteen of them exist, which makes this the shape people write, so
+//  the diagnostic names the rewrite instead of only saying the method does not exist.
+function main():void {
+    string s = "hello.txt";
+    print(s.startsWith("he"));
+    eof: pass;
+}

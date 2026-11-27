@@ -1191,7 +1191,7 @@ Imported by name; names are unqualified at the call site.
 
 | Module | What it gives you |
 |---|---|
-| `algorithm` | 73 functions: `sort`, `sortInts`, `sortInt64s`, `sortFloats`, `binarySearch`, `reverseInts`, `sortIndicesByKey`, and generic forms |
+| `algorithm` | `sort`, `sortInts`, `sortInt64s`, `sortFloats`, `binarySearch`, `reverseInts`, `sortIndicesByKey`, and generic forms -- plus `sortBy` / `minByIndex` / `findIf`, which take a key or a predicate as a `Func` |
 | `map` | `MapIntInt`, `MapIntStr`, `MapStrInt`, `MapStrStr`, and pointer-keyed variants |
 | `set` | sets over the same key types |
 | `vec` | growable arrays: `vector T` is not implemented, this replaces it |
@@ -1200,7 +1200,7 @@ Imported by name; names are unqualified at the call site.
 | `time` | wall clock, monotonic clock, sleep, ISO-8601 parse and format, calendar arithmetic |
 | `sync` | atomics, mutexes, semaphores, channels |
 | `random` | seeded generator |
-| `test` | `testGroup`, `check`, `checkInt`, `checkInt64`, `checkInt128`, `checkString`, `testFinish` |
+| `test` | `testGroup`, `check`, `checkInt`, `checkInt64`, `checkInt128`, `checkString`, `testFinish`, and `testCase` / `testRunAll` for a registered case table |
 
 ```axiom
 function import (return:(algorithm, str));
@@ -1352,7 +1352,9 @@ function main():void {
 int x = 1;              int8 a = 1;        int128 w = 1;
 unsigned int32 u = 1;   float f = 1.5;     double d = 1.5;
 char c = 'A';           bool b = true;     string s = "text";
+bit1 flags[8];          bit256 digest = 0;   // packed bits, not a number
 ptr int p = null;       int arr[3] = {1,2,3};   (int, string) t = (1, "a");
+Func<int, int> f = twice;               // a function value: returns int, takes one
 
 // declaration
 int v = 0;              const int k = 1;    comptime int K = 1;
@@ -1370,15 +1372,17 @@ switch (n) { case 1: ; default: ; }
 break; continue; outer: for i in 0..2 { }
 
 // operators
-a + b   a % b   a == b   a && b   !b   a << 2   a & b
+a + b   a % b   a == b   a && b   !b   a << 2   a & b   a ** 2
 #value          // address of
 @pointer        // dereference
 value as int8   // checked conversion
-sizeof(S)       alignof(S)
+sizeof(S)       alignof(S)      sizeof(T) in a generic
 
 // functions
 function f(int a, int b):int { return a + b; eof: pass; }
 function g<T>(T a):T { return a; eof: pass; }
+Func<int, int, int> op = f;   op(1, 2);      // named as a value, called through it
+function h(Func<int, int> k):int { return k(3); }   // passed as a parameter
 
 // struct with methods
 struct P {

@@ -1453,21 +1453,43 @@ const Type* Sema::checkCall(Expr& expr, Scope& scope, Flow& flow) {
                                                   "' with '->' to call a method through it "
                                                   "('object->" + callee.text + "(...)')");
         } else if (!receiverType->isError()) {
-            m_diagnostics.error(callee.range,
-                                "'" + receiverType->describe() + "' has no method '" +
-                                    callee.text + "'");
+            // A builtin in method position: `s.startsWith("x")`. The builtins are
+            // functions -- `startsWith(s, "x")` -- so "has no method" sends the reader
+            // looking for a typo in a method that was never going to exist. Fourteen of
+            // them are string functions, which makes this the shape people actually write.
+            std::size_t entryCount = 0;
+            const BuiltinEntry* entries = builtinTable(entryCount);
+            bool isBuiltinName = false;
+            for (std::size_t i = 0; i < entryCount; ++i) {
+                if (callee.text == entries[i].name) {
+                    isBuiltinName = true;
+                    break;
+                }
+            }
+            if (isBuiltinName) {
+                // Naming the receiver makes the rewrite complete for the common case
+                // (`s.startsWith(x)` -> `startsWith(s, x)`); for anything longer the
+                // placeholder still says what shape to write.
+                const std::string receiver =
+                    object.kind == ExprKind::Name ? object.text : std::string("<value>");
+                m_diagnostics.error(callee.range,
+                                    "'" + callee.text + "' is a builtin function, not a "
+                                    "method of '" + receiverType->describe() + "'; write '" +
+                                        callee.text + "(" + receiver + ", ...)'");
+            } else {
+                m_diagnostics.error(callee.range,
+                                    "'" + receiverType->describe() + "' has no method '" +
+                                        callee.text + "'");
+            }
         }
         expr.type = m_types.errorType();
         return expr.type;
     }
 
-    // A `Func<...>` reached any other way than a bare name: `table[0](x)`, `s.handler(x)`,
-    // `p->callback(x)`. The value's type already carries the signature, so the check is
-    // the same as the named case -- only the callee expression differs, and IRGen reads
-    // the signature off it.
-    // The callee was not a name, a member or an arrow, so nothing has typed it yet --
-    // `table[0](4)` is an Index. Checking it here is what makes the value's signature
-    // available at all.
+    // A `Func<...>` reached any other way than a bare name, a field or an element:
+    // nothing has typed the callee yet -- `table[0](4)` is an Index -- and the value's
+    // type is where the signature lives. Checking it is what makes the signature available
+    // at all; `checkIndirectCallOf` then reads the arguments against it.
     if (callee.type == nullptr) {
         checkExpr(callee, scope, flow);
     }

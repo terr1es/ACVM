@@ -110,6 +110,39 @@ std::string signatureOf(const FuncInfo& info) {
 // Overload resolution
 //===----------------------------------------------------------------------===//
 
+bool Sema::acceptAggregateZeroFill(Expr& expr, const Type* target) {
+    if (target == nullptr || !target->isAggregate()) {
+        return false;
+    }
+    if (expr.type != nullptr && expr.type->isAggregate()) {
+        return false;   // an aggregate initialising an aggregate is an ordinary copy
+    }
+    // `struct P p[200] = {0}` and `bit256 digest = 0` are the same thing: a constant zero
+    // standing for "all bytes zero". This is the C idiom, and it has to be caught in Sema
+    // rather than in IRGen, which would otherwise treat the 0 as the *address* to copy
+    // from -- a null pointer dereference at run time, which is what it used to do for the
+    // brace spelling. The scalar spelling was missed by that first fix, so `bit256 d = 0;`
+    // still crashed: an aggregate initialised without braces does not go through
+    // `checkInitializer` at all.
+    //
+    // Only a constant zero qualifies. `= 5` for a struct has no meaning to pick: the first
+    // field, or all fields? Refusing is better than guessing.
+    const bool isZero = expr.isConstExpr && !expr.constIsFloat && expr.constInt == 0;
+    if (!isZero) {
+        m_diagnostics.error(expr.range,
+                            "cannot initialise '" + target->describe() + "' from " +
+                                (expr.type != nullptr ? expr.type->describe()
+                                                      : std::string("<unknown>")) +
+                                "; use '0' or '{0}' to zero it, or a '{...}' matching the "
+                                "type");
+        expr.type = m_types.errorType();
+        return true;   // reported: the caller must not add a second complaint
+    }
+    expr.aggregateZeroFill = true;
+    expr.type = target;
+    return true;
+}
+
 const Type* Sema::checkIndirectCallOf(Expr& call, Expr& callee, const Type* signature,
                                      std::vector<ExprPtr>& args, Scope& scope, Flow& flow) {
     const std::string name =
@@ -763,26 +796,7 @@ const Type* Sema::checkInitializer(Expr& expr, const Type* target, Scope& scope,
             return expr.type;
         }
         checkExpr(expr, scope, flow);
-        // `struct P p[200] = {0}`: a scalar zero standing for a whole aggregate. This is the
-        // C idiom for "zero it all", and it has to be caught here rather than in IRGen,
-        // which would otherwise treat the 0 as the *address* to copy from -- a null pointer
-        // dereference at run time, which is exactly what it used to do.
-        //
-        // Only a constant zero is allowed. `{5}` for a struct has no meaning to pick: is 5
-        // the first field, or all fields? Refusing is better than guessing.
-        if (target->isAggregate() && (expr.type == nullptr || !expr.type->isAggregate())) {
-            const bool isZero = expr.isConstExpr && !expr.constIsFloat && expr.constInt == 0;
-            if (!isZero) {
-                m_diagnostics.error(expr.range,
-                                    "cannot initialise '" + target->describe() +
-                                        "' from " + expr.type->describe() +
-                                        "; use '{0}' to zero it, or a '{...}' matching the "
-                                        "type");
-                expr.type = m_types.errorType();
-                return expr.type;
-            }
-            expr.aggregateZeroFill = true;
-            expr.type = target;
+        if (acceptAggregateZeroFill(expr, target)) {
             return expr.type;
         }
         adaptLiteral(expr, target);

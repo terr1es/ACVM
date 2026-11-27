@@ -202,6 +202,19 @@ function main():void {
     checkInt(sizeof(bit256), 32, "a wide bit string survives copy and re-measure");
     checkInt(echoWide(digest), 32, "a wide bit string passes by value");
 
+    // A wide bit string is an aggregate (32 bytes cannot travel as a value), so `= 0` is
+    // the "all bytes zero" initialiser. It used to compile into a memcpy from address 0
+    // and die with a null-pointer trap: the brace spelling `{0}` was fixed, and this one
+    // -- an aggregate initialised without braces -- went through a different path and was
+    // missed.
+    bit256 zeroed = 0;
+    checkInt(sizeof(bit256), 32, "bit256 initialised from 0 is still 32 bytes");
+    // It has to be usable as a value afterwards: the trap fired on the copy, so a fix that
+    // only changed the diagnostic would leave this line failing instead.
+    checkInt(echoWide(zeroed), 32, "and can be passed by value like any other");
+    bit256 again = zeroed;
+    checkInt(echoWide(again), 32, "and copied");
+
     testFinish();
     print("done\n");
     eof: pass;

@@ -270,6 +270,10 @@ void Sema::checkVarDecl(Stmt& stmt, Scope& scope, Flow& flow) {
             checkInitializer(*stmt.init, type, scope, flow);
         } else {
             checkExpr(*stmt.init, scope, flow);
+            // `bit256 digest = 0;` -- no braces, so `checkInitializer` above was not
+            // reached, and without this the zero was emitted as the address to copy from.
+            // Falls through to the ordinary mismatch report for any other scalar.
+            acceptAggregateZeroFill(*stmt.init, type);
             const unsigned errorsBefore = m_diagnostics.errorCount();
             adaptLiteral(*stmt.init, type);
             const Type* initType = stmt.init->type;

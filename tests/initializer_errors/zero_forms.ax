@@ -1,0 +1,43 @@
+//  The spellings that must be accepted, next to the ones `check_initializer_errors.cmake`
+//  requires to be rejected.
+//
+//  A rejection-only test is satisfied by a compiler that rejects everything, so the two
+//  halves belong together. What varies here is where the initialiser sits -- a local, a
+//  global, an array element, inside another aggregate -- because each of those went through
+//  a different code path, and the aggregate-one-level-down case is the one that a fix for
+//  "the local variable" tends to miss.
+
+struct P {
+    int a;
+    int b;
+};
+
+global P GlobalP = 0;
+
+function main():void {
+    // The two spellings of "all bytes zero".
+    P zero = 0;
+    P braced = {0, 0};
+
+    // A wide bit string is an aggregate too (32 bytes cannot travel as a value), so it
+    // takes the same initialiser.
+    bit256 digest = 0;
+
+    // One level down: an array of aggregates, a struct holding a struct.
+    P table[4] = {0};
+    P nested = {0, 0};
+
+    // And the ordinary scalars, which were never in doubt and must stay accepted.
+    int n = 0;
+    int64 wide = 0;
+    int arr[4] = {0};
+
+    P sum = {zero.a + braced.a + GlobalP.a + table[0].a + nested.a, n};
+    print(sum.a);
+    print(" ");
+    print(sizeof(bit256));
+    print(" ");
+    print(wide + arr[0]);
+    print("\n");
+    eof: pass;
+}

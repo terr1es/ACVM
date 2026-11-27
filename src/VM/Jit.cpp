@@ -140,11 +140,6 @@ using jit::Reg;
 using jit::Width;
 using jit::X64Assembler;
 
-/// Compiling calls is what turns the JIT from a leaf-function accelerator into something
-/// that covers a real program; the two bugs that kept it switched off are described at
-/// the SafePoint and Not cases below, and `tests/jit_call_check.ax` holds both down.
-constexpr bool kCompileCalls = true;
-
 constexpr std::size_t kMaxValueSlots = 48;
 constexpr std::size_t kMaxPinnedPages = 8;
 constexpr std::size_t kSlotBytes = 8;
@@ -599,14 +594,10 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             default:
                 break;
             }
-            if (!needsInterpreter && candidate.op == OpCode::Call) {
-                if (!kCompileCalls) {
-                    needsInterpreter = true;
-                } else if (candidate.a >= 0 &&
-                           static_cast<std::size_t>(candidate.a) < module.functions.size()) {
-                    needsInterpreter =
-                        module.functions[static_cast<std::size_t>(candidate.a)].isExternal();
-                }
+            if (!needsInterpreter && candidate.op == OpCode::Call && candidate.a >= 0 &&
+                static_cast<std::size_t>(candidate.a) < module.functions.size()) {
+                needsInterpreter =
+                    module.functions[static_cast<std::size_t>(candidate.a)].isExternal();
             }
             if (!needsInterpreter) {
                 continue;
@@ -1415,13 +1406,9 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // descriptor, which is why the push below tags it) -- getting that tag wrong
             // is what made a callee read an empty string.
             //
-            // A `library` function is the one case left out: its arguments are marshalled
-            // and the call made by the interpreter's external-call path, which the bridge
-            // does not reproduce.
-            if (!kCompileCalls || callee.isExternal()) {
-                refusal = "call into a library function";
-                break;
-            }
+            // A `library` call never reaches here: its arguments are marshalled by the
+            // interpreter's external-call path, which the bridge does not reproduce, so the
+            // hand-off analysis makes it a bail point before lowering gets this far.
             if (callee.returnsAggregate) {
                 refusal = "call returning an aggregate";
                 break;

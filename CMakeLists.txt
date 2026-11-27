@@ -770,6 +770,17 @@ if(ACVM_BUILD_TESTS)
                      -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/scope_errors
                      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_scope.cmake)
 
+    # Initialiser diagnostics. Each case used to be worse than a bad message: a
+    # non-zero scalar against an aggregate was *accepted* and became a memcpy from
+    # that scalar taken as an address, so `bit256 d = 0;` trapped on a null pointer.
+    # The `_ok` forms next to them are compiled too, because a rejection-only check
+    # is satisfied by a compiler that rejects everything.
+    add_test(NAME initializer_errors_check
+             COMMAND ${CMAKE_COMMAND}
+                     -DACVM=$<TARGET_FILE:acvm>
+                     -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/initializer_errors
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_initializer_errors.cmake)
+
     # Method diagnostics: a write through a value receiver must be rejected rather
     # than compile into a no-op, and each call-form mismatch must name the fix.
     add_test(NAME methods_errors_check

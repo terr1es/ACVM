@@ -12,10 +12,22 @@
 //          eof: pass;
 //      }
 //
-//  Every function here has an Axiom body in stdlib/algorithm.ax as well. The
-//  compiler packs both implementations into the .acvm, so a program runs whether
-//  or not the shared library is present. Signatures must stay
-//  in step with that file -- a mismatch is reported at the declaration.
+//  Two things make a program work whether or not the shared library is present, and
+//  only one of them is an Axiom body:
+//
+//    * the functions the Axiom side implements (`sort`, `sortIndicesByKey`, the
+//      `*Strings` family, ...) have a body in stdlib/algorithm.ax that shares one
+//      FuncInfo with this declaration. The body wins at run time when the library
+//      cannot be loaded.
+//    * the rest -- `binarySearch64`, `heapSort64`, `mergeInts64` and the other 64 bit
+//      ones -- have **no** Axiom body. They work anyway because stdlib/algorithm.c is
+//      also compiled into the VM itself (see the `acvm_vm` target), so the code is
+//      already in the binary and the DLL is an alternative rather than the source.
+//      An earlier version of this comment claimed every declaration had an Axiom
+//      body, which is not true and hid that dependency.
+//
+//  Signatures must stay in step with stdlib/algorithm.ax -- a mismatch is reported at
+//  the declaration.
 //
 //  ── two element widths ────────────────────────────────────────────────────
 //

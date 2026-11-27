@@ -1,0 +1,11 @@
+//  Same for a struct: `= 0` means "all bytes zero", `= 7` would need a rule for which
+//  field it applies to. Refusing is better than guessing.
+struct P {
+    int a;
+    int b;
+};
+
+function main():void {
+    P p = 7;
+    eof: pass;
+}
