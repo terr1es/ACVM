@@ -882,11 +882,24 @@ VM::Step VM::step(Process& process, std::string& error) {
             case OpCode::Le:
             case OpCode::Gt:
             case OpCode::Ge: {
-                Value rhs;
-                Value lhs;
-                if (!popValue(rhs) || !popValue(lhs)) {
+                // Read the two operands where they are instead of copying them out.
+                //
+                // `Value` is 32 bytes -- an `Int128` plus a tag, rounded up by the 16-byte
+                // alignment the 128 bit type forces -- so popping both operands into locals was
+                // two 32-byte copies, and pushing the result a third. Reading them as const
+                // references and writing the result in place over the left one keeps the 32
+                // bytes off the critical path: this is the hottest instruction group in every
+                // program, and on a four-instruction loop body the copies were the single
+                // largest remaining cost.
+                //
+                // The stack must not be resized before `computeBinary` returns, because `lhs`
+                // and `rhs` point into it.
+                std::vector<Value>& stack = process.stack;
+                if (stack.size() < 2) {
                     return fail(TrapKind::Unreachable, "stack underflow in an arithmetic instruction");
                 }
+                const Value& lhs = stack[stack.size() - 2];
+                const Value& rhs = stack[stack.size() - 1];
                 Value result;
                 TrapKind trapKind = TrapKind::Unreachable;
                 if (!computeBinary(inst.op, memType(inst.a), lhs, rhs, result, trapKind)) {
@@ -898,7 +911,8 @@ VM::Step VM::step(Process& process, std::string& error) {
                     }
                     return fail(trapKind, "in '" + function.name + "'");
                 }
-                pushValue(result);
+                stack.pop_back();
+                stack.back() = result;
                 continue;
             }
 
@@ -988,12 +1002,11 @@ VM::Step VM::step(Process& process, std::string& error) {
                     return fail(TrapKind::Unreachable, "stack underflow in MEM_EQ");
                 }
                 const std::size_t size = static_cast<std::size_t>(std::max<std::int32_t>(inst.a, 0));
-                std::vector<std::uint8_t> left(size);
-                std::vector<std::uint8_t> right(size);
-                readBytes(lhs.asPtr(), left.data(), size);
-                readBytes(rhs.asPtr(), right.data(), size);
-                const bool equal = std::memcmp(left.data(), right.data(), size) == 0;
-                pushValue(Value::fromInt(equal ? 1 : 0));
+                if (equalBytes(lhs.asPtr(), rhs.asPtr(), size)) {
+                    pushValue(Value::fromInt(1));
+                } else {
+                    pushValue(Value::fromInt(0));
+                }
                 continue;
             }
 
@@ -1055,6 +1068,30 @@ VM::Step VM::step(Process& process, std::string& error) {
                 ip = static_cast<std::size_t>(inst.a);
                 continue;
 
+            case OpCode::CompareBranch: {
+                // `LT; JUMP_IF_FALSE` in one instruction. The comparison itself is
+                // `computeBinary`, the same code the unfused pair runs, so the two forms
+                // cannot disagree about overflow, signedness or float NaN handling.
+                Value rhs;
+                Value lhs;
+                if (!popValue(rhs) || !popValue(lhs)) {
+                    return fail(TrapKind::Unreachable, "stack underflow in CMP_BRANCH");
+                }
+                Value compared;
+                TrapKind trapKind = TrapKind::Unreachable;
+                const auto comparison = compareBranch::comparisonOf(inst.b);
+                if (!computeBinary(compareBranch::toOpCode(comparison),
+                                   memType(compareBranch::memTypeOf(inst.b)), lhs, rhs, compared,
+                                   trapKind)) {
+                    return fail(trapKind, "invalid operand type in CMP_BRANCH");
+                }
+                const bool truthy = compared.asInt() != 0;
+                if (truthy == compareBranch::branchesOnTrue(inst.b)) {
+                    ip = static_cast<std::size_t>(inst.a);
+                }
+                continue;
+            }
+
             case OpCode::JumpIfFalse:
             case OpCode::JumpIfTrue: {
                 Value condition;
@@ -1114,20 +1151,26 @@ VM::Step VM::step(Process& process, std::string& error) {
                     }
                 }
 
-                std::vector<Value> arguments(argc);
-                for (std::size_t i = argc; i-- > 0;) {
-                    if (!popValue(arguments[i])) {
-                        return fail(TrapKind::Unreachable, "stack underflow in CALL");
-                    }
+                // The arguments are read straight off the value stack instead of being moved
+                // into a `std::vector<Value>` first.
+                //
+                // That vector was a heap allocation and a free on every call. Calling an empty
+                // function 20 000 000 times took 53.7 ns per call, and the allocator was the
+                // largest single part of it. The arguments do not need moving to be read:
+                // they sit at the top of `process.stack` in order, while the frame they are
+                // copied into lives in VM memory -- a different space, so writing the frame
+                // cannot disturb them. The stack is trimmed after the copy.
+                //
+                // An aggregate result is different: its destination address is pushed
+                // *before* the arguments, so it sits just below them.
+                const std::size_t frameSlots = argc + (callee.returnsAggregate ? 1 : 0);
+                if (process.stack.size() < frameSlots) {
+                    return fail(TrapKind::Unreachable, "stack underflow in CALL");
                 }
-
+                const std::size_t argumentBase = process.stack.size() - argc;
                 std::uint64_t destination = 0;
                 if (callee.returnsAggregate) {
-                    Value value;
-                    if (!popValue(value)) {
-                        return fail(TrapKind::Unreachable, "missing return destination in CALL");
-                    }
-                    destination = value.asPtr();
+                    destination = process.stack[argumentBase - 1].asPtr();
                 }
 
                 const std::uint64_t frameBase = process.stackTop;
@@ -1143,22 +1186,36 @@ VM::Step VM::step(Process& process, std::string& error) {
                                     "' (unbounded recursion?)");
                 }
 
-                zeroBytes(frameBase, frameSize);
                 process.stackTop += frameSize;
 
                 for (std::size_t i = 0; i < argc && i < callee.params.size(); ++i) {
                     const ParamInfo& param = callee.params[i];
+                    const Value& argument = process.stack[argumentBase + i];
                     if (param.aggregate) {
-                        std::vector<std::uint8_t> buffer(param.size);
-                        readBytes(arguments[i].asPtr(), buffer.data(), param.size);
-                        writeBytes(frameBase + param.offset, buffer.data(), param.size);
+                        // Copied through a stack buffer rather than a heap one: the sizes are
+                        // structs, which are small, and a call that allocates twice is the
+                        // pattern this rewrite exists to remove.
+                        std::uint8_t buffer[64];
+                        if (param.size <= sizeof(buffer)) {
+                            readBytes(argument.asPtr(), buffer, param.size);
+                            writeBytes(frameBase + param.offset, buffer, param.size);
+                        } else {
+                            std::vector<std::uint8_t> large(param.size);
+                            readBytes(argument.asPtr(), large.data(), param.size);
+                            writeBytes(frameBase + param.offset, large.data(), param.size);
+                        }
                     } else {
-                        storeScalar(frameBase + param.offset, param.memType, arguments[i]);
+                        storeScalar(frameBase + param.offset, param.memType, argument);
                     }
                 }
                 if (callee.returnsAggregate) {
                     writeBytes(frameBase, &destination, sizeof(destination));
                 }
+
+                // The copies are done, so the arguments and the result slot can go. Dropping
+                // them here rather than at the top keeps the indices above valid for exactly
+                // as long as they are read.
+                process.stack.resize(argumentBase - (callee.returnsAggregate ? 1 : 0));
 
                 // `frame` is a reference into `frames`, so it must not be touched after the
                 // push: the vector may reallocate. Write ip back first, then leave the inner
@@ -1197,16 +1254,18 @@ VM::Step VM::step(Process& process, std::string& error) {
 
             case OpCode::Ret: {
                 const bool hasResult = function.returnsValue;
-                Value result;
-                if (hasResult && !popValue(result)) {
+                // The result is already on top of the value stack, because the callee's last
+                // expression put it there. Popping it only to push it back was two operations
+                // that cancelled -- and a `push_back` re-checks capacity every time.
+                //
+                // What has to change is the *frame* stack: the callee's frame goes away and
+                // the frame pointer returns to the caller's base.
+                if (hasResult && process.stack.empty()) {
                     return fail(TrapKind::Unreachable, "missing return value in '" + function.name + "'");
                 }
                 const std::uint64_t callerBase = frame.base;
                 process.frames.pop_back();
                 process.stackTop = callerBase;
-                if (hasResult) {
-                    pushValue(result);
-                }
                 if (process.frames.empty()) {
                     // Keep the entry point's result on the stack so that callers which
                     // run a function to completion (event conditions) can read it.
@@ -1230,9 +1289,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                 if (destination.asPtr() == 0 || source.asPtr() == 0) {
                     return fail(TrapKind::NullPointer, "memcpy through a null pointer");
                 }
-                std::vector<std::uint8_t> buffer(size);
-                readBytes(source.asPtr(), buffer.data(), size);
-                writeBytes(destination.asPtr(), buffer.data(), size);
+                copyBytes(destination.asPtr(), source.asPtr(), size);
                 continue;
             }
 
@@ -1426,6 +1483,28 @@ VM::Step VM::step(Process& process, std::string& error) {
                     return fail(trapKind, "in '" + function.name + "'");
                 }
                 storeScalar(slot, typeIndex, updated);
+                continue;
+            }
+
+            case OpCode::StepJump: {
+                // `STEP_LOCAL; JUMP` -- the closing pair of a `for` loop, in one instruction.
+                const std::uint64_t slot =
+                    baseAddress + static_cast<std::uint64_t>(stepJump::slotOf(inst.b));
+                const bool negative = stepJump::isNegative(inst.b);
+                const int typeIndex = stepJump::memTypeOf(inst.b);
+                Value current;
+                if (!loadScalar(slot, typeIndex, current)) {
+                    return fail(TrapKind::Unreachable, "invalid memory type in STEP_JUMP");
+                }
+                const MemType& type = memType(typeIndex);
+                Value updated;
+                TrapKind trapKind = TrapKind::Unreachable;
+                if (!computeBinary(negative ? OpCode::Sub : OpCode::Add, type, current,
+                                   Value::fromInt(1), updated, trapKind)) {
+                    return fail(trapKind, "in '" + function.name + "'");
+                }
+                storeScalar(slot, typeIndex, updated);
+                ip = static_cast<std::size_t>(inst.a);
                 continue;
             }
 

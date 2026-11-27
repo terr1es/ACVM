@@ -234,6 +234,10 @@ private:
     bool readBytes(std::uint64_t addr, void* dst, std::size_t len) const;
     bool writeBytes(std::uint64_t addr, const void* src, std::size_t len);
     bool zeroBytes(std::uint64_t addr, std::size_t len);
+    /// Copies within VM memory, memmove-style, without an intermediate buffer.
+    bool copyBytes(std::uint64_t dst, std::uint64_t src, std::size_t len);
+    /// Compares two ranges of VM memory without copying either out.
+    bool equalBytes(std::uint64_t lhs, std::uint64_t rhs, std::size_t len) const;
     [[nodiscard]] bool loadScalar(std::uint64_t addr, int typeIndex, Value& out) const;
     bool storeScalar(std::uint64_t addr, int typeIndex, const Value& value);
     [[nodiscard]] const MemType& memType(int index) const;
