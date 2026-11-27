@@ -1,0 +1,6 @@
+function main():void {
+    int sum = 0;
+    for (int i = 0; i < 5000000; i++) { sum = sum + (i % 7) * 2 - (i % 3); }
+    print(sum); print("\n");
+    eof: pass;
+}

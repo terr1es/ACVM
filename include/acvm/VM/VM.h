@@ -106,10 +106,21 @@ public:
     /// wall-clock time, and unlike timing it is perfectly reproducible.
     [[nodiscard]] std::uint64_t instructionCount() const { return m_instructions; }
 
-    /// Per-opcode retired counts, indexed by OpCode. The hot loop keeps this
-    /// up to date unconditionally: it is one increment into a 384 byte table
-    /// that stays in cache, which measured below the noise floor.
+    /// Per-opcode retired counts, indexed by OpCode.
+    ///
+    /// Both this and `instructionCount` are only maintained after
+    /// `setProfile(true)` -- see `m_countInstructions`. The comment that used to
+    /// stand here said the update was "below the noise floor" because it is one
+    /// increment into a 384 byte table that stays in cache. That was wrong, and
+    /// measurably so: the increment is a read-modify-write to the VM object plus
+    /// an indexed store, on the critical path of every instruction, and the
+    /// second counter next to it was another. See the benchmark table in
+    /// `docs/performance.md`.
     [[nodiscard]] const std::uint64_t* opcodeHistogram() const { return m_opcodeCounts; }
+
+    /// Turns the retired-instruction counters on. Called by `--stats`, and by the
+    /// debugger, which reports a retired count with every step.
+    void setProfile(bool on) { m_countInstructions = on; }
 
     // Address space layout (sparse, page backed).
     static constexpr std::uint64_t kGlobalBase = 0x0001'0000;
@@ -287,6 +298,30 @@ private:
 
     const Module* m_module = nullptr;
 
+    /// True when a `SafePoint` has somewhere to go.
+    ///
+    /// A safe point exists for three reasons: the scheduler may have another process to run,
+    /// an `event` condition may have become true, or a debugger may want to look at the
+    /// program. When none of those is the case the instruction has no observer, and
+    /// returning to the scheduler costs a full teardown and restart of the interpreter --
+    /// snapshot the frame, write `ip` back, unwind to `runQuantum`, evaluate events that do
+    /// not exist, and come back in.
+    ///
+    /// Measured on a call-heavy benchmark, where a `SafePoint` is emitted before every
+    /// `Call`: 13.2 s against CPython's 2.3 s. The same benchmark's loop body, which has no
+    /// `SafePoint` in it, was already within 12%. The whole difference was this exit.
+    ///
+    /// Deliberately computed rather than cached in a flag: the three answers change at
+    /// different moments (a process is spawned, a debugger attaches, a JIT frame floor is
+    /// raised) and a flag that was not updated at one of them is a bug that shows up as a
+    /// missing event rather than as a crash. These are a handful of loads from one cache
+    /// line, against a hundred cycles of leaving and re-entering.
+    [[nodiscard]] bool safePointsMatter() const {
+        return m_debugAttached || m_frameFloor != 0 || m_processes.size() > 1 ||
+               (m_module != nullptr && !m_module->events.empty());
+    }
+
+
     /// Debugger attachment. `m_debugHooks` is null unless someone installed one,
     /// and the step loop tests that pointer once per instruction.
     DebugHooks m_debugHooks{};
@@ -351,6 +386,18 @@ private:
     std::size_t m_frameFloor = 0;
     std::uint64_t m_instructions = 0;
     std::uint64_t m_opcodeCounts[64] = {};
+
+    /// Whether the two counters above are maintained.
+    ///
+    /// They exist for `--stats` and for the debugger's retired-instruction count, and both
+    /// are optional -- yet maintaining them unconditionally costs a load, an add and a store
+    /// to two members per instruction, plus an indexed access for the histogram. On a loop
+    /// body of eleven instructions that was measurable, and the work is pure overhead unless
+    /// someone asked for the numbers.
+    ///
+    /// Set once before the program runs, so the test is a predictable branch on a value that
+    /// does not change during a run.
+    bool m_countInstructions = false;
 };
 
 } // namespace acvm

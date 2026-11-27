@@ -1,0 +1,11 @@
+function fib(int n):int {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+    eof: pass;
+}
+function main():void {
+    int acc = 0;
+    for (int i = 0; i < 300000; i++) { acc = acc + fib(10); }
+    print(acc); print("\n");
+    eof: pass;
+}

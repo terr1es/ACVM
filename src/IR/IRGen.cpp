@@ -722,6 +722,51 @@ void IRGen::setCurrentLine(const SourceRange& range) {
     m_fn->currentLine.line = m_sources->lineColumn(range.begin).line;
 }
 
+/// Emits an expression whose value nobody wants: in statement position, and in the third
+/// clause of a `for`.
+///
+/// Two things differ from `emitExpr`. An increment collapses into a single `StepLocal`,
+/// because the store-and-keep form an expression needs is exactly what makes `i++` cost five
+/// instructions; and anything else that still leaves a value gets a `Pop`.
+///
+/// This used to be the body of `StmtKind::ExprStmt` only, so the third clause of a `for` --
+/// discarded by definition, since nothing can read it -- went through `emitExpr` and produced
+/// `LoadLocal; ConstInt; Add; StoreLocal keep; Pop`. Every loop in every program paid five
+/// instructions for its own counter. Found by dumping the IR of an empty loop and counting:
+/// ten instructions per iteration, five of them the increment.
+void IRGen::emitDiscardedExpr(Expr& expr) {
+    switch (expr.kind) {
+    case ExprKind::PostInc:
+    case ExprKind::PreInc:
+        emitIncrement(expr, true, false, /*keepResult=*/false);
+        return;
+    case ExprKind::PostDec:
+    case ExprKind::PreDec:
+        emitIncrement(expr, false, false, /*keepResult=*/false);
+        return;
+    default:
+        break;
+    }
+    m_discardResult = true;
+    emitExpr(expr);
+    m_discardResult = false;
+    if (expr.type == nullptr || !expr.type->isVoid()) {
+        // Assignments and increments already avoid leaving a value behind when the result is
+        // discarded; everything else still pushes one.
+        switch (expr.kind) {
+        case ExprKind::Assign:
+        case ExprKind::PostInc:
+        case ExprKind::PreInc:
+        case ExprKind::PostDec:
+        case ExprKind::PreDec:
+            break;
+        default:
+            m_fn->emit(OpCode::Pop);
+            break;
+        }
+    }
+}
+
 void IRGen::emitStmt(Stmt& stmt) {
     setCurrentLine(stmt.range);
     switch (stmt.kind) {
@@ -766,38 +811,7 @@ void IRGen::emitStmt(Stmt& stmt) {
 
     case StmtKind::ExprStmt:
         if (stmt.init) {
-            // `x++;` on its own line discards the result, so skip producing it.
-            switch (stmt.init->kind) {
-            case ExprKind::PostInc:
-            case ExprKind::PreInc:
-                emitIncrement(*stmt.init, true, false, /*keepResult=*/false);
-                return;
-            case ExprKind::PostDec:
-            case ExprKind::PreDec:
-                emitIncrement(*stmt.init, false, false, /*keepResult=*/false);
-                return;
-            default:
-                break;
-            }
-            m_discardResult = true;
-            emitExpr(*stmt.init);
-            m_discardResult = false;
-            if (stmt.init->type == nullptr || !stmt.init->type->isVoid()) {
-                // Assignments and increments already avoid leaving a value
-                // behind when the result is discarded; everything else still
-                // pushes one.
-                switch (stmt.init->kind) {
-                case ExprKind::Assign:
-                case ExprKind::PostInc:
-                case ExprKind::PreInc:
-                case ExprKind::PostDec:
-                case ExprKind::PreDec:
-                    break;
-                default:
-                    m_fn->emit(OpCode::Pop);
-                    break;
-                }
-            }
+            emitDiscardedExpr(*stmt.init);
         }
         return;
 
@@ -851,8 +865,7 @@ void IRGen::emitStmt(Stmt& stmt) {
     case StmtKind::For: {
         if (stmt.initS) {
             emitStmt(*stmt.initS);
-        }
-        const std::size_t loopStart = here();
+        }        const std::size_t loopStart = here();
         std::size_t exit = 0;
         bool hasCondition = false;
         if (stmt.cond) {
@@ -875,8 +888,9 @@ void IRGen::emitStmt(Stmt& stmt) {
             m_fn->patchJump(jump, continueLabel);
         }
         if (stmt.post) {
-            emitExpr(*stmt.post);
-            m_fn->emit(OpCode::Pop);
+            // The third clause of a `for` has no reader -- nothing can observe its value --
+            // so it is emitted the same way a bare `i++;` statement is.
+            emitDiscardedExpr(*stmt.post);
         }
         m_fn->emit(OpCode::Jump, static_cast<std::int32_t>(loopStart));
 

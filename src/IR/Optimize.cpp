@@ -278,15 +278,47 @@ int peephole(Function& fn, int& forwardedOut) {
             ++i;
             continue;
         }
-        // A rewrite is only safe on instructions no jump can reach.
-        if (targets[i] || (i + 1 < n && targets[i + 1])) {
+        Instruction& first = fn.code[i];
+
+        // `jump` to the instruction that follows it.
+        //
+        // Ahead of the guard below, deliberately. The destination of such a jump is by
+        // definition reachable by falling through, so removing the jump breaks nothing --
+        // and the shape that occurs most is exactly the one the guard would reject: several
+        // jumps converging on one instruction. Every function's epilogue is that shape. Each
+        // `return` jumps to it, and for the last return in the body the epilogue *is* the
+        // next instruction, so the jump is a no-op that the guard was preserving.
+        if (!targets[i] && first.op == OpCode::Jump &&
+            first.a == static_cast<std::int32_t>(i + 1)) {
+            drop[i] = 1;
+            changes += 1;
             ++i;
             continue;
         }
-        Instruction& first = fn.code[i];
+
+        // Fusing in place is safe at a jump target; removing `code[i]` is not.
+        //
+        // A jump operand is an index, so dropping an instruction a jump lands on leaves the
+        // jump arriving at whatever moved into its place. Rewriting `code[i]` to do the work
+        // of `code[i]` and `code[i+1]` changes nothing about where control enters: a jump
+        // that landed on the address still lands on the fused load.
+        //
+        // The original guard rejected both, and the cost was the whole epilogue of every
+        // function: `return` always jumps there, so `LocalAddr slot; Load; Ret` -- the shape
+        // that returns any scalar -- could never be fused. Measured on `fib`, returning one
+        // integer took seven instructions, four of them this indirection.
+        //
+        // What remains is the part no rule may ignore: nothing may be fused past an
+        // instruction a jump lands on, because the rule consumes it. The rules that drop
+        // `code[i]` itself test `targets[i]` where they are, so the reason sits next to the
+        // code that depends on it.
+        if (i + 1 < n && targets[i + 1]) {
+            ++i;
+            continue;
+        }
 
         // `push; pop` -- the value is computed and immediately discarded.
-        if (i + 1 < n && !drop[i + 1] && isPurePush(first.op) &&
+        if (!targets[i] && i + 1 < n && !drop[i + 1] && isPurePush(first.op) &&
             fn.code[i + 1].op == OpCode::Pop) {
             drop[i] = 1;
             drop[i + 1] = 1;
@@ -295,17 +327,9 @@ int peephole(Function& fn, int& forwardedOut) {
             continue;
         }
 
-        // `jump` to the instruction that follows it.
-        if (first.op == OpCode::Jump && first.a == static_cast<std::int32_t>(i + 1)) {
-            drop[i] = 1;
-            changes += 1;
-            ++i;
-            continue;
-        }
-
         // A load whose result is discarded. Safe because a frame slot always
         // holds a valid address -- unlike a generic `Load`, which could fault.
-        if (i + 1 < n && !drop[i + 1] && first.op == OpCode::LoadLocal &&
+        if (!targets[i] && i + 1 < n && !drop[i + 1] && first.op == OpCode::LoadLocal &&
             fn.code[i + 1].op == OpCode::Pop) {
             drop[i] = 1;
             drop[i + 1] = 1;
@@ -325,12 +349,42 @@ int peephole(Function& fn, int& forwardedOut) {
                 first.a == second.a && (second.b & ~kKeepBit) == first.b) {
                 if ((second.b & kKeepBit) != 0) {
                     drop[i + 1] = 1;   // keep the load, drop the redundant store
-                } else {
+                } else if (!targets[i]) {
                     drop[i] = 1;
                     drop[i + 1] = 1;
+                } else {
+                    ++i;
+                    continue;
                 }
                 changes += 1;
                 i += 2;
+                continue;
+            }
+
+            // `LocalAddr x; Swap; Store t` -- the three-instruction way of writing the value
+            // that is already on the stack into a local.
+            //
+            // Why the shape exists: `Store` pops the value and then the address, so a store
+            // into a known slot pushes the address first and swaps it under the value. The
+            // sequence is what `return` emits for every scalar, and what any assignment whose
+            // destination is an address rather than a named local emits -- so it sits in the
+            // hot path of every function's epilogue.
+            //
+            // The memType moves from `a` to `b` because that is where the two opcodes keep
+            // it: `Store` carries the type in `a`, `StoreLocal` in `b` alongside the keep
+            // bit. Copying `b` across instead left the type zero, which is a 32 bit store --
+            // so int64 and pointer values were silently truncated, and `map_check` caught it
+            // as `expected 9000000000000, got 2043514880`. The same mistake is what an
+            // earlier attempt at fusing `LocalAddr x; Store` made in the other direction, and
+            // that one stored a pointer over the value being stored.
+            if (first.op == OpCode::LocalAddr && second.op == OpCode::Swap &&
+                i + 2 < n && !drop[i + 2] && !targets[i + 2] &&
+                fn.code[i + 2].op == OpCode::Store) {
+                fn.code[i] = Instruction{OpCode::StoreLocal, first.a, fn.code[i + 2].a};
+                drop[i + 1] = 1;
+                drop[i + 2] = 1;
+                changes += 1;
+                i += 3;
                 continue;
             }
 
@@ -342,6 +396,8 @@ int peephole(Function& fn, int& forwardedOut) {
                 i += 2;
                 continue;
             }
+
+
             // `LocalAddr x; Store` is NOT `StoreLocal x`, and fusing it was a bug:
             // `Store` pops the value first and the address second, so with the two
             // instructions adjacent the address on top *is* the value being stored,

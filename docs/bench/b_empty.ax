@@ -1,0 +1,5 @@
+function main():void {
+    for (int i = 0; i < 50000000; i++) { }
+    print("done\n");
+    eof: pass;
+}

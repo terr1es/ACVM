@@ -273,14 +273,27 @@ bool endsWith(const std::string& text, std::string_view suffix) {
            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+} // namespace
+
 /// Platform specific file names: `ext` means ext.dll on Windows, libext.so on
 /// Linux, libext.dylib on macOS.
+///
+/// Public because there is a second caller: the debugger loads `adb` by name, and it
+/// used to spell the names itself -- "adb.dll" twice and "libadb.so" once. That list was
+/// wrong on two counts. It hardcoded `.dll` into the `ACVM_LIB_DIR` path, so a Linux tree
+/// looked for `adb.dll` there; and it named `libadb.so`, which the build does not produce,
+/// because the modules set `PREFIX ""` and come out as `adb.so`. One naming rule, in one
+/// place, is what stops that from happening again.
 std::vector<std::string> libraryFileNames(const std::string& name) {
     // Each suffix is checked against the length first: `name.size() - 6` on a
     // short name wraps around, and `std::string::compare` with an out of range
     // position throws -- which used to abort the process for a five character
     // library name such as `library "abcde";`.
-    if (endsWith(name, ".dll") || endsWith(name, ".so") || endsWith(name, ".dylib")) {
+    const auto hasSuffix = [&name](std::string_view suffix) {
+        return name.size() >= suffix.size() &&
+               name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    if (hasSuffix(".dll") || hasSuffix(".so") || hasSuffix(".dylib")) {
         return {name};
     }
     std::vector<std::string> candidates;
@@ -295,8 +308,6 @@ std::vector<std::string> libraryFileNames(const std::string& name) {
 #endif
     return candidates;
 }
-
-} // namespace
 
 VM::~VM() {
     for (void* handle : m_libraryHandles) {
@@ -423,6 +434,9 @@ void VM::setDebugHooks(const DebugHooks* hooks) {
     m_debugHooks = *hooks;
     m_debugAttached = true;
     m_debugAborted = false;
+    // The step callback reports `instructionsRetired`, so the counter has to be live from
+    // the moment the debugger can see an instruction.
+    m_countInstructions = true;
     refreshDebugInfo();
 }
 

@@ -10,6 +10,31 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Link-time optimisation, because the dispatch loop lives in a different translation unit
+# from the memory model it drives.
+#
+# `LOAD_LOCAL` calls `loadScalar`, which calls `readBytes`, which asks the page cache for a
+# pointer -- calls that cannot be inlined across the boundary the build imposes. That
+# boundary is an artefact of how the sources are split, not of anything the code needs, and
+# it costs a call and a lost register on the single hottest path in the interpreter.
+#
+# Measured, minimum of five runs, alternating between two builds so drift cancels:
+#
+#     empty loop, 50 000 000 iterations     2.889 s  ->  2.785 s    -3.6%
+#     arithmetic loop, 5 000 000            0.897 s  ->  0.866 s    -3.5%
+#     `fib(10)` x 300 000                  11.112 s  -> 10.445 s    -6.0%
+#     array walk, 2 000 000 x 1 000         0.462 s  ->  0.450 s    -2.6%
+#
+# Worth having, and smaller than expected: the call overhead was real, but the work inside
+# those functions dominates. The remaining cost is in the page-translation fast path, which
+# needs a change of shape rather than a change of build flags.
+#
+# Release only. A debug build is recompiled constantly and LTO makes each rebuild slower for
+# no benefit -- nobody is measuring dispatch cost under a debugger.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # An optimised build is the default: the VM is a hot interpreter loop and is

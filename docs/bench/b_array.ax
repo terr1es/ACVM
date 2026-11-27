@@ -1,0 +1,10 @@
+int buf[1000];
+function main():void {
+    for (int i = 0; i < 1000; i++) { buf[i] = i; }
+    int total = 0;
+    for (int r = 0; r < 2000; r++) {
+        for (int i = 0; i < 1000; i++) { total = total + buf[i]; }
+    }
+    print(total); print("\n");
+    eof: pass;
+}

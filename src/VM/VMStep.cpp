@@ -753,8 +753,10 @@ VM::Step VM::step(Process& process, std::string& error) {
 
             const Instruction& inst = code[ip];
             ++ip;
-            ++m_instructions;
-            ++m_opcodeCounts[static_cast<unsigned>(inst.op)];
+            if (m_countInstructions) {
+                ++m_instructions;
+                ++m_opcodeCounts[static_cast<unsigned>(inst.op)];
+            }
 
             // Every `return Step::Continue` below became `continue`, which targets this
             // loop. Note that `continue` inside the nested switch over ExternalOutcome
@@ -1322,6 +1324,12 @@ VM::Step VM::step(Process& process, std::string& error) {
                 continue;
 
             case OpCode::SafePoint:
+                // Nothing is watching, so there is nothing to hand control to. One
+                // predictable branch, instead of a hundred cycles of leaving the
+                // interpreter and coming back.
+                if (!safePointsMatter()) {
+                    continue;
+                }
                 frame.ip = ip;
                 return Step::SafePoint;
 

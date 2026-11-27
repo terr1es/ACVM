@@ -74,6 +74,9 @@ private:
     /// statements were consumed, 0 when the pattern does not apply.
     std::size_t tryEmitCopyStep(std::vector<StmtPtr>& stmts, std::size_t index);
     void emitExpr(Expr& expr);
+    /// Emits an expression whose value nobody wants: in statement position, and in the third
+    /// clause of a `for`. Collapses `x++` into `StepLocal` and pops anything else.
+    void emitDiscardedExpr(Expr& expr);
     void emitAddress(Expr& expr);
     void emitAssign(Expr& expr);
     void emitIncrement(Expr& expr, bool isIncrement, bool isPrefix, bool keepResult = true);
