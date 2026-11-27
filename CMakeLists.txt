@@ -571,6 +571,13 @@ if(ACVM_BUILD_TESTS)
         acvm_add_script_check(${check_name})
     endforeach()
 
+    # The one check that needs real arguments. Every other script check is registered with
+    # none, which is why `cliParseArgvWith` could lose the first argument without any test
+    # noticing: the others build a command line as a string, program name included.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extralib/cli.ax")
+        acvm_add_script_check(cli_argv_check -- alpha -o beta --name gamma)
+    endif()
+
     # Every other check invokes `acvm` with an absolute path, so the invocation form
     # was never a variable -- which is how a regression that dropped the importing
     # file's own directory for relative paths (`acvm run prog.ax`) got in: ctest

@@ -1,0 +1,48 @@
+//  cli_argv_check.ax — `cliParseArgvWith` must not eat the first argument.
+//
+//  The parser reads token 0 as the program name, mirroring `argv[0]`. Axiom's argument array
+//  starts at the first real argument, so the two disagreed: every program using
+//  `cliParseArgvWith` silently lost its first argument, and `apack app.ax -o out` reported
+//  that no input file had been given.
+//
+//  It went unnoticed because the other checks build a command line as a string
+//  (`cliParse(#d, "tool test")`), which *does* include a program name. Only the entry point
+//  that reads real arguments was affected, and only that one is exercised here.
+//
+//  Run:  acvm run tests/cli_argv_check.ax -- alpha -o beta --name gamma
+
+function import (return:(cli));
+
+function fail(string message):void {
+    print("MISMATCH: "); print(message); print("\n");
+    trap();
+    eof: pass;
+}
+
+function main():void {
+    Doc d = docNew(0);
+    ptr CliArgs a = cliParseArgvWith(#d, "o:name:");
+
+    if (cliFailed(a)) {
+        print("MISMATCH: "); print(cliErrorText(a)); print("\n");
+        trap();
+    }
+    // The argument that was passed is the argument that must arrive. This is the assertion
+    // the missing "program" token broke.
+    if (cliPositionalCount(a) != 1) {
+        fail("the first argument did not become a positional");
+    }
+    if (cliPositionalAt(a, 0) != "alpha") {
+        fail("the first positional is not the argument that was passed");
+    }
+    if (cliValue(a, "o", "") != "beta") {
+        fail("'o' lost its value");
+    }
+    if (cliValue(a, "name", "") != "gamma") {
+        fail("'name' lost its value");
+    }
+
+    docFree(#d);
+    print("done\n");
+    eof: pass;
+}

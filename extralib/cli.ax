@@ -494,11 +494,14 @@ function cliParseArgvWith(ptr Doc d, string spec):ptr CliArgs {
     int count = argCount();
     StrBuf b = {null, 0, 0};
     sbInit(#b, 128);
+    // The parser reads token 0 as the program name, mirroring `argv[0]`. Axiom's argument
+    // array starts at the first real argument, so a stand-in is supplied here. Without it
+    // the first argument a program is given is read as its own name and never seen --
+    // `apack app.ax -o out` would parse `-o out` and report no input file.
+    sbPut(#b, "program");
     int i = 0;
     while (i < count) {
-        if (i > 0) {
-            sbPutByte(#b, 32);
-        }
+        sbPutByte(#b, 32);
         // Re-quote each argument so the tokenizer sees the original boundaries.
         string piece = argAt(i);
         bool needsQuote = piece.length == 0;

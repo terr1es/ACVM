@@ -5,9 +5,11 @@
 #include "acvm/VM/Jit.h"
 #include "acvm/VM/VM.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -334,6 +336,36 @@ int main(int argc, char** argv) {
     }
     if (command == "check") {
         return driver.checkSource(input, options);
+    }
+    if (command == "deps") {
+        // The modules a program reaches, one shared-library name per line, deduplicated.
+        //
+        // Exists so that a packager written in Axiom can answer the same question the
+        // native one answers by calling `Driver::dependencies()` directly. The list comes
+        // from the import walk either way; what changes is only how it crosses the
+        // boundary, and a line of text is the crossing that needs no bindings.
+        //
+        // The compile is a check, not a build: nothing is written. Its output goes
+        // elsewhere because `check` reports success on stdout, and a caller reading this
+        // command's stdout is parsing a list -- one stray line makes every line suspect.
+        std::ostringstream quiet;
+        acvm::Driver dependencyDriver(quiet, std::cerr);
+        const int status = dependencyDriver.checkSource(input, options);
+        if (status != 0) {
+            return status;
+        }
+        std::vector<std::string> seen;
+        for (const acvm::ModuleDependency& dependency : dependencyDriver.dependencies()) {
+            if (dependency.library.empty()) {
+                continue;
+            }
+            if (std::find(seen.begin(), seen.end(), dependency.library) != seen.end()) {
+                continue;
+            }
+            seen.push_back(dependency.library);
+            std::cout << dependency.library << '\n';
+        }
+        return 0;
     }
     if (command == "tokens") {
         return driver.dumpTokenStream(input);
