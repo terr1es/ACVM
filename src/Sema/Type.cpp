@@ -450,7 +450,17 @@ bool TypeContext::same(const Type* lhs, const Type* rhs) const {
         return same(lhs->elem, rhs->elem);
     case TypeKind::Array:
         return lhs->length == rhs->length && same(lhs->elem, rhs->elem);
-    case TypeKind::Tuple: {
+    // A tuple compares element by element, and a function type is stored the same way:
+    // `elems[0]` is the return type and `elems[1..]` the parameters. One branch for both.
+    //
+    // Reaching this without `lhs == rhs` is not possible today -- `getFunc` interns the
+    // signature vector, so two `Func<int, int>` are one object -- which is why the missing
+    // case never produced a wrong answer. It did produce a `-Wswitch` warning, and it would
+    // become a real bug the moment types are rebuilt rather than interned: a module read
+    // back from bytecode, or a signature mentioning an error type, would compare unequal
+    // to itself and the assignment would be rejected.
+    case TypeKind::Tuple:
+    case TypeKind::Func: {
         if (lhs->elems.size() != rhs->elems.size()) {
             return false;
         }
