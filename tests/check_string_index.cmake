@@ -58,14 +58,16 @@ function main():void {
 ]=] "cannot be assigned to")
 
 # The message has to name the way out, not just the prohibition: a reader who tried to
-# overwrite a character wants a string-building path, and str.replace or StrBuilder is it.
+# overwrite a character wants a string-building path. `StrBuilder` was named here first and
+# that was wrong -- its struct is public but `builderInit` / `builderAppend` / `builderFinish`
+# are all private, so only `str.ax` itself can use one.
 expect_reject(check string_index_assign_advice [=[
 function main():void {
     string s = "a";
     s[0] = 'b';
     eof: pass;
 }
-]=] "StrBuilder")
+]=] "makeString")
 
 # ── run time: out of range traps ───────────────────────────────────────────
 
@@ -120,4 +122,59 @@ function main():void {
 }
 ]=] "codePointAt")
 
-message(STATUS "string index: 7 cases rejected for the stated reason")
+# ── compile time: only `+=` concatenates ───────────────────────────────────
+
+# `+=` is concatenation on a string; nothing else is. The message has to name the operator
+# rather than fall back to "requires a numeric target", which was the old wording and sent
+# the reader looking for a numeric conversion that a string will never have.
+expect_reject(check string_append_sub [=[
+function main():void {
+    string s = "a";
+    s -= "b";
+    eof: pass;
+}
+]=] "'-=' is not defined for a string")
+
+expect_reject(check string_append_mul [=[
+function main():void {
+    string s = "a";
+    s *= "b";
+    eof: pass;
+}
+]=] "'*=' is not defined for a string")
+
+# What CONCAT cannot render, `+=` cannot append. Naming the type it got is the difference
+# between "not allowed" and "here is what I was asked to append".
+expect_reject(check string_append_struct [=[
+struct P { int x; };
+function main():void {
+    string s = "a";
+    P p = {1};
+    s += p;
+    eof: pass;
+}
+]=] "can append a string or a scalar, found 'P'")
+
+# ── compile time: a compound assignment reads the target first ─────────────
+
+# `m_lvalueContext` told `checkExpr` the target was a pure write, so an untouched variable
+# was accepted as the left side of `+=`. The implementation then added to whatever the slot
+# held -- on a fresh frame that is usually zero, so `int x; x += 1;` printed 1 and looked
+# correct. Caught on the string version, where the slot held a null descriptor.
+expect_reject(check compound_reads_target [=[
+function main():void {
+    int x;
+    x += 1;
+    eof: pass;
+}
+]=] "may be used before initialisation")
+
+expect_reject(check compound_reads_string_target [=[
+function main():void {
+    string s;
+    s += "b";
+    eof: pass;
+}
+]=] "may be used before initialisation")
+
+message(STATUS "string index and append: 12 cases rejected for the stated reason")

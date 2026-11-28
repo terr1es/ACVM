@@ -1,0 +1,217 @@
+//  string_append_check.ax — `s += x` concatenates, and `s = s + x` was already the answer.
+//
+//  `+=` went through the arithmetic path, which emits ADD on its two operands. For a
+//  string those operands are descriptor addresses, so `s += "b"` would have added two
+//  pointers and stored the sum -- the diagnostic said "requires a numeric target" and
+//  that was the honest answer to a construct that had no meaning.
+//
+//  So the claim worth pinning here is not just "it works": it is that `+=` and `+` agree.
+//  Any test that only checked the happy path would pass on an implementation that read
+//  the target twice, or that handled a string literal but not a `char`, or that rebuilt
+//  the descriptor but forgot the length half of it.
+//
+//  The cases below are the ones where those mistakes show up:
+//
+//    * a target read twice -- `arr[idx()] += s` counts its calls
+//    * the length half of the descriptor -- `length` after appending, not just the text
+//    * a self reference -- `s += s` must read the old value before writing the new
+//    * a scalar right hand side -- an int and a char go through CONCAT's own rendering
+//    * the value of the expression -- `(s += x)` is `CONCAT`'s result, not the old string
+
+function import (return:(test));
+
+int gCalls = 0;
+
+function private oneIndex():int {
+    gCalls = gCalls + 1;
+    return 0;
+    eof: pass;
+}
+
+// ─── agreement with `+` ───────────────────────────────────────────────────
+
+function private checkMatchesPlus():void {
+    testGroup("agrees with +");
+
+    string viaPlus = "ab";
+    viaPlus = viaPlus + "cd";
+
+    string viaCompound = "ab";
+    viaCompound += "cd";
+
+    checkString(viaCompound, "abcd", "appends a string");
+    check(viaCompound == viaPlus, "same result as s = s + rhs");
+    checkInt(viaCompound.length, 4, "length updated with the text");
+
+    // The length half of the descriptor is the half that a hand-rolled implementation
+    // forgets: the text would be right and `length` would still say 2.
+    string grown = "x";
+    grown += "yz";
+    checkInt(grown.length, 3, "length grows");
+    checkString(grown, "xyz", "text and length agree");
+    eof: pass;
+}
+
+function private checkRepeated():void {
+    testGroup("repeated");
+
+    string acc = "";
+    acc += "x";
+    acc += "y";
+    acc += "z";
+    checkString(acc, "xyz", "three appends in a row");
+    checkInt(acc.length, 3, "length after three appends");
+
+    // Starting from empty is the shape a tokenizer or a report builder uses, and it is
+    // the one where an implementation that assumes a non-empty target falls over.
+    string fromEmpty = "";
+    checkInt(fromEmpty.length, 0, "empty before");
+    fromEmpty += "a";
+    checkString(fromEmpty, "a", "first append to an empty string");
+    eof: pass;
+}
+
+function private checkSelfReference():void {
+    testGroup("self reference");
+
+    // `s += s` reads the old value and writes a new one. If the store happened before the
+    // read -- or if the two shared a buffer -- this would be "ab" or "ababab".
+    string s = "ab";
+    s += s;
+    checkString(s, "abab", "s += s doubles the text");
+    checkInt(s.length, 4, "s += s doubles the length");
+    eof: pass;
+}
+
+// ─── scalar right hand sides ──────────────────────────────────────────────
+
+function private checkScalars():void {
+    testGroup("scalars");
+
+    // CONCAT already renders a scalar into the string, so `+=` inherits that. Worth
+    // stating separately: an implementation that only handled the string case would
+    // reject or mis-encode these.
+    string n = "";
+    n += 42;
+    checkString(n, "42", "appends an int");
+
+    string c = "c=";
+    c += 'A';
+    checkString(c, "c=A", "appends a char");
+
+    string mixed = "n=";
+    mixed += 7;
+    mixed += " c=";
+    mixed += 'Z';
+    checkString(mixed, "n=7 c=Z", "int and char interleaved with text");
+
+    string negative = "";
+    negative += -5;
+    checkString(negative, "-5", "appends a negative int");
+
+    string truth = "";
+    truth += true;
+    checkString(truth, "true", "appends a bool");
+    eof: pass;
+}
+
+// ─── targets other than a plain local ─────────────────────────────────────
+
+function private checkArrayElement():void {
+    testGroup("array element");
+
+    string arr[2] = {"a", "b"};
+    arr[0] += "!";
+    checkString(arr[0], "a!", "appends through an array element");
+    checkString(arr[1], "b", "the neighbour is untouched");
+
+    // The index is evaluated once. Reading the target twice -- once to concatenate, once
+    // to store -- would index twice, and with a call in the subscript the two reads need
+    // not agree. `oneIndex` counts.
+    string single[1] = {"x"};
+    gCalls = 0;
+    single[oneIndex()] += "y";
+    checkInt(gCalls, 1, "the subscript is evaluated once");
+    checkString(single[0], "xy", "appends through a computed index");
+    eof: pass;
+}
+
+struct Holder {
+    string text;
+    int count;
+};
+
+function private checkMember():void {
+    testGroup("member");
+
+    Holder h = {"hi", 7};
+    h.text += " there";
+    checkString(h.text, "hi there", "appends through a struct member");
+    checkInt(h.count, 7, "the neighbouring field is untouched");
+
+    Holder nested[1] = {{"a", 1}};
+    nested[0].text += "b";
+    checkString(nested[0].text, "ab", "appends through an element's member");
+    eof: pass;
+}
+
+string gGlobal = "g";
+
+function private checkGlobal():void {
+    testGroup("global");
+
+    gGlobal += "!";
+    checkString(gGlobal, "g!", "appends to a global");
+    gGlobal += "!";
+    checkString(gGlobal, "g!!", "appends to a global twice");
+    eof: pass;
+}
+
+// ─── the expression has a value ───────────────────────────────────────────
+
+function private checkValue():void {
+    testGroup("value of the expression");
+
+    // `x = (s += "q")` must see the new string: the value of the assignment is CONCAT's
+    // result, which is also what gets stored. An implementation that left the old string
+    // on the stack would give "p".
+    string s = "p";
+    string got = (s += "q");
+    checkString(s, "pq", "the target holds the new string");
+    checkString(got, "pq", "the expression evaluates to the new string");
+    eof: pass;
+}
+
+// ─── byte content, not characters ─────────────────────────────────────────
+
+function private checkBytes():void {
+    testGroup("bytes");
+
+    // Appending byte by byte rebuilds the source exactly, including multi-byte text: the
+    // char a byte index returns holds 0..255, and CONCAT encodes a char as a code point,
+    // so a byte >= 0x80 does not survive this path. This case pins ASCII, where the two
+    // views coincide, which is what a tokenizer reads.
+    string src = "1+1+1";
+    string acc = "";
+    for i in 0..src.length {
+        acc += src[i];
+    }
+    checkString(acc, "1+1+1", "byte by byte rebuild");
+    check(acc == src, "and compares equal to the source");
+    checkInt(acc.length, 5, "same length");
+    eof: pass;
+}
+
+function main():void {
+    checkMatchesPlus();
+    checkRepeated();
+    checkSelfReference();
+    checkScalars();
+    checkArrayElement();
+    checkMember();
+    checkGlobal();
+    checkValue();
+    checkBytes();
+    testFinish();
+    eof: pass;
+}

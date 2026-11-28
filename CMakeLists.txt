@@ -605,7 +605,7 @@ if(ACVM_BUILD_TESTS)
                             ternary_check int128_check methods_check
                             compare_branch_check scalar_fastpath_check
                             shared_library_names_check global_index_check
-                            string_index_check
+                            string_index_check string_append_check
                             ${ACVM_EXTRALIB_CHECKS})
         acvm_add_script_check(${check_name})
     endforeach()

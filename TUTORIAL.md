@@ -198,6 +198,36 @@ function main():void {
 Comparing strings with `==` compares contents, not pointers. `String` values are
 compared by bytes; `s == "axiom"` is true for any equal content.
 
+`+=` appends, and takes anything `+` can render — another string, an `int`, a `char`, a
+`bool`. It is the only compound operator defined for a string: `s -= "x"` is rejected.
+
+```axiom
+function main():void {
+    string line = "";
+    line += "count=";
+    line += 3;
+    line += ", first=";
+    line += 'A';
+    print(line);                // count=3, first=A
+    print("\n");
+    print(line.length);         // 16
+    print("\n");
+    eof: pass;
+}
+```
+
+```
+── output ──
+count=3, first=A
+16
+```
+
+For text built in a loop, `+=` allocates a new string each time. The builder in `str` is
+private, so fill a `char` buffer and finish with `makeString` when the length is known in
+advance — that is what `readLineInto` does. Write it through a byte view: a `char` buffer
+holds two bytes per element and `makeString` reads them packed, so `buf[n] = c` is not the
+same as writing byte `n`.
+
 ### 1.5 void and null
 
 `void` is the absence of a value. `null` is a literal of its own type: convertible to any

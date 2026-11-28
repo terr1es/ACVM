@@ -1099,7 +1099,8 @@ const Type* Sema::checkAssign(Expr& expr, Scope& scope, Flow& flow) {
             target.kids[0]->type->kind == TypeKind::String) {
             m_diagnostics.error(target.range,
                                 "'s[i]' reads a byte of a string and cannot be assigned to; "
-                                "build a new string with str.replace or a StrBuilder instead");
+                                "build the new text with str.replace, or fill a byte buffer "
+                                "and makeString it");
         } else {
             m_diagnostics.error(target.range,
                                 "the left side of an assignment must be a variable, a member or "
@@ -1132,7 +1133,32 @@ const Type* Sema::checkAssign(Expr& expr, Scope& scope, Flow& flow) {
                                                  conversionHint(effective, targetType));
         }
     } else {
-        if (!targetType->isNumeric() && targetType->kind != TypeKind::Char) {
+        // A compound assignment reads the target before writing it, so the target has to
+        // hold a value already. This check was missing: `m_lvalueContext` above told
+        // `checkExpr` that the target was a pure write, so `int x; x += 1;` compiled and
+        // added to whatever the stack slot happened to contain -- measured, it printed 1
+        // because the slot was zero, which is the worst way for this to be wrong.
+        if (Symbol* root = lvalueRoot(target); root != nullptr) {
+            checkValueReadable(*root, flow, target.range);
+        }
+
+        // `+=` on a string is concatenation, and it is the only compound operator that
+        // means anything for text. Saying "requires a numeric target" for `s -= "x"`
+        // would send the reader looking for a numeric conversion that is not there, so
+        // the string case is separated from the arithmetic one.
+        if (targetType->kind == TypeKind::String && expr.assignop == AssignOp::Add) {
+            // Whatever `+` can render into a string, `+=` can append: another string, an
+            // int, a char, a float, a bool, an enum, a pointer.
+            if (!isScalarOrString(valueType) && !valueType->isError()) {
+                m_diagnostics.error(value.range,
+                                    "'+=' on a string can append a string or a scalar, found '" +
+                                        valueType->describe() + "'");
+            }
+        } else if (targetType->kind == TypeKind::String) {
+            m_diagnostics.error(expr.range,
+                                "'" + std::string(assignOpName(expr.assignop)) +
+                                    "' is not defined for a string; only '+=' concatenates");
+        } else if (!targetType->isNumeric() && targetType->kind != TypeKind::Char) {
             m_diagnostics.error(expr.range,
                                 "compound assignment requires a numeric target, found '" +
                                     targetType->describe() + "'");
