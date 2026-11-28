@@ -103,6 +103,79 @@ function pathListSeparator():string {
     eof: pass;
 }
 
+//  The file names a `library "name"` declaration could have on `platform`, in the
+//  order to try, separated by newlines:
+//
+//      windows   name.dll
+//      linux     libname.so, name.so
+//      macos     libname.dylib, name.dylib
+//
+//  A name that already carries one of those extensions comes back unchanged, so
+//  `library "libz.so"` and `library "z"` both work.
+//
+//  Two names on POSIX, not one, because both spellings occur in the wild: the
+//  system's own libraries are `libz.so`, a module built by this toolchain is
+//  `z.so` (its build sets PREFIX ""). A caller that knows only one spelling
+//  reports a missing library that is right there under the other name.
+//
+//  Takes the platform as an argument rather than reading it, and that is not for
+//  style: a rule that reads the platform can only be tested on the platform it
+//  runs on, so the POSIX half of this function was correct and unverified from the
+//  day it was written. A packager that used it was Windows-only and every test
+//  passed. `sharedLibraryNamesFor("linux", "z")` can be checked from a Windows
+//  machine, and `shared_library_names_check.ax` does exactly that.
+function sharedLibraryNamesFor(string platform, string name):string {
+    if (name.length == 0) {
+        return "";
+    }
+    if (platform == "windows") {
+        if (trimSuffix(name, ".dll") != name) {
+            return name;
+        }
+        return name + ".dll";
+    }
+    if (trimSuffix(name, ".so") != name || trimSuffix(name, ".dylib") != name) {
+        return name;
+    }
+    if (platform == "macos") {
+        return "lib" + name + ".dylib\n" + name + ".dylib";
+    }
+    return "lib" + name + ".so\n" + name + ".so";
+    eof: pass;
+}
+
+//  `sharedLibraryNamesFor` for the platform this program is running on.
+//
+//  Newline separated rather than an array because that is what `makeSplit` in
+//  stdlib/str.ax consumes, and a caller has to try the names in order anyway.
+function sharedLibraryNames(string name):string {
+    return sharedLibraryNamesFor(platformName(), name);
+    eof: pass;
+}
+
+//  The suffix an executable carries on `platform`, dot included: ".exe" on
+//  Windows, "" everywhere else. Takes the platform for the same reason as
+//  `sharedLibraryNamesFor`.
+function executableSuffixFor(string platform):string {
+    if (platform == "windows") {
+        return ".exe";
+    }
+    return "";
+    eof: pass;
+}
+
+//  `executableSuffixFor` for the platform this program is running on.
+//
+//  This exists because the alternative is a literal ".exe" in every program that
+//  builds or ships another one, and that is not a style question: a packager
+//  written with ".exe" spawned hard compiled on Windows, verified its payload,
+//  and then failed at the copy step on Linux -- while the runtime it wanted sat
+//  in the directory being read from.
+function executableSuffix():string {
+    return executableSuffixFor(platformName());
+    eof: pass;
+}
+
 //  Rewrites `/` into the platform's separator. On Unix it returns the input
 //  unchanged; on Windows it turns `a/b/c` into `a\b\c`.
 //

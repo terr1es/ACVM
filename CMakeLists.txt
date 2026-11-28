@@ -604,7 +604,7 @@ if(ACVM_BUILD_TESTS)
                             generic_struct_check address_assign_check
                             ternary_check int128_check methods_check
                             compare_branch_check scalar_fastpath_check
-                            ${ACVM_EXTRALIB_CHECKS})
+                            shared_library_names_check ${ACVM_EXTRALIB_CHECKS})
         acvm_add_script_check(${check_name})
     endforeach()
 

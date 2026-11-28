@@ -1,0 +1,87 @@
+//  shared_library_names_check.ax -- the naming rule, checked on every platform at once.
+//
+//  This is the test that would have caught the defect that made APACK Windows-only. The
+//  packager spelled shared objects as `name + ".dll"` in eight places; the suffix rule in
+//  `stdlib/os.ax` has always had the POSIX spellings and always answered correctly, and every
+//  test passed, because the rule reads `platformName()` and the tests ran on Windows.
+//
+//  So the rule now takes the platform as an argument (`sharedLibraryNamesFor`) and this file
+//  asks it about all three, from whichever machine is running the check. That is the only way
+//  a Linux answer can be verified on Windows -- and it is a real risk being covered, not a
+//  hypothetical: the two spellings per platform exist because both occur in the wild, and
+//  getting them wrong produces a bundle that omits a library and traps on the recipient's
+//  machine.
+//
+//  Run:  acvm run tests/shared_library_names_check.ax
+
+function import (return:(os));
+function import (return:(str));
+
+function fail(string what):void {
+    print("MISMATCH: "); print(what); print("\n");
+    trap();
+    eof: pass;
+}
+
+/// True when `platform`+`name` produces exactly `first` and, if given, `second`.
+///
+/// Split rather than compared as one string so a failure names the position that was wrong:
+/// "expected libz.so first" is a different bug from "expected two names and got one".
+function expect(string platform, string name, string first, string second):bool {
+    SplitList parts = makeSplit(sharedLibraryNamesFor(platform, name), "\n");
+    ptr SplitList list = #parts;
+    int count = splitCount(list);
+    bool ok = count >= 1 && splitAt(list, 0) == first;
+    if (second.length > 0) {
+        ok = ok && count == 2 && splitAt(list, 1) == second;
+    } else {
+        ok = ok && count == 1;
+    }
+    splitFree(list);
+    return ok;
+    eof: pass;
+}
+
+function main():void {
+    // Windows: one name, and it is the plain one.
+    if (!expect("windows", "z", "z.dll", "")) { fail("windows z"); }
+    if (!expect("windows", "sqlite3", "sqlite3.dll", "")) { fail("windows sqlite3"); }
+
+    // Linux: two names, the `lib` prefix first. Both are real: the system's libraries carry
+    // the prefix, this toolchain's modules do not.
+    if (!expect("linux", "z", "libz.so", "z.so")) { fail("linux z"); }
+    if (!expect("linux", "io", "libio.so", "io.so")) { fail("linux io"); }
+
+    // macOS: the same pair, with its own extension.
+    if (!expect("macos", "z", "libz.dylib", "z.dylib")) { fail("macos z"); }
+
+    // A name that already carries an extension is left alone. This matters because `acvm
+    // deps` reports whatever the declaration said, and `library "libz.so"` is legal.
+    if (!expect("windows", "z.dll", "z.dll", "")) { fail("windows pre-suffixed"); }
+    if (!expect("linux", "libz.so", "libz.so", "")) { fail("linux pre-suffixed"); }
+    if (!expect("linux", "z.so", "z.so", "")) { fail("linux bare pre-suffixed"); }
+    if (!expect("macos", "libz.dylib", "libz.dylib", "")) { fail("macos pre-suffixed"); }
+
+    // Not a platform this build knows: the POSIX pair, which is the safer default -- a `.so`
+    // looked for on an unknown Unix is a missing file rather than a wrong load.
+    if (!expect("freebsd", "z", "libz.so", "z.so")) { fail("freebsd z"); }
+    if (!expect("unknown", "z", "libz.so", "z.so")) { fail("unknown z"); }
+
+    // An empty name produces nothing rather than a bare extension.
+    if (sharedLibraryNamesFor("linux", "").length != 0) { fail("empty name"); }
+
+    // Executable suffix, all three.
+    if (executableSuffixFor("windows") != ".exe") { fail("windows exe suffix"); }
+    if (executableSuffixFor("linux") != "") { fail("linux exe suffix"); }
+    if (executableSuffixFor("macos") != "") { fail("macos exe suffix"); }
+
+    // And the platform-reading wrappers must agree with the explicit forms, since they are
+    // what every caller actually uses.
+    if (executableSuffix() != executableSuffixFor(platformName())) { fail("exe wrapper"); }
+    if (sharedLibraryNames("z") != sharedLibraryNamesFor(platformName(), "z")) {
+        fail("library wrapper");
+    }
+
+    print("done\n");
+    eof: pass;
+}
