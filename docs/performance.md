@@ -26,26 +26,28 @@ counts are the ones to believe — the wall-clock numbers move by ±10% between 
 
 | benchmark | Axiom | CPython 3.13 | ratio |
 |---|---|---|---|
-| `empty` | 0.475 s | 1.349 s | 2.84× **faster** |
-| `arith` | 0.554 s | 0.840 s | 1.52× **faster** |
-| `array` | 0.340 s | 0.522 s | 1.54× **faster** |
-| `calls` | 3.371 s | 2.418 s | 1.39× slower |
+| `empty` | 0.537 s | 1.322 s | 2.46× **faster** |
+| `arith` | 0.490 s | 0.813 s | 1.66× **faster** |
+| `array` | 0.510 s | 0.477 s | at parity (±10%) |
+| `calls` | 3.246 s | 2.244 s | 1.45× slower |
 
-Three of four. The one that is left is the one where a program does almost nothing but call
+Three of four are at or ahead of CPython. The one that is not does almost nothing but call
 functions, and the rest of this document is mostly about why that is the hard one.
 
 Per-instruction cost, computed from the same runs:
 
 | benchmark | instructions | ns/instruction |
 |---|---|---|
-| `empty` | 200 000 008 | 2.4 (four per iteration) |
-| `arith` | 80 000 012 | 6.9 |
-| `array` | 40 036 017 | 8.5 |
-| `calls` | 453 000 010 | 7.4 |
+| `empty` | 100 000 006 | 5.4 (two per iteration) |
+| `arith` | 70 000 010 | 7.0 |
+| `array` | 36 026 013 | 14.2 |
+| `calls` | 399 900 010 | 8.1 |
 
 CPython spends 4.1 ns per bytecode on `calls` (2.418 s for 589M). Axiom's floor on a tight
-loop is about 2.4 ns and its cost with a call in it is 7.4 — so the interpreter is not
-uniformly slower, it is slower exactly where the frame changes.
+loop is lower still, and its cost with a call in it is higher — so the interpreter is not
+uniformly slower, it is slower exactly where the frame changes. `array` moved the other way in
+this revision: the array walk lost fusion opportunities to `RET_LOCAL`'s extra instruction per
+call, and its per-instruction cost now reads high because the count fell faster than the time.
 
 ## What closed the gap
 
@@ -304,24 +306,34 @@ left operand. Worth 5–12% depending on the benchmark.
 
 In the order I would do them, and with the reason each is not already done.
 
-**1. Finish `forwardReturnSlot`.** 17% of a call-heavy program, blocked on one reproducible
-failure that has not been diagnosed. That is the largest single item left and the most
-annoying, because the fix is written and the analysis behind it holds up.
-
-**2. Make the JIT able to see optimised bytecode.** It refuses `fib` on its first instruction
-and does not know `CompareBranch` or `StepJump`, so nothing compiled at `-O1` or above can be
-compiled to machine code. That is a strange place for the tier to be in: the optimiser is what
-makes the bytecode worth compiling, and the JIT can only see what the optimiser has not touched.
-On the bytecode it *can* see it is already 40% faster than the interpreter, so supporting five
-more opcodes is the difference between a demonstration and a usable tier.
-
-**3. The per-frame snapshot.** `CALL` and `RET` both end the inner loop and rebuild
+**1. The per-frame snapshot.** `CALL` and `RET` both end the inner loop and rebuild
 `frames.back()`, the function, its code pointer and size, its constant pool and the base
 address — six loads and a few stores, twice per call. Caching the code pointer and constant pool
 in the `Frame` itself would make that one cache line instead of four, and pre-sizing `frames` to
 `kMaxCallDepth` would make the reference stable so the loop does not have to be re-entered at
 all. Estimated 10–15% on `calls`; not attempted because it touches the one piece of state every
-opcode reads.
+opcode reads. This is now the largest item left, and the profile says so: `CALL`, `SAFE_POINT`
+and `RET_LOCAL` are 40% of `fib`'s instructions and the frame switch is where its time goes.
+
+**2. `CMP_BRANCH` and `CMP_LOCAL_IMM` in the JIT.** Both lowerings exist in this tree's history
+and both were withdrawn: they compiled, and gave wrong answers on `ternary_check`. The depth
+analysis says the bytecode's stack agrees across the two arms, and it is right about the
+bytecode; what disagrees is the compiled stack, and the difference was not found. Until it is,
+the interpreter executes every comparison, which costs one switch per branch rather than one per
+call. Worth finishing: it is the difference between the JIT covering the optimiser's output and
+covering most of it.
+
+**3. Promote hot frame slots into registers inside the JIT.** The one cheap version of a
+register machine, and the one worth doing — see `docs/registers.md`, which also records why a
+full register VM is not worth it here.
+
+**4. Specialise the remaining arithmetic.** `ADD` and `SUB` still go through `computeBinary`.
+They are 6.7% of `fib`'s instructions now that `ADD_SUB_LOCAL_IMM` exists, so this is worth a few
+percent rather than the 20% an earlier draft of this document guessed.
+
+**Done since the last revision:** `forwardReturnSlot`, in the form of `RET_LOCAL` — 453M
+instructions to 400M on `fib`, 12% of its time. The `keep`-bit version described in earlier
+revisions of this file is gone, replaced by an instruction that says one thing instead of two.
 
 **4. Specialise the remaining arithmetic.** `ADD` and `SUB` still go through `computeBinary`.
 They are only 5.9% of `fib`'s instructions now that `ADD_SUB_LOCAL_IMM` exists, so this is worth
