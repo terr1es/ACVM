@@ -468,6 +468,21 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     }
 
 
+    // Whether a safe point in *compiled* code can be a no-op.
+    //
+    // `jitbridge::safePoint` exists to (a) record a resume ip, (b) run `event` conditions and
+    // (c) ask for a yield when another process could run. All three are decidable at compile
+    // time from the module alone: with no `event` declarations the condition phase returns
+    // immediately, and with no `process` declarations `m_processes` holds only the entry
+    // process, so a yield is never requested and the resume ip is never read -- a bail writes
+    // its own, and the debugger is not attached when the JIT is on.
+    //
+    // Worth measuring before believing: at 53.1M calls `fib` reaches two safe points per
+    // invocation, and emitting nothing for them took compiled recursion from 2.702 s to
+    // 1.959 s -- 27.5% of the whole benchmark, on the instruction every call is obliged to
+    // carry.
+    const bool safePointsAreNoOps = module.events.empty() && module.processes.empty();
+
     const std::size_t codeSize = function.code.size();
     constexpr std::size_t kNoLabel = std::numeric_limits<std::size_t>::max();
 
@@ -856,30 +871,12 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // runs. The lowering implements one width; deciding it here rather than in the
             // lowering is what makes the rest of the function still compilable, because a
             // refusal inside the lowering rejects the whole function.
-            // `RET_LOCAL` is handed to the interpreter at the point it runs, which is the
-            // last instruction of the function. A lowering for it was written and withdrawn:
-            // it produced code the assembler refused to finalise, and the cause was not found
-            // within the time this change had. Handing over costs one switch back per return
-            // and keeps every function that previously compiled still compiling, which is the
-            // trade to make while the cause is unknown -- the alternative was a lowering that
-            // works on the programs I tried and fails on one I did not.
-            if (!needsInterpreter && candidate.op == OpCode::RetLocal) {
-                needsInterpreter = true;
-            }
-            // `CMP_BRANCH` is executed by the interpreter, always.
-            //
-            // A lowering for it was written and withdrawn twice. The first version crashed,
-            // because a target that never got a label left `jcc` patching nothing. The second
-            // compiled and gave wrong answers on `ternary_check`: a comparison whose two arms
-            // leave different values on the compiled stack. The depth analysis in this file
-            // says the two edges agree -- and it is right about the *bytecode* -- but the
-            // compiled stack is not the bytecode's stack, and I did not find the difference
-            // inside the time this change had.
-            //
-            // Handing it over is cheap: `CMP_BRANCH` is a branch, so the interpreter takes
-            // control at that instruction and the surrounding loop is still compiled. What it
-            // costs is one switch per branch, not one per call.
-
+            // `RET_LOCAL` is lowered. It was withdrawn once, on the evidence of "the
+            // assembler could not produce executable code" for a function that used it -- but
+            // that turned out to be the unbound `slow` labels in `AddSubLocalImm` and
+            // `CmpLocalImm`, not this. Leaving it as a hand-off costs a switch back to the
+            // interpreter on every single return, which at 53.1M calls is one full interpreter
+            // entry per call.
             if (!needsInterpreter && candidate.op == OpCode::Call && candidate.a >= 0 &&
                 static_cast<std::size_t>(candidate.a) < module.functions.size()) {
                 needsInterpreter =
@@ -2024,6 +2021,42 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             break;
         }
 
+        case OpCode::RetLocal: {
+            // `LOAD_LOCAL slot; RET`: read the return slot and return it.
+            //
+            // Lowered as a load followed by the same `returnToCaller` call that `Ret` emits,
+            // which is what the two instructions meant together. The value never reaches the
+            // value stack: it goes from the frame slot into the third argument register.
+            const IntInfo info = intInfoOf(module, function.returnMemType);
+            if (!info.supported) {
+                refusal = "return of a type the JIT does not inline";
+                break;
+            }
+            if (depth >= kMaxValueSlots) {
+                refusal = "expression stack deeper than the JIT supports";
+                break;
+            }
+            auto slow = assembler.newLabel();
+            auto done = assembler.newLabel();
+            emitScalarLoad(inst.a, info.bits, info.isUnsigned, slow);
+            assembler.mov(mem(Reg::Rsp, slotOffset(depth)), kRegA);
+            assembler.jmp(done);
+            assembler.bind(slow);
+            emitHelperLoad(inst.a, function.returnMemType, depth);
+            assembler.bind(done);
+            assembler.mov(kArg3, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.mov(kArg1, kRegProcess);
+            assembler.movImm(kArg2, Width::Dword, 1);
+            assembler.movImm(kArg4, Width::Dword,
+                             isPointerType(module, function.returnMemType) ? 1 : 0);
+            assembler.callAbsolute(
+                reinterpret_cast<const void*>(&jitbridge::returnToCaller));
+            assembler.movImm(kRegA, Width::Qword, 1);
+            assembler.jmp(failureExit);
+            emittedReturn = true;
+            break;
+        }
+
         case OpCode::Ret: {
             // returnToCaller(process, hasResult, result, resultIsPtr): r8 carries the
             // value, r9 the tag flag. The value goes straight from its slot into r8 --
@@ -2062,6 +2095,9 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         }
 
         case OpCode::SafePoint: {
+            if (safePointsAreNoOps) {
+                break;
+            }
             // A yield is only safe with an empty expression stack. The compiled body keeps
             // its operands in frame slots, but the interpreter resumes at `ip + 1` from
             // `process.stack` -- which knows nothing about them. IRGen emits a safe point
