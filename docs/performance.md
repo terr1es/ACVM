@@ -501,6 +501,37 @@ So the ceiling is roughly 10-15%, for a hundred instructions of assembler emitti
 convention that has to agree with `callFromSlots` exactly. Not worth it. The measured win was in
 the data structure, and the data structure is done.
 
+### The bounds checks an array access performs twice
+
+`LOOK_GLOBAL_INDEXED` is one instruction for `buf[i]` -- it replaced eighteen, and the array
+benchmark went from 298 ms to 201 ms when it landed. It checks `0 <= index < count` itself,
+which it has to: a fused instruction that did not would be unsafe on its own.
+
+The front end also emits that same pair of checks immediately before, from `emitBoundsCheck`,
+because when it emitted them there was no fused form to do the job. So the check runs twice,
+seven instructions per element, and on the array benchmark that is 7 of the 13 remaining.
+
+**Not removed, and this is the third attempt.** The pattern is easy to match and the
+replacement is obviously equivalent; what is hard is proving it in the optimizer's terms, and
+each attempt failed differently:
+
+  1. matched by shape alone and dropped the window -- including the `LOAD_LOCAL` that reloads
+     the index -- so the fused load read a stale slot. `global_index_check` reported
+     `expected 40, got 4`, which is the wrong value rather than a wrong trap, and that
+     distinction is what made it findable.
+  2. added the upper-bound-equals-element-count condition and the jump-target test, and the
+     window stopped matching. The first comparison consumes a value already on the stack, so
+     the window's real shape is `const; cmp; trap; load; const; cmp; trap` -- seven, not eight,
+     and the second `load` is the only one that names the slot.
+  3. with the shape right, `targets[window]` still refused every loop, because a loop's back
+     edge targets the first instruction of the window. Excluding that one position fixed the
+     refusal but not the match, and the remaining cause was not found.
+
+Seven attempts, one optimizer pass, four distinct off-by-one errors in matching a window by
+index. The work is worth about 5% of the array benchmark and none of the others. Left undone
+deliberately, with the diagnosis above, rather than merged half-verified: attempt 1 passed the
+benchmark and broke a correctness test, and that is the failure mode this pattern produces.
+
 ### What is actually left
 
 `calls` is now 1.80× faster than CPython. Each invocation still costs one C++ call
