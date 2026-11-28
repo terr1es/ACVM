@@ -138,6 +138,24 @@ void setTrapMessage(std::string* error, const char* message) {
     }
 }
 
+/// Raises the trap an explicit `TRAP` instruction names, with the message the interpreter
+/// would produce for the same instruction.
+///
+/// The interpreter formats `trapKindName(kind) + ": in '<function>'"` when the instruction
+/// runs, and the differential tests compare trap messages, so a compiled trap has to produce
+/// the same text. Building it here rather than at compile time means the code generator needs
+/// no string storage of its own: the `Function` it points at is part of the module, which
+/// outlives every call.
+void raiseTrap(const Function* function, std::string* error, int kind) {
+    std::string message = trapKindName(static_cast<TrapKind>(kind));
+    message += ": in '";
+    message += function->name;
+    message += "'";
+    if (error != nullptr) {
+        *error = std::move(message);
+    }
+}
+
 } // namespace jitbridge
 
 namespace {
@@ -406,6 +424,29 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     if (function.isProcess) {
         whyNot = "process body (must remain preemptible)";
         return nullptr;
+    }
+
+    // Any function with a safe point in a program that runs more than one process, for the
+    // same reason and one more.
+    //
+    // A safe point can yield. A yield from compiled code returns "2" to whoever entered the
+    // function, and the interpreter's CALL turns that into `Step::SafePoint` so the scheduler
+    // can switch. A *compiled* caller cannot do that -- it is mid-native-frame with nowhere to
+    // hand control back from -- so the yield is dropped. That is a scheduling change, not an
+    // optimisation: `sync_check` has two assertions that count how many workers are inside a
+    // critical section, and they fail when the interleaving changes.
+    //
+    // These functions used to be refused for a different reason (an opcode the lowering did
+    // not implement), so the policy was hidden behind a missing feature. Implementing `TRAP`
+    // and `GLOBAL_ADDR` exposed it.
+    if (module.processes.size() > 1) {
+        for (const Instruction& ins : function.code) {
+            if (ins.op == OpCode::SafePoint) {
+                whyNot = "safe point in a program with more than one process "
+                         "(must remain preemptible)";
+                return nullptr;
+            }
+        }
     }
     // The frame's pages are pinned once, at entry, into a table the whole body addresses
     // through -- so the frame has to fit in the table. Worst case the frame starts one byte
@@ -801,11 +842,9 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // This list has to stay in step with the lowering's switch. A new opcode that
             // `effectOf` models but the lowering does not emit belongs here, and the
             // symptom of forgetting is a refusal naming it rather than anything subtler.
-            case OpCode::Trap:
             case OpCode::ConstFloat:
             case OpCode::ArenaMark:
             case OpCode::CopyStep:
-            case OpCode::GlobalAddr:
             case OpCode::LoadGlobal:
             case OpCode::StoreGlobal:
                 needsInterpreter = true;
@@ -840,9 +879,7 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // Handing it over is cheap: `CMP_BRANCH` is a branch, so the interpreter takes
             // control at that instruction and the surrounding loop is still compiled. What it
             // costs is one switch per branch, not one per call.
-            if (!needsInterpreter && candidate.op == OpCode::CompareBranch) {
-                needsInterpreter = true;
-            }
+
             if (!needsInterpreter && candidate.op == OpCode::Call && candidate.a >= 0 &&
                 static_cast<std::size_t>(candidate.a) < module.functions.size()) {
                 needsInterpreter =
@@ -1026,6 +1063,41 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             }
             assembler.movImm(kRegA, Width::Qword, static_cast<std::int64_t>(raw));
             pushA();
+            break;
+        }
+
+        case OpCode::Trap: {
+            // An explicit trap -- an out-of-bounds index, a failed assertion. The message has
+            // to match the interpreter's character for character, so the bridge builds it from
+            // the same two pieces the interpreter uses.
+            assembler.movImm(kArg1, Width::Qword,
+                             static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(
+                                 &function)));
+            assembler.mov(kArg2, kRegError);
+            assembler.movImm(kArg3, Width::Dword, inst.a);
+            assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::raiseTrap));
+            assembler.movImm(kRegA, Width::Qword, 0);
+            assembler.jmp(failureExit);
+            emittedReturn = true;
+            break;
+        }
+
+        case OpCode::GlobalAddr: {
+            // The address of a global. Both halves of it are compile-time constants -- the
+            // globals live at a fixed base and each has a fixed offset -- so this is a
+            // constant push, and the load that follows goes through the pointer path, which
+            // creates the page on first touch exactly as the interpreter does.
+            if (inst.a < 0 || static_cast<std::size_t>(inst.a) >= module.globals.size()) {
+                refusal = "invalid global index";
+                break;
+            }
+            assembler.movImm(kRegA, Width::Qword,
+                             static_cast<std::int64_t>(
+                                 VM::kGlobalBase +
+                                 module.globals[static_cast<std::size_t>(inst.a)].offset));
+            if (!pushA()) {
+                break;
+            }
             break;
         }
 
@@ -1362,15 +1434,13 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // touches the value stack, and the only one that is not `int32`-only -- the
             // optimizer fuses a comparison at whatever width it finds.
             //
-            // `intInfoOf` answers for pointers too (64-bit unsigned, no trap on arithmetic),
-            // which is what a pointer comparison needs. A float falls out as unsupported and
-            // is refused: the JIT has no floating-point lowering at all, and pretending
-            // otherwise here would be the only place it did.
-            // `int32` only, and the hand-off decision above has already been made: a
-            // `CMP_BRANCH` at any other width is taken out of the compiled region, so this
-            // is the only case that arrives. Reading the type without the check is what
-            // crashed -- the operand stack holds 8 bytes per slot whatever the type, but the
-            // comparison width and the sign extension do not.
+            // `intInfoOf` answers for pointers too (64-bit unsigned, no trap on arithmetic --
+            // pointer arithmetic in Axiom wraps), which is what a pointer comparison needs. A
+            // float falls out as unsupported and is refused, because the JIT has no
+            // floating-point lowering at all.
+            //
+            // The comparison is emitted at Qword width for every type: compiled slots are
+            // already sign- or zero-extended to 64 bits, so only the condition differs.
             const IntInfo info = intInfoOf(module, compareBranch::memTypeOf(inst.b));
             if (depth < 2) {
                 refusal = "stack underflow in CMP_BRANCH";

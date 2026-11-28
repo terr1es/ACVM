@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <utility>
 
 namespace acvm {
@@ -70,6 +71,74 @@ int hexValue(char c) {
         return c - 'a' + 10;
     }
     return c - 'A' + 10;
+}
+
+/// Decodes the UTF-8 sequence starting at `pos`, or reports that there is none.
+///
+/// Returns the number of bytes consumed (0 when the sequence is malformed) and writes the
+/// scalar value to `out`.
+std::size_t decodeUtf8At(std::string_view source, std::size_t pos, std::uint32_t& out) {
+    if (pos >= source.size()) {
+        return 0;
+    }
+    const auto lead = static_cast<unsigned char>(source[pos]);
+    std::size_t length = 0;
+    std::uint32_t value = 0;
+    if (lead < 0x80) {
+        out = lead;
+        return 1;
+    }
+    if ((lead & 0xE0) == 0xC0) {
+        length = 2;
+        value = lead & 0x1Fu;
+    } else if ((lead & 0xF0) == 0xE0) {
+        length = 3;
+        value = lead & 0x0Fu;
+    } else if ((lead & 0xF8) == 0xF0) {
+        length = 4;
+        value = lead & 0x07u;
+    } else {
+        return 0;   // a continuation byte, or a lead that UTF-8 never uses
+    }
+    if (pos + length > source.size()) {
+        return 0;
+    }
+    for (std::size_t i = 1; i < length; ++i) {
+        const auto next = static_cast<unsigned char>(source[pos + i]);
+        if ((next & 0xC0) != 0x80) {
+            return 0;
+        }
+        value = (value << 6) | (next & 0x3Fu);
+    }
+    out = value;
+    return length;
+}
+
+/// Names the byte that stopped the lexer in a way that cannot corrupt the output stream.
+///
+/// `c` is a single byte. Printing it directly is safe only while it is ASCII: a byte in
+/// 0x80..0xFF is a fragment of a UTF-8 sequence, and a lone fragment makes the whole
+/// diagnostic stream invalid UTF-8. Everything printed after it -- including the source
+/// line and every later error -- then renders as mojibake in the terminal, which is how
+/// one stray byte turns into "the compiler prints garbage". The sequence is decoded and
+/// named by its scalar value when it is valid; when it is not, the byte is shown as hex.
+std::string describeStrayByte(std::string_view source, std::size_t pos) {
+    std::uint32_t scalar = 0;
+    const std::size_t length = decodeUtf8At(source, pos, scalar);
+    if (length == 0) {
+        char buffer[16];
+        std::snprintf(buffer, sizeof(buffer), "0x%02X",
+                      static_cast<unsigned>(static_cast<unsigned char>(source[pos])));
+        return std::string("byte ") + buffer;
+    }
+    if (length == 1) {
+        return std::string("'") + static_cast<char>(scalar) + "'";
+    }
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "U+%04X ", static_cast<unsigned>(scalar));
+    std::string text = buffer;
+    text.append(source.substr(pos, length));
+    return "'" + text + "'";
 }
 
 } // namespace
@@ -655,6 +724,18 @@ Token Lexer::lexChar(std::uint32_t start) {
         }
     } else {
         body.push_back(advance());
+        // A non-ASCII character is several bytes of UTF-8 but still one code unit, so the
+        // literal is not malformed -- the lexer is byte-oriented. Consume the rest of the
+        // sequence so the closing quote is found: otherwise every continuation byte is
+        // lexed again and reported as "unexpected character byte 0xB8", burying the one
+        // message that explains what to write instead.
+        if (static_cast<unsigned char>(body.back()) >= 0x80) {
+            std::uint32_t scalar = 0;
+            const std::size_t length = decodeUtf8At(m_source, start + 1, scalar);
+            for (std::size_t i = 1; i < length; ++i) {
+                body.push_back(advance());
+            }
+        }
     }
 
     if (!match('\'')) {
@@ -667,9 +748,17 @@ Token Lexer::lexChar(std::uint32_t start) {
     // A char literal is either one raw character or one escape sequence.
     const bool singleEscape = body.size() >= 2 && body[0] == '\\';
     if (body.empty() || (body.size() != 1 && !singleEscape)) {
-        m_diagnostics.error(SourceRange{SourceLocation{m_file, start},
-                                        SourceLocation{m_file, static_cast<std::uint32_t>(m_pos)}},
-                            "a character literal must contain exactly one code unit");
+        // Name the escape that does work. A raw non-ASCII character is rejected because
+        // the lexer counts bytes, not code points -- the reader has no way to guess that
+        // from "must contain exactly one code unit", and `'\u4E2D'` is the spelling that
+        // has always been supported.
+        const bool rawNonAscii = !singleEscape && static_cast<unsigned char>(body[0]) >= 0x80;
+        m_diagnostics.error(
+            SourceRange{SourceLocation{m_file, start},
+                        SourceLocation{m_file, static_cast<std::uint32_t>(m_pos)}},
+            rawNonAscii ? "a char literal cannot contain a raw non-ASCII character; write "
+                          "the escape instead, e.g. '\\u4E2D'"
+                        : "a character literal must contain exactly one code unit");
     }
     return makeToken(TokenKind::CharLit, start);
 }
@@ -790,14 +879,22 @@ Token Lexer::lexOperator(std::uint32_t start) {
     case ']': return makeToken(TokenKind::RBracket, start);
     case '{': return makeToken(TokenKind::LBrace, start);
     case '}': return makeToken(TokenKind::RBrace, start);
-    default:
-        break;
+    default: {
+        // `c` is one byte of what may be a multi-byte UTF-8 sequence, and `advance()`
+        // above consumed only that byte. Swallowing the rest here keeps the one message
+        // that matters from being buried under two or three that repeat it as
+        // "unexpected character byte 0xB8" and "0xAD".
+        std::uint32_t scalar = 0;
+        const std::size_t length = decodeUtf8At(m_source, start, scalar);
+        m_diagnostics.error(SourceRange{SourceLocation{m_file, start},
+                                        SourceLocation{m_file, static_cast<std::uint32_t>(m_pos)}},
+                            "unexpected character " + describeStrayByte(m_source, start));
+        for (std::size_t i = 1; i < length; ++i) {
+            advance();
+        }
+        return makeToken(TokenKind::Invalid, start);
     }
-
-    m_diagnostics.error(SourceRange{SourceLocation{m_file, start},
-                                    SourceLocation{m_file, static_cast<std::uint32_t>(m_pos)}},
-                        std::string("unexpected character '") + c + "'");
-    return makeToken(TokenKind::Invalid, start);
+    }
 }
 
 Token Lexer::next() {

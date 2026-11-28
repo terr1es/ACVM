@@ -1253,7 +1253,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                     if (JitFunction native =
                             m_jit.entryFor(*m_module, calleeIndex, m_jitRefusal)) {
                         const std::int64_t outcome =
-                            native(this, &process, frameBase, &error);
+                            native(this, &process, frameBase, &error, nullptr);
                         if (outcome == 0) {
                             return Step::Trap;
                         }
