@@ -310,12 +310,13 @@ a demonstration rather than a tier. It now beats CPython 3.13 on all four.
 
 | benchmark | interpreter | `--jit` | vs CPython 3.13 |
 |---|---|---|---|
-| `empty` | 0.410 s | 0.109 s | 10.4× faster |
-| `arith` | 0.461 s | 0.037 s | 18.1× faster |
-| `array` | 0.281 s | 0.041 s | 9.5× faster |
-| `calls` | 2.940 s | 1.893 s | 1.04× faster |
+| `empty` | 0.445 s | 0.117 s | 11.0× faster |
+| `arith` | 0.507 s | 0.041 s | 19.4× faster |
+| `array` | 0.311 s | 0.047 s | 10.1× faster |
+| `calls` | 3.249 s | 1.504 s | 1.45× faster |
 
-Three causes, and only one of them was a missing lowering.
+Five causes. The two largest were not missing opcodes at all -- they were instructions the
+compiled body was still paying for on every call.
 
 `CMP_LOCAL_IMM` read its frame slot from `a`. But `a` is the jump target -- this instruction is
 a branch, like every other branch in this set -- and the slot is packed into `b` with the
@@ -325,8 +326,8 @@ the *target index*. For `ternary_check` that was a neighbouring variable holding
 attributed to the value stack disagreeing between the interpreter and compiled code, which was
 wrong; the disassembly showed `frame+4` and the lowering was reading `frame+12`.
 
-With the slot correct, the loop header compiles, and that is where the 3–12× comes from. `array`
-is unchanged because it walks a global array (`LOAD_GLOBAL`), which is still a hand-off point.
+With the slot correct, the loop header compiles, and that is where the first large gains came
+from.
 
 `calls` was *slower* than the interpreter at first -- 4.805 s against 3.305 s -- because every
 `CALL` in compiled code went through three C++ bridges: `pushValue` per argument, then
@@ -343,9 +344,40 @@ instead of 1.78× behind the interpreter:
     the interpreter's value stack, and no 32-byte `Value` is constructed per argument.
     2.802 s to 2.702 s.
 
-Compiled recursion still costs a C++ call per invocation -- there is no inlining and no direct
-jump to the callee's entry -- which is the whole of what is left between 2.702 s and CPython's
-2.209 s.
+### The two instructions a call still paid for
+
+After the bridge became one call instead of three, `calls` sat at 2.702 s. What closed the rest
+was not a missing opcode but two instructions the compiled body still handed back to the
+interpreter, or called out for, on every invocation.
+
+**`SAFE_POINT` was a C++ call, twice per `fib` invocation.** `jitbridge::safePoint` exists to
+record a resume ip, run `event` conditions and ask for a yield. All three are decidable at
+compile time from the module: with no `event` declarations the condition phase returns
+immediately, and with no `process` declarations `m_processes` holds only the entry process, so a
+yield is never requested and the resume ip is never read -- a bail writes its own, and the
+debugger is not attached when the JIT is on. Emitting nothing for those safe points took
+`calls` from 2.148 s to 1.795 s, 16.4%. At 53.1M calls that is 106M C++ calls removed.
+
+**`RET_LOCAL` was a hand-off.** Every compiled function ended by switching back to the
+interpreter so it could execute one instruction and return. Lowering it is a load from the
+return slot followed by the same `returnToCaller` call `RET` emits. 1.795 s to 1.504 s, another
+16.2%.
+
+That lowering had been written once before and withdrawn, on the evidence of "the assembler
+could not produce executable code" for a function that used it. The cause was the unbound
+`slow` labels in `AddSubLocalImm` and `CmpLocalImm`, not this -- the same "a created label must
+be bound" mistake, read as a reason to remove an unrelated piece of code. Worth remembering:
+a vague assembler error is not evidence about which lowering is at fault.
+
+Together: 2.148 s to 1.504 s, 30% of the benchmark.
+
+### What is actually left
+
+`calls` is now 1.45× faster than CPython. Each invocation still costs one C++ call
+(`callFromSlots`), one call back into generated code, and a frame zeroing that goes through the
+page table -- measured at 8.9% by ablation. A direct call that inlines the frame setup and jumps
+to the callee's entry would remove the first two; doing the zeroing in the callee's prologue,
+where the page pointers are already pinned, would remove the third.
 
 ## What did not work, this round
 
@@ -375,11 +407,10 @@ its entry is what would close the remaining 1.22× on `calls`. It is also the ch
 compiled recursion reachable for real programs, where a call is the unit of work rather than an
 occasional event.
 
-**2. `CMP_BRANCH` in the JIT.** Still handed to the interpreter, for the reason recorded below
-under "what did not work". `CMP_LOCAL_IMM` was in the same state until its operand bug was found,
-and fixing that one turned the JIT from "never faster than the interpreter" into 3.4× on a bare
-loop and 12× on an arithmetic one. `CMP_BRANCH` is the same opportunity for branches whose
-operand is not a local plus a constant.
+**2. The frame zeroing on every call.** `callFromSlots` calls `zeroBytes(frameBase, frameSize)`,
+which resolves a page through the store's cache before `memset`. Ablating it measures 8.9% of
+`calls`. The callee's prologue already pins its own pages, so the zeroing could move there and
+become a store per slot -- but only for frames small enough that the prologue knows all of them.
 
 **3. Promote more than one slot.** One frame slot's address is cached in `rbp`; worth 11.8% on a
 compiled arithmetic loop and nothing on the others. There are no more free callee-saved
