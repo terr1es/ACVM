@@ -191,6 +191,11 @@ public:
                                         std::uint64_t source, std::uint64_t size);
         static int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
                                  void** out, int maxPages);
+        /// A CALL whose arguments arrive in the caller's native slots instead of on the value
+        /// stack. See `jitbridge::callFromSlots` for what it replaces and what it measured.
+        static bool callFromSlots(VM& vm, void* process, int functionIndex, int argc,
+                                  const std::int64_t* args, std::uint32_t pointerMask,
+                                  std::int64_t* out, std::string* error);
         static bool callFunction(VM& vm, void* process, int functionIndex, int argc,
                                  std::string* error);
         static bool popResult(void* process, std::int64_t* out, bool isPtr = false);

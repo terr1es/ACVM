@@ -55,6 +55,13 @@ namespace acvm {
 
 namespace jitbridge {
 
+bool callFromSlots(VM& vm, void* process, int functionIndex, int argc,
+                   const std::int64_t* args, std::uint32_t pointerMask, std::int64_t* out,
+                   std::string* error) {
+    return VM::JitBridge::callFromSlots(vm, process, functionIndex, argc, args, pointerMask,
+                                       out, error);
+}
+
 bool loadSlot(VM& vm, std::uint64_t address, int typeIndex, std::int64_t& out) {
     return VM::JitBridge::loadSlot(vm, address, typeIndex, out);
 }
@@ -1835,54 +1842,54 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 refusal = "stack underflow in CALL";
                 break;
             }
-            // The interpreter's CALL reads its arguments from the value stack, so they
-            // have to be moved there. They are already contiguous in the native frame.
+            // One call, not three. The arguments stay in the caller's native slots and the
+            // result lands in the slot the first argument came from -- the expression stack
+            // shrinks by `argc` and grows by one, and that is exactly where it ends up.
+            //
+            // Before this, each call was `pushValue` per argument, then `callFunction`, then
+            // `popResult`: three trips through a C++ helper, each with its own register setup,
+            // plus a 32 byte `Value` constructed per argument and a value stack push and pop
+            // around it. At 53.1M calls that is the whole reason compiled code used to be
+            // slower than interpreted code on a recursive program.
             const std::size_t firstArgument = depth - static_cast<std::size_t>(argc);
+            std::uint32_t pointerMask = 0;
             for (int i = 0; i < argc; ++i) {
-                // An aggregate parameter (a string is one) arrives as the *address* of
-                // its descriptor, so it carries the pointer tag too -- pushing it as an
-                // integer made the callee read an empty string.
                 const ParamInfo* param =
                     i < static_cast<int>(callee.params.size())
                         ? &callee.params[static_cast<std::size_t>(i)]
                         : nullptr;
-                const bool argumentIsPtr =
-                    param != nullptr &&
-                    (param->aggregate || isPointerType(module, param->memType));
-                assembler.mov(kRegA,
-                              mem(Reg::Rsp, slotOffset(firstArgument +
-                                                       static_cast<std::size_t>(i))));
-                assembler.mov(kArg1, kRegProcess);
-                assembler.mov(kArg2, kRegA);
-                assembler.movImm(kArg3, Width::Dword, argumentIsPtr ? 1 : 0);
-                assembler.callAbsolute(
-                    reinterpret_cast<const void*>(&jitbridge::pushValue));
+                if (param != nullptr &&
+                    (param->aggregate || isPointerType(module, param->memType))) {
+                    pointerMask |= 1u << i;
+                }
+            }
+            // Eight arguments at most: four beyond the registers would already have been
+            // pushed by the caller of this function, and a bit mask carries the tags.
+            if (argc > 8) {
+                refusal = "call with more than eight arguments";
+                break;
             }
             assembler.mov(kArg1, kRegVm);
             assembler.mov(kArg2, kRegProcess);
             assembler.movImm(kArg3, Width::Dword, inst.a);
             assembler.movImm(kArg4, Width::Dword, argc);
-            assembler.subImm(Reg::Rsp, 48);
-            assembler.mov(mem(Reg::Rsp, 32), kRegError);   // fifth argument
+            // The fifth to eighth arguments go on the stack, 32 bytes of shadow space first,
+            // and the frame is kept 16 byte aligned at the call.
+            assembler.subImm(Reg::Rsp, 64);
+            assembler.lea(kRegA, mem(Reg::Rsp, static_cast<std::int32_t>(slotOffset(firstArgument)) + 64));
+            assembler.mov(mem(Reg::Rsp, 32), kRegA);          // args
+            assembler.movImm(kRegA, Width::Dword, static_cast<std::int32_t>(pointerMask));
+            assembler.mov(mem(Reg::Rsp, 40), kRegA);          // pointerMask
+            assembler.lea(kRegA, mem(Reg::Rsp, static_cast<std::int32_t>(slotOffset(firstArgument)) + 64));
+            assembler.mov(mem(Reg::Rsp, 48), kRegA);          // out
+            assembler.mov(mem(Reg::Rsp, 56), kRegError);
             assembler.callAbsolute(
-                reinterpret_cast<const void*>(&jitbridge::callFunction));
-            assembler.addImm(Reg::Rsp, 48);
+                reinterpret_cast<const void*>(&jitbridge::callFromSlots));
+            assembler.addImm(Reg::Rsp, 64);
             assembler.test(kRegA, kRegA, Width::Byte);
             assembler.jcc(Cond::Equal, failureExit);
             depth = firstArgument;
             if (callee.returnsValue) {
-                if (depth >= kMaxValueSlots) {
-                    refusal = "expression stack deeper than the JIT supports";
-                    break;
-                }
-                assembler.mov(kArg1, kRegProcess);
-                assembler.lea(kArg2, mem(Reg::Rsp, slotOffset(depth)));
-                assembler.movImm(kArg3, Width::Dword,
-                                 isPointerType(module, callee.returnMemType) ? 1 : 0);
-                assembler.callAbsolute(
-                    reinterpret_cast<const void*>(&jitbridge::popResult));
-                assembler.test(kRegA, kRegA, Width::Byte);
-                assembler.jcc(Cond::Equal, failureExit);
                 ++depth;
             }
             break;

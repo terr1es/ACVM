@@ -190,6 +190,24 @@ bool callFunction(VM& vm, void* process, int functionIndex, int argc,
 /// Moves the value stack's top into `out` and pops it. Used after a call returns.
 bool popResult(void* process, std::int64_t* out, bool isPtr = false);
 
+/// Performs a CALL from compiled code, reading the arguments out of the caller's native
+/// slots instead of pushing them onto the interpreter's value stack first.
+///
+/// `args` points at `argc` slots of 8 bytes, in the order the callee declares them, and
+/// `pointerMask` carries a bit per argument: set means the slot holds an address rather than
+/// an integer, which the callee's frame needs to know because it stores a tagged `Value`.
+///
+/// The result is written to `out` when the callee returns one. That is the same slot the
+/// first argument came from -- the caller's expression stack shrinks by `argc` and grows by
+/// one, and this way that slot is already in the right place.
+///
+/// This replaces three round trips per call (`pushValue` for each argument, then
+/// `callFunction`, then `popResult`). Those three were measurable: at 53.1M calls, removing
+/// the heap allocation inside `callFunction` alone took compiled `fib` from 4.81 s to 2.80 s.
+bool callFromSlots(VM& vm, void* process, int functionIndex, int argc,
+                   const std::int64_t* args, std::uint32_t pointerMask, std::int64_t* out,
+                   std::string* error);
+
 /// Pushes one value onto the interpreter's stack. Compiled code keeps its values in
 /// native slots, but CALL reads its arguments from `process.stack`, so this is how the two
 /// representations meet.

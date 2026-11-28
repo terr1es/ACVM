@@ -1588,6 +1588,125 @@ int VM::JitBridge::pinFramePages(VM& vm, std::uint64_t frameBase,
     return static_cast<int>(count);
 }
 
+bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int argc,
+                                  const std::int64_t* args, std::uint32_t pointerMask,
+                                  std::int64_t* out, std::string* error) {
+    auto& p = *static_cast<Process*>(process);
+    if (vm.m_module == nullptr || functionIndex < 0 ||
+        static_cast<std::size_t>(functionIndex) >= vm.m_module->functions.size()) {
+        if (error != nullptr) {
+            *error = "invalid call target";
+        }
+        return false;
+    }
+    const Function& callee = vm.m_module->functions[static_cast<std::size_t>(functionIndex)];
+
+    const std::uint64_t frameBase = p.stackTop;
+    const std::uint64_t frameSize = std::max<std::uint64_t>(callee.frameSize, 8);
+    const std::uint64_t previousTop = p.stackTop;
+    if (p.frames.size() >= kMaxCallDepth) {
+        if (error != nullptr) {
+            *error = "call depth exceeded in '" + callee.name + "' (unbounded recursion?)";
+        }
+        return false;
+    }
+
+    vm.zeroBytes(frameBase, frameSize);
+    p.stackTop += frameSize;
+    for (int i = 0; i < argc && static_cast<std::size_t>(i) < callee.params.size(); ++i) {
+        const ParamInfo& param = callee.params[static_cast<std::size_t>(i)];
+        const std::int64_t raw = args[i];
+        if (param.aggregate) {
+            // The slot holds the address of the descriptor, so its bytes have to be copied
+            // into the callee's frame -- storing the address leaves the callee reading an
+            // empty string.
+            std::uint8_t buffer[64];
+            const std::uint64_t from = static_cast<std::uint64_t>(raw);
+            if (param.size <= sizeof(buffer)) {
+                vm.readBytes(from, buffer, param.size);
+                vm.writeBytes(frameBase + param.offset, buffer, param.size);
+            } else {
+                std::vector<std::uint8_t> large(param.size);
+                vm.readBytes(from, large.data(), param.size);
+                vm.writeBytes(frameBase + param.offset, large.data(), param.size);
+            }
+        } else {
+            const bool isPtr = (pointerMask & (1u << i)) != 0;
+            const Value value = isPtr ? Value::fromPtr(static_cast<std::uint64_t>(raw))
+                                      : Value::fromInt(static_cast<Int128>(raw));
+            vm.storeScalar(frameBase + param.offset, param.memType, value);
+        }
+    }
+
+    // The same tail `callFunction` uses. It computes the frame base again from `stackTop`,
+    // which is why that is passed in rather than assumed.
+    const std::uint64_t pushedBase = p.stackTop - frameSize;
+    p.frames.push_back(Frame::of(&callee, pushedBase));
+
+    if (JitFunction native = vm.m_jit.entryFor(*vm.m_module,
+                                               static_cast<std::size_t>(functionIndex),
+                                               vm.m_jitRefusal)) {
+        const std::int64_t outcome = native(&vm, &p, pushedBase, error);
+        if (outcome == 0) {
+            // Unwind what was set up, so the caller's failure path sees the stack it had.
+            p.stackTop = previousTop;
+            return false;
+        }
+        if (outcome == 3) {
+            // The body stopped at an instruction only the interpreter can run. The frame is
+            // still on the frame stack and its resume ip was written, so finish it here.
+            const std::size_t baseDepth = p.frames.size();
+            const std::size_t previousFloor = vm.m_frameFloor;
+            vm.m_frameFloor = baseDepth;
+            while (p.frames.size() >= baseDepth && !p.finished) {
+                const Step result = vm.step(p, *error);
+                if (result == Step::Trap) {
+                    vm.m_frameFloor = previousFloor;
+                    p.stackTop = previousTop;
+                    return false;
+                }
+                if (result == Step::Finished) {
+                    break;
+                }
+            }
+            vm.m_frameFloor = previousFloor;
+        }
+    } else {
+        const std::size_t baseDepth = p.frames.size();
+        const std::size_t previousFloor = vm.m_frameFloor;
+        vm.m_frameFloor = baseDepth;
+        while (p.frames.size() >= baseDepth && !p.finished) {
+            const Step result = vm.step(p, *error);
+            if (result == Step::Trap) {
+                vm.m_frameFloor = previousFloor;
+                p.stackTop = previousTop;
+                return false;
+            }
+            if (result == Step::Finished) {
+                break;
+            }
+        }
+        vm.m_frameFloor = previousFloor;
+    }
+
+    // The callee's epilogue left its result on the value stack, whichever way it ran. Move it
+    // into the caller's native slot: the caller's expression stack shrinks by `argc` and grows
+    // by one, and `out` is the slot where the first argument was, so nothing has to move.
+    if (callee.returnsValue) {
+        if (p.stack.empty()) {
+            if (error != nullptr) {
+                *error = "missing return value in '" + callee.name + "'";
+            }
+            p.stackTop = previousTop;
+            return false;
+        }
+        const Value result = p.stack.back();
+        p.stack.pop_back();
+        *out = static_cast<std::int64_t>(result.asInt());
+    }
+    return true;
+}
+
 bool VM::JitBridge::callFunction(VM& vm, void* process, int functionIndex, int argc,
                                  std::string* error) {
     auto& p = *static_cast<Process*>(process);
@@ -1613,34 +1732,51 @@ bool VM::JitBridge::callFunction(VM& vm, void* process, int functionIndex, int a
         return false;
     }
 
-    std::vector<Value> arguments(static_cast<std::size_t>(argc));
-    for (std::size_t i = static_cast<std::size_t>(argc); i-- > 0;) {
-        if (p.stack.empty()) {
-            if (error != nullptr) {
-                *error = "stack underflow in CALL to '" + callee.name + "' (argc " +
-                     std::to_string(argc) + ", stack " + std::to_string(p.stack.size()) + ")";
-            }
-            return false;
+    // Arguments are read off the value stack where they sit, not moved into a
+    // `std::vector<Value>` first.
+    //
+    // The vector was a heap allocation and a free on every call -- the same shape that was
+    // removed from the interpreter's own CALL, and it should have been removed here at the
+    // same time. Compiled callers push their arguments here, so the layout is the interpreter's:
+    // the arguments are the top `argc` values, in order.
+    const std::size_t stackSize = p.stack.size();
+    if (stackSize < static_cast<std::size_t>(argc)) {
+        if (error != nullptr) {
+            *error = "stack underflow in CALL to '" + callee.name + "' (argc " +
+                     std::to_string(argc) + ", stack " + std::to_string(stackSize) + ")";
         }
-        arguments[i] = p.stack.back();
-        p.stack.pop_back();
+        return false;
     }
+    const std::size_t argumentBase = stackSize - static_cast<std::size_t>(argc);
 
     vm.zeroBytes(frameBase, frameSize);
     p.stackTop += frameSize;
-    for (std::size_t i = 0; i < arguments.size() && i < callee.params.size(); ++i) {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(argc) && i < callee.params.size(); ++i) {
         const ParamInfo& param = callee.params[i];
+        const Value& argument = p.stack[argumentBase + i];
         if (param.aggregate) {
             // An aggregate argument is the address of its descriptor, so the bytes have to
             // be copied into the callee's frame. Storing the pointer instead -- which is
             // what this did at first -- leaves the callee reading an empty string.
-            std::vector<std::uint8_t> buffer(param.size);
-            vm.readBytes(arguments[i].asPtr(), buffer.data(), param.size);
-            vm.writeBytes(frameBase + param.offset, buffer.data(), param.size);
+            //
+            // Through a stack buffer rather than a heap one: a struct is small, and the point
+            // of this rewrite is to stop allocating per call.
+            std::uint8_t buffer[64];
+            if (param.size <= sizeof(buffer)) {
+                vm.readBytes(argument.asPtr(), buffer, param.size);
+                vm.writeBytes(frameBase + param.offset, buffer, param.size);
+            } else {
+                std::vector<std::uint8_t> large(param.size);
+                vm.readBytes(argument.asPtr(), large.data(), param.size);
+                vm.writeBytes(frameBase + param.offset, large.data(), param.size);
+            }
         } else {
-            vm.storeScalar(frameBase + param.offset, param.memType, arguments[i]);
+            vm.storeScalar(frameBase + param.offset, param.memType, argument);
         }
     }
+    // The arguments are copied, so they can go. This is what the pop loop above did one at a
+    // time; doing it once keeps `p.stack` from being resized inside the loop that reads it.
+    p.stack.resize(argumentBase);
 
     p.frames.push_back(Frame::of(&callee, frameBase));
 
