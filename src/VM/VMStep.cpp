@@ -1204,9 +1204,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                             readBytes(argument.asPtr(), large.data(), param.size);
                             writeBytes(frameBase + param.offset, large.data(), param.size);
                         }
-                    } else if (const MemType& paramType = memType(param.memType);
-                               paramType.kind == MemType::Kind::Int && paramType.size == 4 &&
-                               paramType.bits == 32 && !paramType.isUnsigned) {
+                    } else if (memType(param.memType).isPlainInt32()) {
                         // Same int32 shortcut as `STORE_LOCAL`: every scalar parameter on every
                         // call went through the general store, which is a page lookup, a
                         // `memcpy`, a mask and a narrowing, to write four bytes.
@@ -1410,8 +1408,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                 const int loadType = inst.b & 0xFF;
                 const std::uint64_t loadAddress = baseAddress + static_cast<std::uint64_t>(inst.a);
                 const MemType& loadMemType = memType(loadType);
-                if (loadMemType.kind == MemType::Kind::Int && loadMemType.size == 4 &&
-                    loadMemType.bits == 32 && !loadMemType.isUnsigned) {
+                if (loadMemType.isPlainInt32()) {
                     if (const std::int32_t* cell = residentInt32(loadAddress)) {
                         process.stack.push_back(Value::fromInt(*cell));
                         continue;
@@ -1432,8 +1429,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                 const int storeType = inst.b & 0xFF;
                 const std::uint64_t storeAddress = baseAddress + static_cast<std::uint64_t>(inst.a);
                 const MemType& storeMemType = memType(storeType);
-                if (storeMemType.kind == MemType::Kind::Int && storeMemType.size == 4 &&
-                    storeMemType.bits == 32 && !storeMemType.isUnsigned) {
+                if (storeMemType.isPlainInt32()) {
                     if (std::int32_t* cell = residentInt32(storeAddress)) {
                         if (process.stack.empty()) {
                             return fail(TrapKind::Unreachable, "stack underflow in STORE_LOCAL");
@@ -1533,6 +1529,99 @@ VM::Step VM::step(Process& process, std::string& error) {
                 continue;
             }
 
+            case OpCode::CopyLocal: {
+                // `LOAD_LOCAL src; STORE_LOCAL dst keep`: read a slot, write a slot, push.
+                const std::uint64_t source = baseAddress + static_cast<std::uint64_t>(inst.b);
+                const std::uint64_t destination = baseAddress + static_cast<std::uint64_t>(inst.a);
+
+                std::int32_t value = 0;
+                if (const std::int32_t* cell = residentInt32(source)) {
+                    value = *cell;
+                } else if (!readBytes(source, &value, sizeof(value))) {
+                    return fail(TrapKind::Unreachable, "cannot read the copied slot");
+                }
+
+                if (std::int32_t* cell = residentInt32(destination)) {
+                    *cell = value;
+                } else if (!writeBytes(destination, &value, sizeof(value))) {
+                    // The optimizer fuses only `int32` slots, so the width is known here and
+                    // no memType has to be carried. Writing four bytes is the whole store.
+                    return fail(TrapKind::Unreachable, "cannot write the copied slot");
+                }
+
+                process.stack.push_back(Value::fromInt(value));
+                continue;
+            }
+
+            case OpCode::AddSubLocalImm: {
+                // `LOAD_LOCAL slot; CONST c; ADD|SUB`: read a slot, add or subtract, push.
+                const std::uint64_t slot = baseAddress + static_cast<std::uint64_t>(inst.a);
+                const Value& constant =
+                    function.constants[static_cast<std::size_t>(addSubLocal::constantOf(inst.b))];
+                const std::int32_t rhs = static_cast<std::int32_t>(constant.asInt());
+
+                std::int32_t lhs = 0;
+                if (const std::int32_t* cell = residentInt32(slot)) {
+                    lhs = *cell;
+                } else if (!readBytes(slot, &lhs, sizeof(lhs))) {
+                    return fail(TrapKind::Unreachable, "cannot read the operand slot");
+                }
+
+                // Overflow checked the same way the general path checks it, so a sum that does
+                // not fit 32 bits traps here exactly as it traps there. The optimizer only fuses
+                // operands that are `int32`, so the arithmetic is the same 32-bit arithmetic
+                // `computeBinary` would have done.
+                std::int32_t result = 0;
+                const bool overflow = addSubLocal::isSubtract(inst.b)
+                                          ? __builtin_sub_overflow(lhs, rhs, &result)
+                                          : __builtin_add_overflow(lhs, rhs, &result);
+                if (overflow) {
+                    return fail(TrapKind::IntegerOverflow,
+                                "signed overflow in '" + function.name + "'");
+                }
+                process.stack.push_back(Value::fromInt(result));
+                continue;
+            }
+
+            case OpCode::CmpLocalImm: {
+                // `LOAD_LOCAL; CONST; CMP_BRANCH` in one instruction -- the shape of every
+                // loop bound and every `if (n < 2)`.
+                //
+                // This is the instruction that decides whether the call benchmark is close to
+                // CPython or twice off it. The three-instruction form it replaces was two
+                // 32-byte stack pops, a call into `computeBinary` with arms for float, pointer,
+                // native-width int and generic 128-bit, and a branch. This is a load of four
+                // bytes, a compare, and a branch.
+                //
+                // The types are checked at compile time by the optimizer, which only fuses
+                // `int32` against an integer constant that fits 32 bits. Nothing here needs to
+                // re-check them; `residentInt32` returns null for a page that does not exist
+                // yet, and that is the only case left to handle.
+                const std::uint64_t slot =
+                    baseAddress + static_cast<std::uint64_t>(compareLocal::slotOf(inst.b));
+                const Value& constant =
+                    function.constants[static_cast<std::size_t>(compareLocal::constantOf(inst.b))];
+                const std::int32_t rhs = static_cast<std::int32_t>(constant.asInt());
+
+                std::int32_t lhs = 0;
+                if (const std::int32_t* cell = residentInt32(slot)) {
+                    lhs = *cell;
+                } else if (!readBytes(slot, &lhs, sizeof(lhs))) {
+                    // `residentInt32` declines for a page that does not exist yet, a slot that
+                    // straddles a page boundary, and a misaligned slot. `readBytes` handles all
+                    // three the way the rest of the VM does: a missing page reads as zeros, and
+                    // a straddling read is assembled from both pages in order.
+                    return fail(TrapKind::Unreachable, "cannot read the compared slot");
+                }
+
+                const bool truthy = compareLocal::compare32(compareLocal::comparisonOf(inst.b),
+                                                            lhs, rhs);
+                if (truthy == compareLocal::branchesOnTrue(inst.b)) {
+                    ip = static_cast<std::size_t>(inst.a);
+                }
+                continue;
+            }
+
             case OpCode::StepJump: {
                 // `STEP_LOCAL; JUMP` -- the closing pair of a `for` loop, in one instruction.
                 const std::uint64_t slot =
@@ -1553,8 +1642,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                 // builtin the general path uses, so a counter that would overflow falls
                 // through to it and traps exactly where it did before.
                 const MemType& type = memType(typeIndex);
-                if (type.kind == MemType::Kind::Int && type.size == 4 && type.bits == 32 &&
-                    !type.isUnsigned) {
+                if (type.isPlainInt32()) {
                     if (std::int32_t* cell = residentInt32(slot)) {
                         std::int32_t next = 0;
                         if (!__builtin_add_overflow(*cell, negative ? -1 : 1, &next)) {

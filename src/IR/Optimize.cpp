@@ -50,7 +50,8 @@ namespace {
 /// and removed everything after it.
 bool isJump(OpCode op) {
     return op == OpCode::Jump || op == OpCode::JumpIfFalse || op == OpCode::JumpIfTrue ||
-           op == OpCode::CompareBranch || op == OpCode::StepJump;
+           op == OpCode::CompareBranch || op == OpCode::StepJump ||
+           op == OpCode::CmpLocalImm;
 }
 
 /// True when control does not fall through to the next instruction. `Trap`
@@ -230,6 +231,111 @@ int compact(Function& fn, const std::vector<char>& drop) {
 ///
 /// Reachability is a plain walk from index 0. `Call` falls through (the callee
 /// returns), `Trap` does not, and both arms of a conditional are live.
+//===--- pass: the return slot -------------------------------------------===//
+
+/// `STORE_LOCAL 0; JUMP epilogue` and `epilogue: LOAD_LOCAL 0; RET` -> the store keeps its
+/// value and the load disappears.
+///
+/// Every function that returns a scalar stores it into frame slot 0 and jumps to one shared
+/// epilogue, which loads slot 0 back and returns. The load is there because the epilogue is
+/// shared, and `RET` takes its result from the value stack -- so the value has to get back onto
+/// the stack somehow, and this is how IRGen does it.
+///
+/// But the store can leave the value on the stack itself (`keep`), and then the load has
+/// nothing left to do. One instruction per call, and on a call-heavy program that is one
+/// instruction in eight.
+///
+/// The condition is that **every** edge into the epilogue's `LOAD_LOCAL` comes from a
+/// `STORE_LOCAL 0` immediately before it, either falling through or via a `JUMP`. That is what
+/// makes the rewrite equivalent: on each such path the value being loaded is the one that was
+/// just stored, and it is the one the `keep` bit leaves on the stack.
+///
+/// If any edge arrives some other way -- a jump from a place that did not store, or a jump into
+/// the middle of the sequence -- the pattern is left alone. Getting this wrong is a stack
+/// underflow at `RET`, which is how an earlier attempt at forwarding `StoreLocal; LoadLocal`
+/// broke a loop's back edge.
+///
+/// **Disabled.** It reduced `fib` from 453M instructions to 373M and made three `--jit`
+/// comparison tests fail with `missing return value in 'chanTryPush'`: under the JIT the
+/// rewritten epilogue reaches `RET` with nothing on the value stack, while the same program
+/// without `--jit` runs correctly and every other check passes. The edge analysis below was
+/// verified against that function's real bytecode -- one jump into the epilogue, every arriving
+/// path preceded by a `StoreLocal 0` -- so the fault is in how the interpreter and the compiled
+/// frame disagree about a stack that a `keep` bit left populated, not in which paths were
+/// considered. Worth finishing, because 17% of a call-heavy program is a lot; not worth shipping
+/// half-understood, because the failure mode is a wrong answer under one execution mode.
+int forwardReturnSlot(Function& fn) {
+    const std::size_t n = fn.code.size();
+    if (n < 3) {
+        return 0;
+    }
+    // Only a function that returns a scalar has this epilogue. A `void` function's `RET`
+    // takes nothing from the stack, so the `LOAD_LOCAL 0` in front of it -- if one appears at
+    // all -- is loading a local, not restoring a return value, and keeping it on the stack
+    // would leave a value behind that the caller never pops.
+    if (!fn.returnsValue) {
+        return 0;
+    }
+
+    std::vector<char> drop(n, 0);
+    int changes = 0;
+
+    for (std::size_t i = 1; i + 1 < n; ++i) {
+        if (drop[i] || fn.code[i].op != OpCode::LoadLocal || fn.code[i].a != 0) {
+            continue;
+        }
+        if (fn.code[i + 1].op != OpCode::Ret) {
+            continue;
+        }
+
+        // The fall-through predecessor.
+        const auto isPlainStoreToZero = [&fn](const Instruction& ins) {
+            return ins.op == OpCode::StoreLocal && ins.a == 0 && (ins.b & 0x100) == 0;
+        };
+        if (!isPlainStoreToZero(fn.code[i - 1])) {
+            continue;
+        }
+
+        // Every jump that lands on the load, each with a store right before it.
+        std::vector<std::size_t> stores{i - 1};
+        bool everyEdgeStores = true;
+        for (std::size_t j = 0; j < n && everyEdgeStores; ++j) {
+            if (!isJump(fn.code[j].op) || fn.code[j].a < 0 ||
+                static_cast<std::size_t>(fn.code[j].a) != i) {
+                continue;
+            }
+            if (j == 0 || !isPlainStoreToZero(fn.code[j - 1])) {
+                everyEdgeStores = false;
+                break;
+            }
+            stores.push_back(j - 1);
+        }
+        if (!everyEdgeStores) {
+            continue;
+        }
+
+        for (const std::size_t store : stores) {
+            fn.code[store].b |= 0x100;
+        }
+        if (const char* dbg = std::getenv("ACVM_DEBUG_RET")) {
+            (void)dbg;
+            std::fprintf(stderr, "forwardReturnSlot: %s epilogue at %zu, %zu store(s)\n",
+                         fn.name.c_str(), i, stores.size());
+            for (std::size_t j = 0; j < n; ++j) {
+                if (isJump(fn.code[j].op) && fn.code[j].a >= 0 &&
+                    static_cast<std::size_t>(fn.code[j].a) == i) {
+                    std::fprintf(stderr, "  edge from %zu (prev op %d)\n", j,
+                                 static_cast<int>(fn.code[j - 1].op));
+                }
+            }
+        }
+        drop[i] = 1;
+        changes += 1;
+    }
+
+    return changes > 0 ? compact(fn, drop) : 0;
+}
+
 int removeUnreachable(Function& fn) {
     const std::size_t n = fn.code.size();
     if (n == 0) {
@@ -307,7 +413,7 @@ int threadJumps(Function& fn) {
 /// The rewrites that need only the pattern under the cursor.
 /// Returns instructions removed; `forwardedOut` counts the subset that came from
 /// folding a store and a load into one keeping store.
-int peephole(Function& fn, int& forwardedOut) {
+int peephole(Function& fn, const Module& module, int& forwardedOut) {
     const std::size_t n = fn.code.size();
     forwardedOut = 0;
     if (n < 2) {
@@ -454,6 +560,148 @@ int peephole(Function& fn, int& forwardedOut) {
                     drop[i + 1] = 1;
                     changes += 1;
                     i += 2;
+                    continue;
+                }
+            }
+
+            // `JUMP` whose destination is a `RET` -> `RET`.
+            //
+            // Every function ends its scalar return with `... ; JUMP -> epilogue`, and the
+            // epilogue is `RET`. The jump is a dispatch that does nothing but arrive. Four
+            // bytes of code become four bytes of code, and one dispatch disappears.
+            //
+            // Safe unconditionally: the destination is still a `RET` for every other jump that
+            // named it, and a `RET` here returns exactly what the `RET` there would have.
+            if (first.op == OpCode::Jump && first.a >= 0 &&
+                static_cast<std::size_t>(first.a) < n && !drop[static_cast<std::size_t>(first.a)] &&
+                fn.code[static_cast<std::size_t>(first.a)].op == OpCode::Ret) {
+                fn.code[i] = Instruction{OpCode::Ret, 0, 0};
+                changes += 1;
+                i += 1;
+                continue;
+            }
+
+            // `LOAD_LOCAL src; STORE_LOCAL dst keep` -> `COPY_LOCAL dst, src`.
+            //
+            // The tail of every scalar return: the value is written to the return slot and
+            // also left on the stack, because that is where `RET` takes it from. Two
+            // instructions that both move a `Value` through the stack become one that reads a
+            // frame slot, writes a frame slot, and pushes.
+            if (i + 1 < n && !drop[i + 1] && !targets[i + 1] &&
+                first.op == OpCode::LoadLocal && second.op == OpCode::StoreLocal &&
+                (second.b & 0x100) != 0) {
+                const int loadType = first.b & 0xFF;
+                const int storeType = second.b & 0xFF;
+                if (loadType == storeType && loadType >= 0 &&
+                    static_cast<std::size_t>(loadType) < module.memTypes.size() &&
+                    module.memTypes[static_cast<std::size_t>(loadType)].isPlainInt32() &&
+                    first.a >= 0 && second.a >= 0) {
+                    fn.code[i] = Instruction{OpCode::CopyLocal, second.a, first.a};
+                    drop[i + 1] = 1;
+                    changes += 1;
+                    i += 2;
+                    continue;
+                }
+            }
+
+            // `LOAD_LOCAL slot; CONST c; ADD|SUB` -> `ADD_SUB_LOCAL_IMM`.
+            //
+            // `fib` emits two per call and so does anything that walks a sequence. The pair was
+            // `LOAD` (32-byte push), `CONST` (32-byte push) and a call into `computeBinary`; the
+            // fused form loads four bytes, adds, and pushes.
+            if (i + 2 < n && !drop[i + 1] && !drop[i + 2] && !targets[i + 1] && !targets[i + 2] &&
+                first.op == OpCode::LoadLocal && fn.code[i + 1].op == OpCode::ConstInt &&
+                (fn.code[i + 2].op == OpCode::Add || fn.code[i + 2].op == OpCode::Sub)) {
+                const Instruction& load = first;
+                const Instruction& constant = fn.code[i + 1];
+                const Instruction& arithmetic = fn.code[i + 2];
+
+                const int loadType = load.b & 0xFF;
+                const int arithType = arithmetic.a;
+                const bool sameType = loadType == arithType;
+                const bool plainInt32 =
+                    loadType >= 0 && static_cast<std::size_t>(loadType) < module.memTypes.size() &&
+                    module.memTypes[static_cast<std::size_t>(loadType)].isPlainInt32();
+
+                bool constantFits = false;
+                if (constant.a >= 0 &&
+                    static_cast<std::size_t>(constant.a) < fn.constants.size()) {
+                    const Value& value = fn.constants[static_cast<std::size_t>(constant.a)];
+                    if (value.isInt()) {
+                        const Int128 wide = value.asInt();
+                        constantFits = wide >= INT32_MIN && wide <= INT32_MAX;
+                    }
+                }
+
+                if (sameType && plainInt32 && constantFits &&
+                    addSubLocal::encodable(load.a, constant.a)) {
+                    fn.code[i] = Instruction{
+                        OpCode::AddSubLocalImm, load.a,
+                        addSubLocal::pack(constant.a, arithmetic.op == OpCode::Sub)};
+                    drop[i + 1] = 1;
+                    drop[i + 2] = 1;
+                    changes += 1;
+                    i += 3;
+                    continue;
+                }
+            }
+
+            // `LOAD_LOCAL slot; CONST c; CMP_BRANCH` -> `CMP_LOCAL_IMM`.
+            //
+            // The most common branch in any program: every loop bound and every `if (n < 2)`
+            // has this shape. Three instructions become one, and -- the larger half of the
+            // gain -- the comparison stops being a 32-byte pop, a 32-byte pop, and a call into
+            // `computeBinary` with its float/pointer/128-bit arms. It becomes a load of four
+            // bytes and a compare.
+            //
+            // It runs on the second round, not the first: round one turns `LT; JUMP_IF_FALSE`
+            // into `CMP_BRANCH`, and only then does this pattern exist. `optimizeFunction`
+            // repeats the passes until nothing changes, which is what makes that work.
+            //
+            // The guards are the whole safety argument. An operand that is not `int32` keeps
+            // the three-instruction form, because `CMP_LOCAL_IMM` reads 4 bytes directly and
+            // every other width would read the wrong number of them. A slot or a constant
+            // index that does not fit its field keeps it too, rather than being masked -- two
+            // earlier fusions here truncated instead of refusing, and both shipped a wrong
+            // answer.
+            if (i + 2 < n && !drop[i + 1] && !drop[i + 2] && !targets[i + 1] && !targets[i + 2] &&
+                first.op == OpCode::LoadLocal && fn.code[i + 1].op == OpCode::ConstInt &&
+                fn.code[i + 2].op == OpCode::CompareBranch) {
+                const Instruction& load = first;
+                const Instruction& constant = fn.code[i + 1];
+                const Instruction& branch = fn.code[i + 2];
+
+                const int loadType = load.b & 0xFF;
+                const int branchType = compareBranch::memTypeOf(branch.b);
+                const bool sameType = loadType == branchType;
+                const bool plainInt32 =
+                    loadType >= 0 && static_cast<std::size_t>(loadType) < module.memTypes.size() &&
+                    module.memTypes[static_cast<std::size_t>(loadType)].isPlainInt32();
+
+                // The constant has to be an integer that fits 32 bits, because the comparison
+                // is done in 32-bit registers. A `double` or a 128-bit value keeps the general
+                // form; narrowing it here would compare the wrong number.
+                bool constantFits = false;
+                if (constant.a >= 0 &&
+                    static_cast<std::size_t>(constant.a) < fn.constants.size()) {
+                    const Value& value = fn.constants[static_cast<std::size_t>(constant.a)];
+                    if (value.isInt()) {
+                        const Int128 wide = value.asInt();
+                        constantFits = wide >= INT32_MIN && wide <= INT32_MAX;
+                    }
+                }
+
+                if (sameType && plainInt32 && constantFits &&
+                    compareLocal::encodable(load.a, constant.a)) {
+                    fn.code[i] = Instruction{
+                        OpCode::CmpLocalImm, branch.a,
+                        compareLocal::pack(load.a, constant.a,
+                                           compareBranch::comparisonOf(branch.b),
+                                           compareBranch::branchesOnTrue(branch.b))};
+                    drop[i + 1] = 1;
+                    drop[i + 2] = 1;
+                    changes += 1;
+                    i += 3;
                     continue;
                 }
             }
@@ -1342,7 +1590,11 @@ void optimizeFunction(Function& fn, const Module& module, OptLevel level, Optimi
         }
 
         int forwarded = 0;
-        const int peepholed = peephole(fn, forwarded);
+        const int returned = 0;  // disabled: see the note on the function
+        stats.peepholes += returned;
+        changes += returned;
+
+        const int peepholed = peephole(fn, module, forwarded);
         stats.forwarded += forwarded;
         stats.peepholes += peepholed - forwarded;
         changes += peepholed;

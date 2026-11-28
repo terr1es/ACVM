@@ -26,6 +26,18 @@ struct MemType {
     [[nodiscard]] bool isInteger() const {
         return kind == Kind::Int || kind == Kind::Bool || kind == Kind::Char;
     }
+
+    /// A 32-bit signed integer -- the type of every loop counter, every `int` local, and every
+    /// `if (n < 2)`.
+    ///
+    /// Named once because five sites asked the same four questions in a row: the optimizer
+    /// before fusing a branch, and the VM's fast paths for `LOAD_LOCAL`, `STORE_LOCAL`,
+    /// `STEP_JUMP` and parameter passing. Five copies of a predicate is five chances for one of
+    /// them to be a condition short, and the failure would be a fast path that is subtly wrong
+    /// for `unsigned int` rather than one that is slow.
+    [[nodiscard]] bool isPlainInt32() const {
+        return kind == Kind::Int && size == 4 && bits == 32 && !isUnsigned;
+    }
 };
 
 enum class OpCode : std::uint8_t {
@@ -143,6 +155,37 @@ enum class OpCode : std::uint8_t {
     /// Only ±1 is encoded, and the peephole refuses anything else: a general delta would not
     /// fit beside the slot and the type, and the loops worth fusing count by one.
     StepJump,
+
+    /// `LOAD_LOCAL slot; CONST c; CMP_BRANCH ...` -- a local against a constant, in one.
+    ///
+    /// The most common branch in any program, because it is the shape of every loop bound and
+    /// every `if (n < 2)`: load a variable, compare it to a literal, branch. Three instructions
+    /// become one, and the comparison becomes a 32-bit compare instead of a call into
+    /// `computeBinary` with its float/pointer/128-bit arms.
+    ///
+    /// Only `int32` operands are fused -- that is what a loop counter and an `int` local are,
+    /// and covering every type would mean carrying the memType and giving up the immediate.
+    /// Anything else keeps the three-instruction form and runs exactly as before.
+    CmpLocalImm,
+
+    /// `LOAD_LOCAL src; STORE_LOCAL dst keep` -- copy one local to another and leave it on the
+    /// stack, in one instruction.
+    ///
+    /// This is how every scalar `return` ends: the value is put in the return slot and also
+    /// left on the stack for `RET` to take. Two instructions that both touch the value stack,
+    /// replaced by one that reads a frame slot, writes a frame slot, and pushes.
+    CopyLocal,
+
+    /// `LOAD_LOCAL slot; CONST c; ADD|SUB` -- a local plus or minus a constant, in one.
+    ///
+    /// `fib` emits two of these per call (`n - 1`, `n - 2`) and so does most arithmetic that
+    /// walks a sequence. As with `CMP_LOCAL_IMM`, the operands are `int32` only, checked by the
+    /// optimizer, and the constant has to fit 32 bits.
+    ///
+    /// One opcode for both operations: `b` carries the sign, which is one bit rather than a
+    /// second instruction. A separate `AddLocalImm` would cost a jump-table slot to save a
+    /// shift.
+    AddSubLocalImm,
 };
 
 enum class TrapKind : std::int32_t {
@@ -257,6 +300,105 @@ inline constexpr int kMaxMemType = 0x3F;
 }
 
 } // namespace stepJump
+
+//===--- CmpLocalImm operand packing -------------------------------------===//
+//
+// `a` is the branch target, as it is for every other branch in this instruction set.
+// `b` carries the rest:
+//
+//     bits 0-15    frame slot                 (frames up to 64 KB)
+//     bits 16-26   constant index             (2048 constants per function)
+//     bits 27-29   comparison                 (Eq..Ge, as in `compareBranch`)
+//     bit  30      branch when the comparison is true
+//
+// 31 bits, so `b` is never negative and `>>` needs no care. Anything that does not fit is not
+// fused: a slot past 64 KB, a constant past 2048, an operand that is not `int32`. The
+// optimizer refuses those rather than masking, for the reason the two previous fusions here
+// taught: masking truncates silently, and a truncated operand is a wrong answer, not a slow one.
+namespace compareLocal {
+
+inline constexpr int kSlotBits = 16;
+inline constexpr std::int32_t kSlotMask = (1 << kSlotBits) - 1;
+inline constexpr int kConstantShift = kSlotBits;
+inline constexpr int kConstantBits = 11;
+inline constexpr std::int32_t kConstantMask = ((1 << kConstantBits) - 1) << kConstantShift;
+inline constexpr int kComparisonShift = kConstantShift + kConstantBits;
+inline constexpr std::int32_t kComparisonMask = 0x7 << kComparisonShift;
+inline constexpr std::int32_t kBranchOnTrueBit = 1 << 30;
+
+inline constexpr std::int32_t kMaxSlot = kSlotMask;
+inline constexpr std::int32_t kMaxConstant = (1 << kConstantBits) - 1;
+
+/// True when this comparison can be carried. False means "do not fuse".
+[[nodiscard]] inline bool encodable(std::int32_t slot, std::int32_t constant) {
+    return slot >= 0 && slot <= kMaxSlot && constant >= 0 && constant <= kMaxConstant;
+}
+
+[[nodiscard]] inline std::int32_t pack(std::int32_t slot, std::int32_t constant,
+                                       compareBranch::Comparison comparison, bool branchOnTrue) {
+    return (slot & kSlotMask) | ((constant << kConstantShift) & kConstantMask) |
+           ((static_cast<std::int32_t>(comparison) << kComparisonShift) & kComparisonMask) |
+           (branchOnTrue ? kBranchOnTrueBit : 0);
+}
+[[nodiscard]] inline std::int32_t slotOf(std::int32_t b) { return b & kSlotMask; }
+[[nodiscard]] inline std::int32_t constantOf(std::int32_t b) {
+    return (b & kConstantMask) >> kConstantShift;
+}
+[[nodiscard]] inline compareBranch::Comparison comparisonOf(std::int32_t b) {
+    return static_cast<compareBranch::Comparison>((b & kComparisonMask) >> kComparisonShift);
+}
+[[nodiscard]] inline bool branchesOnTrue(std::int32_t b) {
+    return (b & kBranchOnTrueBit) != 0;
+}
+
+/// The answer of `lhs <cmp> rhs` for a 32-bit signed comparison.
+///
+/// Written out rather than routed through `computeBinary`: the point of this instruction is to
+/// not call it. The six cases match `computeBinary`'s, and `compare_local_check.ax` pins all
+/// six against the three-instruction form, so the two cannot drift.
+[[nodiscard]] inline bool compare32(compareBranch::Comparison comparison, std::int32_t lhs,
+                                   std::int32_t rhs) {
+    switch (comparison) {
+    case compareBranch::Comparison::Eq: return lhs == rhs;
+    case compareBranch::Comparison::Ne: return lhs != rhs;
+    case compareBranch::Comparison::Lt: return lhs < rhs;
+    case compareBranch::Comparison::Le: return lhs <= rhs;
+    case compareBranch::Comparison::Gt: return lhs > rhs;
+    case compareBranch::Comparison::Ge: return lhs >= rhs;
+    }
+    return false;
+}
+
+} // namespace compareLocal
+
+//===--- AddSubLocalImm operand packing ----------------------------------===//
+//
+// `a` is the frame slot to read. `b` carries the constant and the operation:
+//
+//     bits 0-30   constant index
+//     bit  31     subtract rather than add
+//
+// The constant index is checked against `kMaxConstant` rather than masked, so a function with
+// more constants than the field holds keeps the three-instruction form. That is the same rule
+// as everywhere else here: refuse to fuse, never truncate a field.
+namespace addSubLocal {
+
+inline constexpr std::int32_t kSubtractBit = static_cast<std::int32_t>(1u << 31);
+inline constexpr std::int32_t kConstantMask = ~kSubtractBit;
+
+inline constexpr std::int32_t kMaxConstant = kConstantMask;
+
+[[nodiscard]] inline bool encodable(std::int32_t slot, std::int32_t constant) {
+    return slot >= 0 && constant >= 0 && constant <= kMaxConstant;
+}
+
+[[nodiscard]] inline std::int32_t pack(std::int32_t constant, bool subtract) {
+    return (constant & kConstantMask) | (subtract ? kSubtractBit : 0);
+}
+[[nodiscard]] inline std::int32_t constantOf(std::int32_t b) { return b & kConstantMask; }
+[[nodiscard]] inline bool isSubtract(std::int32_t b) { return (b & kSubtractBit) != 0; }
+
+} // namespace addSubLocal
 
 struct Instruction {
     OpCode op = OpCode::Halt;

@@ -139,6 +139,23 @@ void formatInstruction(const Module& module, const Function& function, std::size
     case OpCode::Cast:
         out << memTypeText(module, inst.a) << " -> " << memTypeText(module, inst.b);
         break;
+    case OpCode::CopyLocal:
+        out << "frame+" << inst.a << " <- frame+" << inst.b << " i32";
+        break;
+    case OpCode::AddSubLocalImm:
+        out << "frame+" << inst.a << " i32 "
+            << (addSubLocal::isSubtract(inst.b) ? "-" : "+") << " const["
+            << addSubLocal::constantOf(inst.b) << "]";
+        break;
+    case OpCode::CmpLocalImm: {
+        static const char* kText[] = {"==", "!=", "<", "<=", ">", ">="};
+        const auto comparison = compareLocal::comparisonOf(inst.b);
+        out << "frame+" << compareLocal::slotOf(inst.b) << " i32 " << kText[static_cast<int>(comparison)]
+            << " const[" << compareLocal::constantOf(inst.b) << "] "
+            << (compareLocal::branchesOnTrue(inst.b) ? "if true goto " : "if false goto ")
+            << inst.a;
+        break;
+    }
     case OpCode::StepJump:
         out << "frame+" << stepJump::slotOf(inst.b) << ' '
             << memTypeText(module, stepJump::memTypeOf(inst.b)) << ' '

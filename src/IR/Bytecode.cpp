@@ -66,6 +66,9 @@ std::string_view opCodeName(OpCode op) {
     case OpCode::Pow: return "POW";
     case OpCode::CompareBranch: return "CMP_BRANCH";
     case OpCode::StepJump: return "STEP_JUMP";
+    case OpCode::CmpLocalImm: return "CMP_LOCAL_IMM";
+    case OpCode::CopyLocal: return "COPY_LOCAL";
+    case OpCode::AddSubLocalImm: return "ADD_SUB_LOCAL_IMM";
     }
     return "??";
 }
