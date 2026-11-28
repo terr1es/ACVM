@@ -172,31 +172,48 @@ with the same generator, threshold and ordering, and prints identical inversion 
 
 | Engine | Time | vs CPython 3.13 | vs C++ `-O2` |
 |---|---:|---:|---:|
-| ACVM interpreter | 98.6 ms | 2.1× slower | 27× slower |
-| ACVM `--jit` | 22.4 ms | 2.1× faster | 6.2× slower |
-| CPython 3.13 | 46.6 ms | — | 13× slower |
-| C++ `-O0` (clang) | 4.3 ms | 11× faster | 1.2× slower |
-| C++ `-O2` (clang) | 3.6 ms | 13× faster | — |
+| ACVM interpreter | 96.7 ms | 2.1× slower | 25× slower |
+| ACVM `--jit` | 22.3 ms | 2.0× faster | 5.7× slower |
+| CPython 3.13 | 45.7 ms | — | 12× slower |
+| C++ `-O0` (clang) | 5.1 ms | 9.0× faster | 1.3× slower |
+| C++ `-O2` (clang) | 3.9 ms | 12× faster | — |
 
 Run-to-run variation is 2–5%; ratios are accurate to two significant figures.
 
-The interpreter is within 2.1× of CPython on a pointer-heavy program. `--jit` places it 2.1×
-ahead of CPython and 6.2× behind unoptimized C++. The remaining gap to C++ follows from
+The interpreter is within 2.1× of CPython on a pointer-heavy program. `--jit` places it 2.0×
+ahead of CPython and 5.7× behind unoptimized C++. The remaining gap to C++ follows from
 absent inlining, from register allocation limited to a few pinned slots, and from a call that
 traverses one C++ frame per invocation.
 
 Per-benchmark comparison against CPython, same run:
 
-| Benchmark | Interpreter | `--jit` | CPython 3.13 | `--jit` vs CPython |
+| Benchmark | Interpreter | `--jit` | CPython 3.13 | Interpreter vs CPython |
 |---|---:|---:|---:|---:|
-| empty loop | 426.9 ms | 99.5 ms | 938.1 ms | 9.4× faster |
-| arithmetic | 483.4 ms | 24.0 ms | 441.1 ms | 18.4× faster |
-| array walk | 208.3 ms | 26.6 ms | 117.2 ms | 4.4× faster |
-| recursion (`fib 10` × 300,000) | 2792.7 ms | 1028.0 ms | 1857.5 ms | 1.8× faster |
+| empty loop | 427.2 ms | 94.3 ms | 849.0 ms | 2.0× faster |
+| integer arithmetic | 451.9 ms | 23.4 ms | 408.4 ms | 1.1× slower |
+| branch-dense | 809.8 ms | 130.8 ms | 641.1 ms | 1.3× slower |
+| array walk | 111.3 ms | 24.8 ms | 112.0 ms | 1.0× slower |
+| string search | 442.4 ms | 60.5 ms | 42.8 ms | 10.3× slower |
+| hash set | 1253.1 ms | 680.6 ms | 37.5 ms | 33× slower |
+| double accumulation | 232.2 ms | 233.5 ms | 143.4 ms | 1.6× slower |
+| recursion (`fib 10` × 300,000) | 2507.0 ms | 948.7 ms | 1733.1 ms | 1.4× slower |
 
-The interpreter is fastest only on the bare loop. Fusion reduces that loop body to four
-instructions; memory access and function calls pay for a dispatch granularity the IR does not
-eliminate. [`docs/performance.md`](docs/performance.md) contains the analysis, the
+The comparison column is the interpreter against CPython, since those are the tiers that
+correspond. `--jit` is a compilation tier and CPython has none; see the note below.
+
+The shape is uneven by design of the tiers rather than by accident, and the two ends of it are
+worth naming:
+
+- **Fusion carries the tight loops.** `LOAD_GLOBAL_INDEXED` makes an array read one dispatch
+  instead of thirteen, which is why the array walk went from 1.8× behind CPython to parity, and
+  why `--jit` gains least there -- it was already lowering that instruction.
+- **Anything written in Axiom and called per element pays for it.** The hash containers have no
+  C half, so one lookup is about 370 bytecodes; CPython's `set` is C. `double` is the other
+  end: the JIT refuses any function whose scalars are not integers or pointers, so
+  `--jit` reports 233.5 ms against the interpreter's 232.2 ms -- not a slow path, an absent
+  one.
+
+Memory access and function calls pay for a dispatch granularity the IR does not eliminate. [`docs/performance.md`](docs/performance.md) contains the analysis, the
 per-instruction costs, and the changes that were measured and reverted.
 
 Two qualifications apply to these tables:
