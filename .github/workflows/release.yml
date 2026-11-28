@@ -84,6 +84,15 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
+      # `gcc-libs` carries the static libstdc++/libgcc archives. `-static` needs them,
+      # and the MSYS2 clang defaults to libstdc++ rather than libc++, so a toolchain
+      # without this package links the DLL form only.
+      #
+      # This note sits above `install:` and not inside it. Everything inside a `>-` block
+      # is data: a `#` there is not a comment, so the earlier version of this list handed
+      # pacman the tokens "#", "The", "static", ... and the step died with "cmd.exe failed
+      # with exit code 1" before cmake ran. The ci workflow has the same list without the
+      # note, which is why only this one broke.
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -92,9 +101,6 @@ jobs:
             mingw-w64-ucrt-x86_64-clang
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
-            # The static libstdc++/libgcc archives. `-static` needs them, and the MSYS2
-            # clang defaults to libstdc++ rather than libc++, so a toolchain without
-            # this package links the DLL form only and the whole archive fails here.
             mingw-w64-ucrt-x86_64-gcc-libs
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
