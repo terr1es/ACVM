@@ -806,6 +806,46 @@ void IRGen::emitExpr(Expr& expr) {
             m_fn->emit(OpCode::Load, byteMemType);
             return;
         }
+        // `global[i]` for a scalar element becomes one instruction, emitted here rather than
+        // fused later.
+        //
+        // `LOAD_GLOBAL_INDEXED` carries the index slot and the element type and performs both
+        // bounds checks itself, which is what allows it to be a single dispatch. Emitting it
+        // directly means the two checks are never generated and therefore never need removing:
+        // this code knows the base is a global array and knows its element count, so there is
+        // nothing for a later pass to prove.
+        //
+        // The alternative was a peephole that recognised `CONST 0; CMP; TRAP; LOAD_LOCAL;
+        // CONST N; CMP; TRAP; GLOBAL_ADDR; LOAD_LOCAL; CONST size; MUL; ADD; LOAD` and deleted
+        // the checks from it. Four attempts at matching that window, one of which also deleted
+        // the index reload -- the fused load then read a stale slot, and `global_index_check`
+        // reported a wrong value rather than a wrong trap. Emitting the instruction the
+        // generator actually means has no such failure mode.
+        if (baseType != nullptr && baseType->kind == TypeKind::Array && expr.kids[0]->isLValue) {
+            Expr& base = *expr.kids[0];
+            if (base.kind == ExprKind::Name && base.sym != nullptr &&
+                base.sym->kind == Symbol::Kind::Global &&
+                baseType->elem->sizeBytes >= 1 && baseType->elem->sizeBytes <= 8) {
+                const int elementType = memTypeOf(baseType->elem);
+                const std::uint32_t indexSlot = allocRawTemp(8, 8);
+                // The instruction encodes the slot in 16 bits. A frame large enough to push
+                // the slot past that keeps the general path; the reserved slot then goes
+                // unused, which costs eight bytes of frame and nothing else.
+                if (loadGlobalIndexed::encodable(static_cast<std::int32_t>(indexSlot),
+                                                 elementType)) {
+                    // The index is evaluated once, into a 64-bit slot -- the same staging the
+                    // general path performs, and the reason the wide flag is set.
+                    emitExpr(*expr.kids[1]);
+                    m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(indexSlot));
+                    m_fn->emit(OpCode::Swap);
+                    m_fn->emit(OpCode::Store, int64MemType());
+                    m_fn->emit(OpCode::LoadGlobalIndexed, base.sym->globalIndex,
+                               loadGlobalIndexed::pack(static_cast<std::int32_t>(indexSlot),
+                                                       elementType, /*wideIndex=*/true));
+                    return;
+                }
+            }
+        }
         emitAddress(expr);
         emitLoadValue(expr.type);
         return;
@@ -1043,6 +1083,41 @@ void IRGen::emitAssign(Expr& expr) {
         emitExpr(*expr.kids[1]);
         emitConvert(valueType, targetType);
         m_fn->emit(discard ? OpCode::Store : OpCode::StoreKeep, memTypeOf(targetType));
+        return;
+    }
+
+    // `s += rhs` on a string is concatenation, and it has to be built here rather than
+    // left to the arithmetic path below: that path emits ADD on the two operands, and a
+    // string operand is a descriptor address, so `s += "b"` would have added two pointers
+    // together and stored the sum.
+    //
+    // The two steps are the ones `s = s + rhs` already takes -- CONCAT to build the new
+    // string, then the aggregate copy to store the 16 byte descriptor -- with the target's
+    // address read once and parked. Reading it twice via `emitExpr` and again via
+    // `emitAddress` would index twice in `arr[i] += s`, and the second index could see a
+    // different `i` than the first.
+    if (targetType != nullptr && targetType->kind == TypeKind::String &&
+        expr.assignop == AssignOp::Add) {
+        const std::uint32_t addrSlot = allocRawTemp(8, 8);
+        emitAddress(*expr.kids[0]);                            // [&target]
+        m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(addrSlot));
+        m_fn->emit(OpCode::Swap);                              // [&slot, &target]
+        m_fn->emit(OpCode::Store, ptrMemType());               // []
+
+        // The address *is* the value: a string is passed around as the address of its
+        // descriptor, which is what CONCAT reads.
+        m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(addrSlot));
+        m_fn->emit(OpCode::Load, ptrMemType());                // [target]
+        emitExpr(*expr.kids[1]);                               // [target, rhs]
+        const bool rhsIsString = valueType != nullptr && valueType->kind == TypeKind::String;
+        const int rhsCode = rhsIsString || valueType == nullptr ? -1 : memTypeOf(valueType);
+        m_fn->emit(OpCode::Concat, rhsCode, 0);                // [concatenated]
+        if (!discard) {
+            m_fn->emit(OpCode::Dup);                           // [result, result]
+        }
+        m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(addrSlot));
+        m_fn->emit(OpCode::Load, ptrMemType());                // [..., &target]
+        m_fn->emit(OpCode::MemCopy, static_cast<std::int32_t>(targetType->sizeBytes));
         return;
     }
 
