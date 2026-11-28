@@ -47,6 +47,7 @@
 
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -468,6 +469,75 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         assembler.jcc(Cond::Equal, failureExit);
     }
 
+    // -- the promoted slot ---------------------------------------------------
+    //
+    // A frame slot's address does not change while a function runs: `frameBase` is fixed for
+    // the frame, pages are never moved or reclaimed, and the call above has resolved every
+    // page the frame touches. Yet each access recomputes the address from scratch -- a `lea`,
+    // a mask, a shift, an indexed load from the page table, a bounds compare and a branch,
+    // nine instructions to reach a slot whose address was known at entry.
+    //
+    // `rbp` is pushed by the prologue, is callee-saved, and holds nothing else: the other five
+    // saved registers carry the VM, the process, the frame base, the error buffer and the
+    // frame's page offset. So it can keep the address of the one slot this function touches
+    // most, computed once here with the same straddle test every access would have made.
+    //
+    // If that slot turns out to straddle a page boundary -- a few frames in 65536, depending
+    // on where the frame landed -- the register holds zero and every access falls through to
+    // the general path, which is what it would have done anyway. Correctness does not depend
+    // on the frame's placement, only speed does.
+    std::int32_t promotedOffset = -1;
+    {
+        // Which slot is worth a register. Not a complete list of instructions that touch a
+        // frame slot, and it does not have to be: an instruction left out only means its slot
+        // is not promoted, never a wrong answer. The four below are the ones whose whole
+        // purpose is a hot `int32` local -- a loop counter, an accumulator, a compared bound.
+        std::map<std::int32_t, int> counts;
+        for (const Instruction& ins : function.code) {
+            std::int32_t slot = -1;
+            switch (ins.op) {
+            case OpCode::StepJump: slot = stepJump::slotOf(ins.b); break;
+            case OpCode::StepLocal: slot = ins.a; break;
+            case OpCode::CmpLocalImm: slot = compareLocal::slotOf(ins.b); break;
+            case OpCode::AddSubLocalImm: slot = ins.a; break;
+            default: break;
+            }
+            if (slot < 0 || static_cast<std::uint64_t>(slot) + 4 > function.frameSize) {
+                continue;
+            }
+            counts[slot] += 1;
+        }
+        int best = 1;   // one access does not pay for the prologue
+        for (const auto& entry : counts) {
+            if (entry.second > best) {
+                best = entry.second;
+                promotedOffset = entry.first;
+            }
+        }
+    }
+    if (promotedOffset >= 0) {
+        auto straddles = assembler.newLabel();
+        auto resolved = assembler.newLabel();
+        assembler.lea(kTmp1, mem(kRegPageOffset, promotedOffset));
+        assembler.mov(kTmp2, kTmp1);
+        assembler.movImm(kRegA, Width::Qword, 0xFFFF);
+        assembler.and_(kTmp2, kRegA, Width::Qword);   // offset within its page
+        assembler.shr(kTmp1, 16, Width::Qword);       // page index within the frame
+        assembler.mov(kTmp1, memIndex(Reg::Rsp, kTmp1, 8,
+                                     static_cast<std::int32_t>(kPageTableOffset)));
+        assembler.cmpImm(kTmp2, static_cast<std::int32_t>(65536 - 4));
+        assembler.jcc(Cond::Above, straddles);
+        assembler.lea(Reg::Rbp, memIndex(kTmp1, kTmp2, 1, 0));
+        assembler.jmp(resolved);
+        assembler.bind(straddles);
+        assembler.movImm(Reg::Rbp, Width::Qword, 0);
+        assembler.bind(resolved);
+    } else {
+        // Nothing to promote; the register must still hold something the accessor can
+        // recognise as "not promoted". Zero is that value.
+        assembler.movImm(Reg::Rbp, Width::Qword, 0);
+    }
+
     std::vector<X64Assembler::Label> labels(codeSize, kNoLabel);
     for (const Instruction& candidate : function.code) {
         // Every branch, not just the three that existed when this loop was written. A target
@@ -735,9 +805,7 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // Handing it over is cheap: `CMP_BRANCH` is a branch, so the interpreter takes
             // control at that instruction and the surrounding loop is still compiled. What it
             // costs is one switch per branch, not one per call.
-            if (!needsInterpreter &&
-                (candidate.op == OpCode::CompareBranch ||
-                 candidate.op == OpCode::CmpLocalImm)) {
+            if (!needsInterpreter && candidate.op == OpCode::CompareBranch) {
                 needsInterpreter = true;
             }
             if (!needsInterpreter && candidate.op == OpCode::Call && candidate.a >= 0 &&
@@ -806,8 +874,18 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     /// Clobbers rax, r10 and r11 -- every scratch register there is. A caller that needs a
     /// value to survive has to park it in the scratch slot; keeping it in a register is
     /// what made `i++` store 0xFFFF, the mask this uses, instead of the value.
+    ///
+    /// The promoted slot skips all of it. `promotedOffset` is the one slot whose address the
+    /// prologue resolved into `rbp` -- see the note there -- so reaching it is a test and a
+    /// move, and the test fails only when that slot straddled a page boundary.
     auto emitSlotAddress = [&](std::int32_t offset, unsigned bits,
                                X64Assembler::Label slow) {
+        if (offset == promotedOffset) {
+            assembler.test(Reg::Rbp, Reg::Rbp, Width::Qword);
+            assembler.jcc(Cond::Equal, slow);
+            assembler.mov(kTmp1, Reg::Rbp);
+            return;
+        }
         const unsigned bytes = (bits + 7) / 8;
         assembler.lea(kTmp1, mem(kRegPageOffset, offset));
         assembler.mov(kTmp2, kTmp1);
@@ -1215,9 +1293,15 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // Straddling slots take the interpreter's reader, then converge on the same
             // compare-and-branch. See the note in `AddSubLocalImm`: the `slow` label has to
             // be bound or nothing in the function can be finalised.
+            // The slot comes out of `b`, not `a`: this instruction is a branch, so `a` is the
+            // target like every other branch. Reading `a` as the slot compiled a comparison
+            // against whatever local happened to live at the *target index* -- for
+            // `ternary_check` that was a neighbouring variable holding 5, so `-1 > 0` came out
+            // true and the false arm was unreachable.
+            const std::int32_t slot = compareLocal::slotOf(inst.b);
             auto slow = assembler.newLabel();
             auto compared = assembler.newLabel();
-            emitScalarLoad(inst.a, 32, /*isUnsigned=*/false, slow);
+            emitScalarLoad(slot, 32, /*isUnsigned=*/false, slow);
             assembler.movImm(kTmp1, Width::Qword, static_cast<std::int64_t>(raw));
             assembler.cmp(kRegA, kTmp1, Width::Qword);
             assembler.jmp(compared);
@@ -1226,7 +1310,7 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // at `depth` is where a *different* path may be keeping a live value. Writing the
             // operand there clobbered one arm of a ternary, which is how `ternary_check` came
             // back with `expected 5, got 3`.
-            emitHelperLoad(inst.a, memTypeForInt32(module), kScratchSlot);
+            emitHelperLoad(slot, memTypeForInt32(module), kScratchSlot);
             assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(kScratchSlot)));
             assembler.movImm(kTmp1, Width::Qword, static_cast<std::int64_t>(raw));
             assembler.cmp(kRegA, kTmp1, Width::Qword);

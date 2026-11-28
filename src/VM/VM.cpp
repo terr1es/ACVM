@@ -1213,7 +1213,7 @@ bool VM::startProcess(Process& process, const Function* entry, std::uint64_t sta
 
     const std::uint64_t frameSize = std::max<std::uint64_t>(entry->frameSize, 8);
     zeroBytes(process.stackTop, frameSize);
-    process.frames.push_back(Frame{entry, 0, process.stackTop});
+    process.frames.push_back(Frame::of(entry, process.stackTop));
     process.stackTop += frameSize;
     return true;
 }
@@ -1642,7 +1642,7 @@ bool VM::JitBridge::callFunction(VM& vm, void* process, int functionIndex, int a
         }
     }
 
-    p.frames.push_back(Frame{&callee, 0, frameBase});
+    p.frames.push_back(Frame::of(&callee, frameBase));
 
     // Compiled callees return through their own epilogue and pop their own frame, so the
     // caller only has to check whether one is still there.

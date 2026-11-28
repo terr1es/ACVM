@@ -219,6 +219,14 @@ private:
         const Function* function = nullptr;
         std::size_t ip = 0;
         std::uint64_t base = 0;
+
+        /// The only way a frame is created. Three sites used to assemble one by hand.
+        [[nodiscard]] static Frame of(const Function* callee, std::uint64_t frameBase) {
+            Frame frame;
+            frame.function = callee;
+            frame.base = frameBase;
+            return frame;
+        }
     };
 
     struct Process {

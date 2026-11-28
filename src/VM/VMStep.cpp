@@ -1241,7 +1241,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                 // push: the vector may reallocate. Write ip back first, then leave the inner
                 // loop so the snapshot at the top is taken again for the callee.
                 frame.ip = ip;
-                process.frames.push_back(Frame{&callee, 0, frameBase});
+                process.frames.push_back(Frame::of(&callee, frameBase));
 
                 // Compiled code takes over here, after the frame exists and its parameters
                 // are in place. It also performs the callee's `Ret`, so on success the frame
