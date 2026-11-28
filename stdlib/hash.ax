@@ -47,19 +47,35 @@ comptime int HASH_USED = 1;
 comptime int HASH_TOMB = 2;
 comptime int HASH_MIN_SLOTS = 8;
 
-//  FNV-1a over the eight bytes of a 64 bit key. Bit mixing rather than
-//  multiplication by a float multiplier: it is cheap and spreads the low bits,
-//  which is what modulo-by-power-of-two indexing consumes.
-function private hashOfInt64(int64 key):int {
-    unsigned int hash = 2166136261u32;
-    for (int i = 0; i < 8; i++) {
-        // Mask **before** narrowing: `as int` is a checked conversion, and a key
-        // above 2^31 would trap on the shift that does not move it out of range.
-        int64 narrowed = (key >> (i * 8)) & 255i64;
-        unsigned int byte = narrowed as int as unsigned int;
-        hash = (hash ^ byte) * 16777619u32;
-    }
-    return (hash & 2147483647u32) as int;
+//  Mixes a 64 bit key into a non-negative 32 bit slot index.
+//
+//  SplitMix64's finalizer: three xor-shift rounds and two multiplications. It
+//  replaces an eight round FNV-1a byte walk, which cost about eighty bytecodes
+//  per lookup -- one variable shift, one mask, two casts and a multiply per
+//  byte -- and this costs about ten. Distribution is at least as good: FNV over
+//  eight bytes spreads the low bits, while the finalizer avalanches both halves,
+//  which is what a power-of-two mask actually needs.
+//
+//  `unsigned` throughout, so the multiplications wrap. A signed `int64` would
+//  trap on the first one: Axiom's integer arithmetic is exact at every width and
+//  reports overflow rather than wrapping, which is the wrong behaviour inside a
+//  hash.
+//
+//  The result is returned unmasked: `hashTableIntLocate` folds it with
+//  `& (slots - 1)`, which is the modulo only because every slot count this table
+//  ever holds is a power of two (`hashSlotsFor` rounds up to one, and nothing else
+//  constructs a table). That replaces a division per lookup -- a division in this
+//  VM is a helper call, not an instruction -- and it is also the stronger mask:
+//  the finalizer's low bits are already well mixed, so taking them all is better
+//  than reducing to 31 bits first and then taking a remainder.
+function private hashOfInt64(int64 key):unsigned int64 {
+    unsigned int64 mixed = key as unsigned int64;
+    mixed = mixed ^ (mixed >> 33);
+    mixed = mixed * 18397679294719823053u64;
+    mixed = mixed ^ (mixed >> 33);
+    mixed = mixed * 14181476777654086739u64;
+    mixed = mixed ^ (mixed >> 33);
+    return mixed;
     eof: pass;
 }
 
@@ -134,17 +150,33 @@ function private hashTableIntSlots(ptr HashTableInt t):int {
 //  point** is written to `insertAt` when provided: the first tombstone met on the
 //  probe path, or the empty slot that ended the search.
 function private hashTableIntLocate(ptr HashTableInt t, int64 key, ptr int insertAt):int {
-    const int slots = hashTableIntSlots(t);
+    //  The probe runs once per slot visited, so everything that is constant
+    //  across the loop is hoisted: the slot count, both array bases. Neither
+    //  array moves during a probe -- `locate` allocates nothing -- so the bases
+    //  stay valid.
+    //
+    //  `states` used to be read through `vecGetInt`, which is three calls deep
+    //  (`vecGetInt` -> `vecAt` -> a bounds check) on every slot while `keys` next
+    //  to it was already a plain dereference. The asymmetry was an oversight and
+    //  it dominated the loop.
+    const int slots = t->states.count;
     if (slots <= 0) {
         if (insertAt != 0 as ptr int) {
             @insertAt = -1;
         }
         return -1;
     }
-    int index = hashOfInt64(key) % slots;
+    ptr int64 keyBase = t->keys.data as ptr int64;
+    ptr int stateBase = t->states.data as ptr int;
+
+    // `slots` is a power of two, so the mask is the modulo. `slots - 1` keeps the
+    // index inside the array by construction, which is why no separate
+    // non-negative step is needed.
+    int index = (hashOfInt64(key) & (slots as unsigned int64 - 1u64)) as int;
+
     int firstTomb = -1;
     for (int step = 0; step < slots; step++) {
-        const int state = vecGetInt(#t->states, index);
+        const int state = @(stateBase + index);
         if (state == HASH_EMPTY) {
             if (insertAt != 0 as ptr int) {
                 @insertAt = firstTomb >= 0 ? firstTomb : index;
@@ -156,8 +188,7 @@ function private hashTableIntLocate(ptr HashTableInt t, int64 key, ptr int inser
                 firstTomb = index;
             }
         } else {
-            int64 stored = @(t->keys.data as ptr int64 + index);
-            if (stored == key) {
+            if (@(keyBase + index) == key) {
                 if (insertAt != 0 as ptr int) {
                     @insertAt = index;
                 }
@@ -180,7 +211,7 @@ function private hashTableIntLocate(ptr HashTableInt t, int64 key, ptr int inser
 
 function private hashTableIntGrow(ptr HashTableInt t, int minSlots):bool {
     const int target = hashSlotsFor(minSlots);
-    if (target <= hashTableIntSlots(t)) {
+    if (target <= t->states.count) {
         return true;
     }
     HashTableInt fresh = makeHashTableInt(target);
@@ -188,22 +219,35 @@ function private hashTableIntGrow(ptr HashTableInt t, int minSlots):bool {
         return false;
     }
     // Re-insert the live keys only; tombstones simply disappear.
-    const int slots = hashTableIntSlots(t);
+    //
+    // Every array is touched by index in a loop that runs once per slot, so the
+    // bases are hoisted and the state is read and written through pointers
+    // rather than through `vecGetInt` / `vecSetInt`, both of which are three
+    // calls deep. Growth happens once per doubling, which means the total work
+    // here is about twice the final table size -- the same order as the inserts
+    // that caused it, so this loop is not a corner case.
+    const int slots = t->states.count;
+    ptr int oldStates = t->states.data as ptr int;
+    ptr int64 oldKeys = t->keys.data as ptr int64;
+    ptr int oldValues = t->values.data as ptr int;
+    ptr int64 newKeys = fresh.keys.data as ptr int64;
+    ptr int newValues = fresh.values.data as ptr int;
+    ptr int newStates = fresh.states.data as ptr int;
     for (int i = 0; i < slots; i++) {
-        if (vecGetInt(#t->states, i) != HASH_USED) {
+        if (@(oldStates + i) != HASH_USED) {
             continue;
         }
-        int64 key = @(t->keys.data as ptr int64 + i);
-        int value = @(t->values.data as ptr int + i);
+        int64 key = @(oldKeys + i);
+        int value = @(oldValues + i);
         int at = -1;
         hashTableIntLocate(#fresh, key, #at);
         if (at < 0) {
             hashTableIntFree(#fresh);
             return false;
         }
-        @(fresh.keys.data as ptr int64 + at) = key;
-        @(fresh.values.data as ptr int + at) = value;
-        vecSetInt(#fresh.states, at, HASH_USED);
+        @(newKeys + at) = key;
+        @(newValues + at) = value;
+        @(newStates + at) = HASH_USED;
         fresh.used = fresh.used + 1;
         fresh.filled = fresh.filled + 1;
     }
@@ -215,7 +259,9 @@ function private hashTableIntGrow(ptr HashTableInt t, int minSlots):bool {
 
 //  Inserts or overwrites. Returns false only on allocation failure.
 function private hashTableIntPut(ptr HashTableInt t, int64 key, int value):bool {
-    const int slots = hashTableIntSlots(t);
+    // `t->states.count` directly: `hashTableIntSlots` is a call whose only job is
+    // to read that field, and this runs once per insert.
+    const int slots = t->states.count;
     if (slots <= 0) {
         return false;
     }
@@ -235,10 +281,14 @@ function private hashTableIntPut(ptr HashTableInt t, int64 key, int value):bool 
     if (at < 0) {
         return false;   // no usable slot
     }
-    const int state = vecGetInt(#t->states, at);
+    // Raw pointer access rather than `vecGetInt` / `vecSetInt`, which each go
+    // through `vecAt` and a bounds check. `hashTableIntLocate` already proved `at`
+    // is inside the array -- it returned it -- so the check is redundant here.
+    ptr int stateBase = t->states.data as ptr int;
+    const int state = @(stateBase + at);
     @(t->keys.data as ptr int64 + at) = key;
     @(t->values.data as ptr int + at) = value;
-    vecSetInt(#t->states, at, HASH_USED);
+    @(stateBase + at) = HASH_USED;
     t->used = t->used + 1;
     if (state != HASH_TOMB) {
         t->filled = t->filled + 1;
@@ -267,7 +317,7 @@ function private hashTableIntRemove(ptr HashTableInt t, int64 key):bool {
     if (found < 0) {
         return false;
     }
-    vecSetInt(#t->states, found, HASH_TOMB);
+    @(t->states.data as ptr int + found) = HASH_TOMB;
     t->used = t->used - 1;
     return true;
     eof: pass;
@@ -487,18 +537,24 @@ function private hashTableStrSlots(ptr HashTableStr t):int {
     eof: pass;
 }
 
+//  The string-keyed probe. Same shape as the integer one and for the same
+//  reasons: the slot count and both bases are hoisted, `states` is read through
+//  a pointer instead of `vecGetInt`, and the slot index comes from a mask rather
+//  than a remainder.
 function private hashTableStrLocate(ptr HashTableStr t, string key, ptr int insertAt):int {
-    const int slots = hashTableStrSlots(t);
+    const int slots = t->states.count;
     if (slots <= 0) {
         if (insertAt != 0 as ptr int) {
             @insertAt = -1;
         }
         return -1;
     }
+    ptr int stateBase = t->states.data as ptr int;
+    ptr string keyBase = t->keys.data as ptr string;
     int index = strHashIndex(key) % slots;
     int firstTomb = -1;
     for (int step = 0; step < slots; step++) {
-        const int state = vecGetInt(#t->states, index);
+        const int state = @(stateBase + index);
         if (state == HASH_EMPTY) {
             if (insertAt != 0 as ptr int) {
                 @insertAt = firstTomb >= 0 ? firstTomb : index;
@@ -510,8 +566,7 @@ function private hashTableStrLocate(ptr HashTableStr t, string key, ptr int inse
                 firstTomb = index;
             }
         } else {
-            string stored = @(t->keys.data as ptr string + index);
-            if (strCompare(stored, key) == 0) {
+            if (strCompare(@(keyBase + index), key) == 0) {
                 if (insertAt != 0 as ptr int) {
                     @insertAt = index;
                 }
@@ -532,29 +587,38 @@ function private hashTableStrLocate(ptr HashTableStr t, string key, ptr int inse
 
 function private hashTableStrGrow(ptr HashTableStr t, int minSlots):bool {
     const int target = hashSlotsFor(minSlots);
-    if (target <= hashTableStrSlots(t)) {
+    if (target <= t->states.count) {
         return true;
     }
     HashTableStr fresh = makeHashTableStr(target);
     if (fresh.keys.data == 0 as ptr int8) {
         return false;
     }
-    const int slots = hashTableStrSlots(t);
+    //  Bases hoisted and `states` read through a pointer, as in the integer
+    //  table's growth: this loop runs once per old slot, and the rehash cost is
+    //  about twice the final table size -- the same order as the inserts.
+    const int slots = t->states.count;
+    ptr int oldStates = t->states.data as ptr int;
+    ptr string oldKeys = t->keys.data as ptr string;
+    ptr int oldValues = t->values.data as ptr int;
+    ptr string newKeys = fresh.keys.data as ptr string;
+    ptr int newValues = fresh.values.data as ptr int;
+    ptr int newStates = fresh.states.data as ptr int;
     for (int i = 0; i < slots; i++) {
-        if (vecGetInt(#t->states, i) != HASH_USED) {
+        if (@(oldStates + i) != HASH_USED) {
             continue;
         }
-        string key = @(t->keys.data as ptr string + i);
-        int value = @(t->values.data as ptr int + i);
+        string key = @(oldKeys + i);
+        int value = @(oldValues + i);
         int at = -1;
         hashTableStrLocate(#fresh, key, #at);
         if (at < 0) {
             hashTableStrFree(#fresh);
             return false;
         }
-        @(fresh.keys.data as ptr string + at) = key;
-        @(fresh.values.data as ptr int + at) = value;
-        vecSetInt(#fresh.states, at, HASH_USED);
+        @(newKeys + at) = key;
+        @(newValues + at) = value;
+        @(newStates + at) = HASH_USED;
         fresh.used = fresh.used + 1;
         fresh.filled = fresh.filled + 1;
     }
@@ -583,10 +647,11 @@ function private hashTableStrPut(ptr HashTableStr t, string key, int value):bool
     if (at < 0) {
         return false;
     }
-    const int state = vecGetInt(#t->states, at);
+    ptr int putStateBase = t->states.data as ptr int;
+    const int state = @(putStateBase + at);
     @(t->keys.data as ptr string + at) = key;
     @(t->values.data as ptr int + at) = value;
-    vecSetInt(#t->states, at, HASH_USED);
+    @(putStateBase + at) = HASH_USED;
     t->used = t->used + 1;
     if (state != HASH_TOMB) {
         t->filled = t->filled + 1;
@@ -612,7 +677,7 @@ function private hashTableStrRemove(ptr HashTableStr t, string key):bool {
     if (found < 0) {
         return false;
     }
-    vecSetInt(#t->states, found, HASH_TOMB);
+    @(t->states.data as ptr int + found) = HASH_TOMB;
     t->used = t->used - 1;
     return true;
     eof: pass;
