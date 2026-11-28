@@ -1641,6 +1641,15 @@ bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int 
     // has to compute anyway.
     CallSetup setup;
     setup.frameBase = frameBase;
+    // The caller's own native slot, so a compiled callee can deliver its result without going
+    // through the interpreter's value stack. See the note on `CallSetup::resultSlot` for why
+    // the callee also stops popping its own frame when this is set.
+    //
+    // Set even when the callee returns nothing. The two things it decides -- where the result
+    // goes and who pops the frame -- have to agree, and tying both to `returnsValue` broke that
+    // for `void` functions: the epilogue took the general path and popped, then this side
+    // popped again, and the frame stack drained into `call depth exceeded`.
+    setup.resultSlot = out;
     const std::uint64_t pageOffset = frameBase & kPageMask;
     if (pageOffset + frameSize <= kPageSize) {
         setup.firstPage = vm.m_memory->get(frameBase >> kPageShift, true);
@@ -1709,8 +1718,8 @@ bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int 
         }
     }
 
-    // The same tail `callFunction` uses. It computes the frame base again from `stackTop`,
-    // which is why that is passed in rather than assumed.
+    // The frame base is where `stackTop` was before this frame grew, which is why it is
+    // computed here rather than assumed from the callee's size alone.
     const std::uint64_t pushedBase = p.stackTop - frameSize;
     p.frames.push_back(Frame::of(&callee, pushedBase));
 
@@ -1724,6 +1733,14 @@ bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int 
             // Unwind what was set up, so the caller's failure path sees the stack it had.
             p.stackTop = previousTop;
             return false;
+        }
+        if (outcome == 1) {
+            // Normal return: the value is already in the caller's slot, and the frame is
+            // still on the frame stack because `emitReturn` left it for this side to pop --
+            // only the caller can tell a normal return from a bail.
+            p.frames.pop_back();
+            p.stackTop = previousTop;
+            return true;
         }
         if (outcome == 3) {
             // The body stopped at an instruction only the interpreter can run. The frame is
@@ -1780,132 +1797,7 @@ bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int 
     return true;
 }
 
-bool VM::JitBridge::callFunction(VM& vm, void* process, int functionIndex, int argc,
-                                 std::string* error) {
-    auto& p = *static_cast<Process*>(process);
-    if (vm.m_module == nullptr || functionIndex < 0 ||
-        static_cast<std::size_t>(functionIndex) >= vm.m_module->functions.size()) {
-        if (error != nullptr) {
-            *error = "invalid call target";
-        }
-        return false;
-    }
-    const Function& callee = vm.m_module->functions[static_cast<std::size_t>(functionIndex)];
 
-    // Arguments are already on the value stack, in order, because compiled code pushed
-    // them there -- so the frame setup is the same one CALL performs. External libraries
-    // and aggregates are outside what the lowering emits a call for, which is why this
-    // path can assume ordinary value parameters.
-    const std::uint64_t frameBase = p.stackTop;
-    const std::uint64_t frameSize = std::max<std::uint64_t>(callee.frameSize, 8);
-    if (p.frames.size() >= kMaxCallDepth) {
-        if (error != nullptr) {
-            *error = "call depth exceeded in '" + callee.name + "' (unbounded recursion?)";
-        }
-        return false;
-    }
-
-    // Arguments are read off the value stack where they sit, not moved into a
-    // `std::vector<Value>` first.
-    //
-    // The vector was a heap allocation and a free on every call -- the same shape that was
-    // removed from the interpreter's own CALL, and it should have been removed here at the
-    // same time. Compiled callers push their arguments here, so the layout is the interpreter's:
-    // the arguments are the top `argc` values, in order.
-    const std::size_t stackSize = p.stack.size();
-    if (stackSize < static_cast<std::size_t>(argc)) {
-        if (error != nullptr) {
-            *error = "stack underflow in CALL to '" + callee.name + "' (argc " +
-                     std::to_string(argc) + ", stack " + std::to_string(stackSize) + ")";
-        }
-        return false;
-    }
-    const std::size_t argumentBase = stackSize - static_cast<std::size_t>(argc);
-
-    vm.zeroBytes(frameBase, frameSize);
-    p.stackTop += frameSize;
-    for (std::size_t i = 0; i < static_cast<std::size_t>(argc) && i < callee.params.size(); ++i) {
-        const ParamInfo& param = callee.params[i];
-        const Value& argument = p.stack[argumentBase + i];
-        if (param.aggregate) {
-            // An aggregate argument is the address of its descriptor, so the bytes have to
-            // be copied into the callee's frame. Storing the pointer instead -- which is
-            // what this did at first -- leaves the callee reading an empty string.
-            //
-            // Through a stack buffer rather than a heap one: a struct is small, and the point
-            // of this rewrite is to stop allocating per call.
-            std::uint8_t buffer[64];
-            if (param.size <= sizeof(buffer)) {
-                vm.readBytes(argument.asPtr(), buffer, param.size);
-                vm.writeBytes(frameBase + param.offset, buffer, param.size);
-            } else {
-                std::vector<std::uint8_t> large(param.size);
-                vm.readBytes(argument.asPtr(), large.data(), param.size);
-                vm.writeBytes(frameBase + param.offset, large.data(), param.size);
-            }
-        } else {
-            vm.storeScalar(frameBase + param.offset, param.memType, argument);
-        }
-    }
-    // The arguments are copied, so they can go. This is what the pop loop above did one at a
-    // time; doing it once keeps `p.stack` from being resized inside the loop that reads it.
-    p.stack.resize(argumentBase);
-
-    p.frames.push_back(Frame::of(&callee, frameBase));
-
-    // Compiled callees return through their own epilogue and pop their own frame, so the
-    // caller only has to check whether one is still there.
-    if (JitFunction native = vm.m_jit.entryFor(*vm.m_module,
-                                              static_cast<std::size_t>(functionIndex),
-                                              vm.m_jitRefusal)) {
-        const std::int64_t outcome = native(&vm, process, frameBase, error, nullptr);
-        if (outcome == 0) {
-            return false;
-        }
-        if (outcome == 2) {
-            // A nested yield cannot be honoured: the compiled caller is mid-frame on its
-            // own native stack and has nowhere to hand control back from. Treated as
-            // success.
-            return true;
-        }
-        if (outcome != 3) {
-            return true;
-        }
-        // 3: the body reached an instruction only the interpreter can execute and left
-        // its resume ip behind. Fall through and finish this one frame interpreted.
-    }
-
-    // No compiled entry: run exactly this frame in the interpreter.
-    //
-    // The frame floor is what makes "exactly this frame" true. Without it, `step()` runs
-    // until a safe point, which for a callee with no calls in it means it keeps going
-    // after the callee returns -- straight into the *compiled* caller's bytecode. Both
-    // implementations then run the same body: this is how `noisy(x)` ended up printing
-    // twice and returning the value of the wrong call.
-    const std::size_t baseDepth = p.frames.size();
-    const std::size_t previousFloor = vm.m_frameFloor;
-    vm.m_frameFloor = baseDepth;
-    bool ok = true;
-    while (p.frames.size() >= baseDepth && !p.finished) {
-        const Step result = vm.step(p, *error);
-        if (result == Step::Trap) {
-            ok = false;
-            break;
-        }
-        if (result == Step::Finished) {
-            break;
-        }
-    }
-    vm.m_frameFloor = previousFloor;
-    return ok;
-}
-
-bool VM::JitBridge::pushValue(void* process, std::int64_t value, bool isPtr) {
-    auto& p = *static_cast<Process*>(process);
-    p.stack.push_back(isPtr ? Value::fromPtr(static_cast<std::uint64_t>(value))
-                            : Value::fromInt(static_cast<Int128>(value)));
-    return true;
-}
 
 int VM::JitBridge::safePoint(VM& vm, void* process, std::uint64_t nextIp,
                              std::string* error) {
@@ -1950,20 +1842,6 @@ bool VM::JitBridge::consumeBudget(VM& vm, std::uint64_t amount) {
     return false;
 }
 
-bool VM::JitBridge::popResult(void* process, std::int64_t* out, bool isPtr) {
-    auto& p = *static_cast<Process*>(process);
-    if (p.stack.empty()) {
-        return false;
-    }
-    const Value value = p.stack.back();
-    p.stack.pop_back();
-    if (value.tag() == Value::Tag::Float) {
-        return false;
-    }
-    *out = isPtr ? static_cast<std::int64_t>(value.asPtr())
-                 : static_cast<std::int64_t>(value.asInt());
-    return true;
-}
 
 void VM::JitBridge::returnToCaller(void* process, bool hasResult, std::int64_t result,
                                    bool resultIsPtr) {

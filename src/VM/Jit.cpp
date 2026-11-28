@@ -107,14 +107,7 @@ void copyThroughPointers(VM& vm, std::uint64_t destination, std::uint64_t source
     VM::JitBridge::copyThroughPointers(vm, destination, source, size);
 }
 
-bool callFunction(VM& vm, void* process, int functionIndex, int argc,
-                  std::string* error) {
-    return VM::JitBridge::callFunction(vm, process, functionIndex, argc, error);
-}
 
-bool pushValue(void* process, std::int64_t value, bool isPtr) {
-    return VM::JitBridge::pushValue(process, value, isPtr);
-}
 
 int safePoint(VM& vm, void* process, std::uint64_t nextIp, std::string* error) {
     return VM::JitBridge::safePoint(vm, process, nextIp, error);
@@ -128,9 +121,6 @@ bool consumeBudget(VM& vm, std::uint64_t amount) {
     return VM::JitBridge::consumeBudget(vm, amount);
 }
 
-bool popResult(void* process, std::int64_t* out, bool isPtr) {
-    return VM::JitBridge::popResult(process, out, isPtr);
-}
 
 void setTrapMessage(std::string* error, const char* message) {
     if (error != nullptr) {
@@ -966,6 +956,52 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         assembler.cmpImm(kTmp2, static_cast<std::int32_t>(65536 - bytes));
         assembler.jcc(Cond::Above, slow);
         assembler.lea(kTmp1, memIndex(kTmp1, kTmp2, 1, 0));
+    };
+
+    /// Emits the function's return: the value in `valueSlot` (when `hasResult`) delivered to
+    /// the caller.
+    ///
+    /// Two ways out, and the fast one is why this exists. A compiled caller passes a
+    /// `resultSlot` in the setup it hands over -- a native slot of its own -- and then the
+    /// return is one store. Without it the return goes through `jitbridge::returnToCaller`,
+    /// which pops the frame and pushes a 32-byte `Value` onto the interpreter's stack so that
+    /// the caller can immediately pop it again. At 53.1M calls that round trip is the last
+    /// per-call C++ entry left.
+    ///
+    /// The setup is re-read here rather than kept in a register: it lives at a fixed offset in
+    /// this frame for the whole body, and every register is spoken for.
+    auto emitReturn = [&](bool hasResult, std::size_t valueSlot) {
+        auto general = assembler.newLabel();
+        assembler.mov(kTmp1, mem(Reg::Rsp, static_cast<std::int32_t>(kFrameBytes) + 88),
+                      Width::Qword);
+        assembler.test(kTmp1, kTmp1, Width::Qword);
+        assembler.jcc(Cond::Equal, general);
+        assembler.mov(kTmp2, mem(kTmp1, 16), Width::Qword);   // setup->resultSlot
+        assembler.test(kTmp2, kTmp2, Width::Qword);
+        assembler.jcc(Cond::Equal, general);
+        if (hasResult) {
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(valueSlot)));
+            assembler.mov(mem(kTmp2, 0), kRegA, Width::Qword);
+        }
+        // The frame stays: the caller pops it, because only it can tell a normal return from
+        // a bail into the interpreter.
+        assembler.movImm(kRegA, Width::Qword, 1);
+        assembler.jmp(failureExit);
+
+        assembler.bind(general);
+        if (hasResult) {
+            assembler.mov(kArg3, mem(Reg::Rsp, slotOffset(valueSlot)));
+        } else {
+            assembler.movImm(kArg3, Width::Qword, 0);
+        }
+        assembler.mov(kArg1, kRegProcess);
+        assembler.movImm(kArg2, Width::Dword, hasResult ? 1 : 0);
+        assembler.movImm(kArg4, Width::Dword,
+                         isPointerType(module, function.returnMemType) ? 1 : 0);
+        assembler.callAbsolute(
+            reinterpret_cast<const void*>(&jitbridge::returnToCaller));
+        assembler.movImm(kRegA, Width::Qword, 1);
+        assembler.jmp(failureExit);
     };
 
     auto emitHelperLoad = [&](std::int32_t offset, int typeIndex,
@@ -1919,10 +1955,10 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             }
             const Function& callee = module.functions[static_cast<std::size_t>(inst.a)];
             // Arguments cross through the interpreter's value stack: recorded here into
-            // `process.stack`, popped by `callFunction`, which then dispatches to the
-            // callee's compiled entry when it has one and to `step()` when it does not.
+            // a native slot, read by `callFromSlots`, which sets up the frame and dispatches
+            // to the callee's compiled entry when it has one and to `step()` when it does not.
             // The interop carries aggregates (a string arrives as the address of its
-            // descriptor, which is why the push below tags it) -- getting that tag wrong
+            // descriptor, which is why the pointer mask tags it) -- getting that tag wrong
             // is what made a callee read an empty string.
             //
             // A `library` call never reaches here: its arguments are marshalled by the
@@ -1941,11 +1977,11 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // result lands in the slot the first argument came from -- the expression stack
             // shrinks by `argc` and grows by one, and that is exactly where it ends up.
             //
-            // Before this, each call was `pushValue` per argument, then `callFunction`, then
-            // `popResult`: three trips through a C++ helper, each with its own register setup,
-            // plus a 32 byte `Value` constructed per argument and a value stack push and pop
-            // around it. At 53.1M calls that is the whole reason compiled code used to be
-            // slower than interpreted code on a recursive program.
+            // Before this, each call was three trips through a C++ helper (`pushValue` per
+            // argument, `callFunction`, `popResult`), each with its own register setup, plus a
+            // 32 byte `Value` built per argument and a value stack push and pop around it. At
+            // 53.1M calls that is the whole reason compiled code used to be slower than
+            // interpreted code on a recursive program.
             const std::size_t firstArgument = depth - static_cast<std::size_t>(argc);
             std::uint32_t pointerMask = 0;
             for (int i = 0; i < argc; ++i) {
@@ -2044,52 +2080,28 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             assembler.bind(slow);
             emitHelperLoad(inst.a, function.returnMemType, depth);
             assembler.bind(done);
-            assembler.mov(kArg3, mem(Reg::Rsp, slotOffset(depth)));
-            assembler.mov(kArg1, kRegProcess);
-            assembler.movImm(kArg2, Width::Dword, 1);
-            assembler.movImm(kArg4, Width::Dword,
-                             isPointerType(module, function.returnMemType) ? 1 : 0);
-            assembler.callAbsolute(
-                reinterpret_cast<const void*>(&jitbridge::returnToCaller));
-            assembler.movImm(kRegA, Width::Qword, 1);
-            assembler.jmp(failureExit);
+            emitReturn(/*hasResult=*/true, depth);
             emittedReturn = true;
             break;
         }
 
         case OpCode::Ret: {
-            // returnToCaller(process, hasResult, result, resultIsPtr): r8 carries the
-            // value, r9 the tag flag. The value goes straight from its slot into r8 --
-            // there is nothing to compute -- so no scratch register is involved.
             if (function.returnsValue) {
                 if (depth == 0) {
                     refusal = "missing return value";
                     break;
                 }
                 --depth;
-                assembler.mov(kArg3, mem(Reg::Rsp, slotOffset(depth)));
+                emitReturn(/*hasResult=*/true, depth);
+            } else {
+                emitReturn(/*hasResult=*/false, 0);
             }
-            assembler.mov(kArg1, kRegProcess);
-            assembler.movImm(kArg2, Width::Dword, function.returnsValue ? 1 : 0);
-            assembler.movImm(kArg4, Width::Dword,
-                             isPointerType(module, function.returnMemType) ? 1 : 0);
-            assembler.callAbsolute(
-                reinterpret_cast<const void*>(&jitbridge::returnToCaller));
-            assembler.movImm(kRegA, Width::Qword, 1);
-            assembler.jmp(failureExit);
             emittedReturn = true;
             break;
         }
 
         case OpCode::Halt: {
-            assembler.mov(kArg1, kRegProcess);
-            assembler.movImm(kArg2, Width::Dword, 0);
-            assembler.movImm(kArg3, Width::Qword, 0);
-            assembler.movImm(kArg4, Width::Dword, 0);
-            assembler.callAbsolute(
-                reinterpret_cast<const void*>(&jitbridge::returnToCaller));
-            assembler.movImm(kRegA, Width::Qword, 1);
-            assembler.jmp(failureExit);
+            emitReturn(/*hasResult=*/false, 0);
             emittedReturn = true;
             break;
         }
@@ -2178,13 +2190,9 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                      "': falls off the end with a value still on the stack";
             return nullptr;
         }
-        assembler.mov(kArg1, kRegProcess);
-        assembler.movImm(kArg2, Width::Dword, 0);
-        assembler.movImm(kArg3, Width::Qword, 0);
-        assembler.movImm(kArg4, Width::Dword, 0);
-        assembler.callAbsolute(
-            reinterpret_cast<const void*>(&jitbridge::returnToCaller));
-        assembler.movImm(kRegA, Width::Qword, 1);
+        // A `void` function that falls off the end: no value, so nothing to deliver, but the
+        // frame still has to go somewhere -- `emitReturn` decides who pops it.
+        emitReturn(/*hasResult=*/false, 0);
     }
 
     // Each trap block ends with a jump. Without one it falls through into the next and the

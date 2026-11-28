@@ -84,6 +84,16 @@ struct CallSetup {
     std::uint64_t frameBase = 0;
     /// Null means "this frame spans more than one page, resolve them yourself".
     void* firstPage = nullptr;
+    /// Where the compiled callee should write its result.
+    ///
+    /// Null means "leave it on the interpreter's value stack, as a return always has".
+    /// Non-null is the compiled-caller case: the caller has a native slot for the value, so
+    /// pushing a 32-byte `Value` onto the stack for the caller to pop again is work that only
+    /// exists to satisfy the interpreter's calling convention.
+    ///
+    /// **When this is honoured the callee does not pop its own frame.** The caller does, which
+    /// is the only place that can tell a normal return from a bail.
+    std::int64_t* resultSlot = nullptr;
 };
 
 using JitFunction = std::int64_t (*)(VM* vm, void* process, std::uint64_t frameBase,
@@ -194,15 +204,7 @@ void copyThroughPointers(VM& vm, std::uint64_t destination, std::uint64_t source
 int pinFramePages(VM& vm, std::uint64_t frameBase, std::uint64_t frameSize,
                   void** out, int maxPages);
 
-/// Performs a full CALL: pushes the arguments onto the interpreter's value stack, sets up
-/// the callee's frame, and runs it -- through its compiled entry when it has one, through
-/// the interpreter when it does not. Pops the frame on return and leaves any result on the
-/// value stack, exactly as the interpreter's CALL does.
-bool callFunction(VM& vm, void* process, int functionIndex, int argc,
-                  std::string* error);
 
-/// Moves the value stack's top into `out` and pops it. Used after a call returns.
-bool popResult(void* process, std::int64_t* out, bool isPtr = false);
 
 /// Performs a CALL from compiled code, reading the arguments out of the caller's native
 /// slots instead of pushing them onto the interpreter's value stack first.
@@ -222,10 +224,6 @@ bool callFromSlots(VM& vm, void* process, int functionIndex, int argc,
                    const std::int64_t* args, std::uint32_t pointerMask, std::int64_t* out,
                    std::string* error);
 
-/// Pushes one value onto the interpreter's stack. Compiled code keeps its values in
-/// native slots, but CALL reads its arguments from `process.stack`, so this is how the two
-/// representations meet.
-bool pushValue(void* process, std::int64_t value, bool isPtr = false);
 
 /// A safe point from compiled code. Records where the interpreter should resume and says
 /// whether the scheduler has to run now.
