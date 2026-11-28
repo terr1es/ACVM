@@ -111,14 +111,15 @@ Four things were measured this round and did not help:
     had already done it; the versions that spelled it out explicitly were measurably slower,
     from register pressure.
 
-And one that worked but is not shipped: `forwardReturnSlot`, which rewrites
-`STORE_LOCAL 0; JUMP epilogue` / `epilogue: LOAD_LOCAL 0; RET` into a keeping store and a
-plain `RET`. It takes `fib` to 373M instructions — 17% — and makes three `--jit` comparison
-tests fail with `missing return value in 'chanTryPush'`, while the same programs without
-`--jit` run correctly. The edge analysis was checked against that function's real bytecode:
-one jump into the epilogue, every arriving path preceded by a `StoreLocal 0`. So the fault is
-in how the interpreter and a compiled frame disagree about a stack that a `keep` bit left
-populated. Worth finishing; not worth shipping half-understood.
+And one that worked once its diagnosis was corrected: forwarding the return slot, which
+rewrites `STORE_LOCAL 0; JUMP epilogue` / `epilogue: LOAD_LOCAL 0; RET` into one `RET_LOCAL 0`.
+It is shipped now, worth 12% of `fib`'s instructions. The note that used to stand here blamed the
+three failing `--jit` tests on a `keep` bit leaving a stack the compiled frame disagreed about.
+That was wrong. The rewrite was correct; the JIT was silently dropping every instruction the
+optimiser had fused (`effectOf` returned "unknown", the depth analysis skipped them rather than
+refusing, and the lowering emitted the body up to them) and marking the function compiled
+anyway. `chanTryPush` reported a missing return value because the instruction that produced it
+had never been emitted.
 
 ## Why it was slow, and why the first answer was wrong
 
@@ -302,26 +303,77 @@ tag, rounded up by the 16-byte alignment the 128-bit type forces — so popping 
 locals was two 32-byte copies, and pushing the result a third. The result is now written over the
 left operand. Worth 5–12% depending on the benchmark.
 
+## The JIT after the comparison fix
+
+The JIT used to be slower than the interpreter on every benchmark in this file, which made it
+a demonstration rather than a tier. It is not any more, on everything except calls.
+
+| benchmark | interpreter | `--jit` | |
+|---|---|---|---|
+| `empty` | 0.406 s | 0.119 s | **3.4× faster** |
+| `arith` | 0.518 s | 0.042 s | **12.2× faster** |
+| `array` | 0.311 s | 0.315 s | unchanged |
+| `calls` | 3.305 s | 4.805 s | **0.69× — slower** |
+
+Two causes, and only one of them was a missing lowering.
+
+`CMP_LOCAL_IMM` read its frame slot from `a`. But `a` is the jump target -- this instruction is
+a branch, like every other branch in this set -- and the slot is packed into `b` with the
+constant and the comparison. So a compiled comparison read whatever local happened to live at
+the *target index*. For `ternary_check` that was a neighbouring variable holding 5, so
+`-1 > 0` evaluated true and the false arm was unreachable: `expected 5, got 3`. The bug had been
+attributed to the value stack disagreeing between the interpreter and compiled code, which was
+wrong; the disassembly showed `frame+4` and the lowering was reading `frame+12`.
+
+With the slot correct, the loop header compiles, and that is where the 3–12× comes from. `array`
+is unchanged because it walks a global array (`LOAD_GLOBAL`), which is still a hand-off point.
+
+`calls` is slower for a different reason: **every `CALL` in compiled code goes through a C++
+bridge.** Arguments are pushed onto the interpreter's value stack, `callFunction` pops them,
+looks the callee up, zeroes its frame and calls its entry. That is about 29 ns per call, and at
+53.1M calls it more than wipes out what the compiled body saves. A direct call path is the next
+piece of work; see the list above.
+
+## What did not work, this round
+
+Two changes from the list, both implemented, measured and dropped.
+
+**Caching the frame's decoded state.** `VM::Frame` holds a `Function*`, and the interpreter
+reaches `code.data()`, `code.size()` and `constants.data()` through it -- a five-deep dependent
+load chain on every `CALL` and every `RET`. Caching all three in the frame (24 more bytes per
+frame) measured **1.3% slower**, not faster: the chain was already resolved out of L1 by the
+out-of-order engine. Reverted. What survived is `Frame::of`, because three sites were assembling
+a frame by hand and a fourth would have got it wrong.
+
+**Removing work from `CALL`'s body.** Ablating the argument store cost nothing (3.232 s to
+3.251 s), ablating `zeroBytes(frameBase, frameSize)` cost nothing (3.253 s to 3.262 s), and
+`-O4`, which deletes all 53.1M safe points, is worth 3.3%. Whatever the call path's cost is, it
+is not in the work those functions do -- which is consistent with the bridge finding above: it is
+in the transfer, not the setup.
+
 ## What is still on the table
 
 In the order I would do them, and with the reason each is not already done.
 
-**1. The per-frame snapshot.** `CALL` and `RET` both end the inner loop and rebuild
-`frames.back()`, the function, its code pointer and size, its constant pool and the base
-address — six loads and a few stores, twice per call. Caching the code pointer and constant pool
-in the `Frame` itself would make that one cache line instead of four, and pre-sizing `frames` to
-`kMaxCallDepth` would make the reference stable so the loop does not have to be re-entered at
-all. Estimated 10–15% on `calls`; not attempted because it touches the one piece of state every
-opcode reads. This is now the largest item left, and the profile says so: `CALL`, `SAFE_POINT`
-and `RET_LOCAL` are 40% of `fib`'s instructions and the frame switch is where its time goes.
+**1. Give compiled code a direct call path.** Every `CALL` in compiled code marshals its
+arguments onto the interpreter's value stack and goes through `jitbridge::callFunction`, which
+looks the callee up and sets up its frame. That is roughly 29 ns of overhead per call, and it is
+why compiled `fib` is *slower* than interpreted `fib` (4.81 s against 3.31 s for 53.1M calls)
+once the JIT can compile it at all. Inlining the frame setup and jumping straight to the
+callee's entry would fix it; it is also the largest remaining piece of work in the JIT, because
+the callee's prologue, the frame zeroing and the argument copy all have to agree with what
+`callFunction` does today.
 
-**2. `CMP_BRANCH` and `CMP_LOCAL_IMM` in the JIT.** Both lowerings exist in this tree's history
-and both were withdrawn: they compiled, and gave wrong answers on `ternary_check`. The depth
-analysis says the bytecode's stack agrees across the two arms, and it is right about the
-bytecode; what disagrees is the compiled stack, and the difference was not found. Until it is,
-the interpreter executes every comparison, which costs one switch per branch rather than one per
-call. Worth finishing: it is the difference between the JIT covering the optimiser's output and
-covering most of it.
+**2. `CMP_BRANCH` in the JIT.** Still handed to the interpreter, for the reason recorded below
+under "what did not work". `CMP_LOCAL_IMM` was in the same state until its operand bug was found,
+and fixing that one turned the JIT from "never faster than the interpreter" into 3.4× on a bare
+loop and 12× on an arithmetic one. `CMP_BRANCH` is the same opportunity for branches whose
+operand is not a local plus a constant.
+
+**3. Promote more than one slot.** One frame slot's address is cached in `rbp`; worth 11.8% on a
+compiled arithmetic loop and nothing on the others. There are no more free callee-saved
+registers, so a second slot means spilling something else -- which is where this stops being a
+cheap trick and becomes an allocator.
 
 **3. Promote hot frame slots into registers inside the JIT.** The one cheap version of a
 register machine, and the one worth doing — see `docs/registers.md`, which also records why a
