@@ -26,23 +26,97 @@ counts are the ones to believe — the wall-clock numbers move by ±10% between 
 
 | benchmark | Axiom | CPython 3.13 | ratio |
 |---|---|---|---|
-| `empty` | 1.365 s | 1.280 s | 1.07× slower |
-| `arith` | 0.698 s | 0.777 s | 1.11× **faster** |
-| `array` | 0.338 s | 0.394 s | 1.17× **faster** |
-| `calls` | 5.226 s | 2.090 s | 2.50× slower |
+| `empty` | 0.475 s | 1.349 s | 2.84× **faster** |
+| `arith` | 0.554 s | 0.840 s | 1.52× **faster** |
+| `array` | 0.340 s | 0.522 s | 1.54× **faster** |
+| `calls` | 3.371 s | 2.418 s | 1.39× slower |
 
-Two consecutive runs, so the spread is visible rather than hidden behind one number:
+Three of four. The one that is left is the one where a program does almost nothing but call
+functions, and the rest of this document is mostly about why that is the hard one.
 
-| benchmark | ratio, two runs |
-|---|---|
-| `empty` | 1.17×, 1.07× |
-| `arith` | 0.79×, 0.90× |
-| `array` | 0.85×, 0.86× |
-| `calls` | 2.40×, 2.50× |
+Per-instruction cost, computed from the same runs:
 
-Arithmetic and array access are now faster than CPython rather than level with it. `empty` is
-within the noise of parity. `calls` is the one benchmark still clearly behind, and the rest of
-this document is largely about why.
+| benchmark | instructions | ns/instruction |
+|---|---|---|
+| `empty` | 200 000 008 | 2.4 (four per iteration) |
+| `arith` | 80 000 012 | 6.9 |
+| `array` | 40 036 017 | 8.5 |
+| `calls` | 453 000 010 | 7.4 |
+
+CPython spends 4.1 ns per bytecode on `calls` (2.418 s for 589M). Axiom's floor on a tight
+loop is about 2.4 ns and its cost with a call in it is 7.4 — so the interpreter is not
+uniformly slower, it is slower exactly where the frame changes.
+
+## What closed the gap
+
+Two changes, and both of them were about memory rather than instructions.
+
+### Three fusions
+
+`CMP_LOCAL_IMM` is `LOAD_LOCAL slot; CONST c; CMP_BRANCH` in one instruction — the shape of
+every loop bound and every `if (n < 2)`. `ADD_SUB_LOCAL_IMM` is the same for
+`LOAD_LOCAL; CONST c; ADD|SUB`, which `fib` emits twice per call. `COPY_LOCAL` is
+`LOAD_LOCAL src; STORE_LOCAL dst keep`, which is how every scalar `return` writes its value to
+the return slot. Together they took `fib` from 665M instructions to 453M.
+
+The instruction count is not the larger half of the gain. The fused forms also stop calling
+`computeBinary` — a function with arms for float, pointer, native-width int and generic
+128-bit — and stop pushing two 32-byte `Value`s through the stack to compare them. `empty`
+went from 1.09× behind CPython to 2.84× ahead on this alone.
+
+### The page lookup
+
+`residentInt32` returns a pointer into a page, and to find that page it called
+`PageStore::get`: a modulo, a cache-index compare and a load, on **every local access**. A
+frame is one allocation of a few hundred bytes, so every access in a function hits the same
+64 KB page — the lookup was answering the same question thousands of times in a row.
+
+It now remembers the last page and compares indices before asking again. Keeping that cache
+across a `CALL` rather than dropping it with the frame was worth another 15%, because frames
+are contiguous VM memory and consecutive calls usually land in the same page. `PageStore` only
+ever `find`s or `emplace`s, so a page is never moved and never freed, which is what makes the
+retained pointer safe.
+
+`calls` went from 5.31 s to 3.37 s across the two changes.
+
+## Why `calls` is still 1.39× behind
+
+| | Axiom | CPython 3.13 |
+|---|---|---|
+| time per call | 63.5 ns | 45.5 ns |
+| items per call | 8.5 instructions | 11.1 bytecodes |
+| cost per item | 7.4 ns | 4.1 ns |
+
+Axiom executes fewer operations per call and pays more for each. The gap is not uniform: a
+tight loop runs at 2.4 ns per instruction, and a loop with a call in it at 7.4. So the cost is
+in changing frames — the snapshot the interpreter rebuilds after every `CALL` and every `RET`
+(`frames.back()`, the function, its code pointer and size, its constant pool, the base
+address) plus whatever the call does to the branch predictor.
+
+Four things were measured this round and did not help:
+
+  * **A smaller `Value`.** 32 bytes to 24 (a `lo`/`hi`/tag struct instead of a 16-byte-aligned
+    union) is worth 1.4% on `calls` and 7.6% on `arith`, while making `asInt()` two loads and
+    a shift. Reverted. The copy was never the bottleneck.
+  * **Deleting `SAFE_POINT`.** `-O4` removes all 53.1M of them, 11.7% of the program, for 0.6%
+    of the time. They are the cheapest instruction in the VM.
+  * **The JIT.** It refuses `fib` because the first instruction is `CMP_LOCAL_IMM`, and it does
+    not know `CompareBranch` or `StepJump` at all — so every program compiled at `-O1` or above
+    is invisible to it. On the `-O0` bytecode it *can* compile, it is 40% faster than the
+    interpreter and still slower than `-O2` interpretation (4.20 s against 3.28 s), because the
+    extra instructions cost more than the compiled code saves.
+  * **Hoisting `module.memTypes` or the constant pool out of the dispatch loop.** The compiler
+    had already done it; the versions that spelled it out explicitly were measurably slower,
+    from register pressure.
+
+And one that worked but is not shipped: `forwardReturnSlot`, which rewrites
+`STORE_LOCAL 0; JUMP epilogue` / `epilogue: LOAD_LOCAL 0; RET` into a keeping store and a
+plain `RET`. It takes `fib` to 373M instructions — 17% — and makes three `--jit` comparison
+tests fail with `missing return value in 'chanTryPush'`, while the same programs without
+`--jit` run correctly. The edge analysis was checked against that function's real bytecode:
+one jump into the epilogue, every arriving path preceded by a `StoreLocal 0`. So the fault is
+in how the interpreter and a compiled frame disagree about a stack that a `keep` bit left
+populated. Worth finishing; not worth shipping half-understood.
 
 ## Why it was slow, and why the first answer was wrong
 
@@ -228,43 +302,34 @@ left operand. Worth 5–12% depending on the benchmark.
 
 ## What is still on the table
 
-In the order I would do them, most valuable first.
+In the order I would do them, and with the reason each is not already done.
 
-**1. `Value` is 32 bytes.** This is now the top item, and the reason is quantitative rather than
-aesthetic: it is the remaining explanation for `calls` being 2.4× behind. It holds an `Int128`,
-which forces 16-byte alignment, so a stack slot is 32 bytes and every push or pop moves that.
-CPython's stack holds 8-byte pointers. `CONST_INT` alone is 16% of `fib`'s instructions and does
-nothing but push 32 bytes. Making the common case (`int32`, `int64`, `float`, pointer) 16 bytes
-would halve the traffic on the hottest data path in the VM. It is also the largest change here:
-`Value` is the type everything else is written against, and the 128-bit cases would have to move
-to a side path. The previous round deferred it on the grounds that memory access was the real
-cost; that turned out to be right, and it has now been fixed, which promotes this to the front.
+**1. Finish `forwardReturnSlot`.** 17% of a call-heavy program, blocked on one reproducible
+failure that has not been diagnosed. That is the largest single item left and the most
+annoying, because the fix is written and the analysis behind it holds up.
 
-**2. Specialise arithmetic.** `computeBinary` is one function with arms for float, pointer,
-native-width int, generic 128-bit and the six comparisons. Every arithmetic instruction pays that
-branch ladder because the arms cannot be selected per call site. CPython's specialised
-`BINARY_OP_INT_ADD` and friends are separate code paths, chosen once. Two obvious cases here:
-`ADD`/`SUB` with a memType of `int32` are almost all of real arithmetic and could be a single
-compare-and-add at the top of the dispatch arm, before the general function is called.
+**2. Make the JIT able to see optimised bytecode.** It refuses `fib` on its first instruction
+and does not know `CompareBranch` or `StepJump`, so nothing compiled at `-O1` or above can be
+compiled to machine code. That is a strange place for the tier to be in: the optimiser is what
+makes the bytecode worth compiling, and the JIT can only see what the optimiser has not touched.
+On the bytecode it *can* see it is already 40% faster than the interpreter, so supporting five
+more opcodes is the difference between a demonstration and a usable tier.
 
-**3. `SAFE_POINT` before every `CALL`.** 8% of `fib`'s instructions. It is cheap now — one branch
-when nothing is watching — but it is still a dispatch. The predicate is computed from four members
-on every execution; caching it in one `bool` that is updated at the four places those members
-change would make it a single load. The reason it was written as a recomputation is recorded in
-`VM.h`, and any caching has to update it at `setDebugHooks`, at process creation, when the JIT
-raises `m_frameFloor`, and on module load.
+**3. The per-frame snapshot.** `CALL` and `RET` both end the inner loop and rebuild
+`frames.back()`, the function, its code pointer and size, its constant pool and the base
+address — six loads and a few stores, twice per call. Caching the code pointer and constant pool
+in the `Frame` itself would make that one cache line instead of four, and pre-sizing `frames` to
+`kMaxCallDepth` would make the reference stable so the loop does not have to be re-entered at
+all. Estimated 10–15% on `calls`; not attempted because it touches the one piece of state every
+opcode reads.
 
-**4. A comparison with an immediate.** `LOAD_LOCAL i; CONST_INT 2; CMP_BRANCH` is 24% of `fib`'s
-instructions and does nothing but ask "is `i` less than two". An opcode carrying the immediate in
-its own operand would make it one instruction, saving 16% of `fib` and about the same in any loop
-with a constant bound.
+**4. Specialise the remaining arithmetic.** `ADD` and `SUB` still go through `computeBinary`.
+They are only 5.9% of `fib`'s instructions now that `ADD_SUB_LOCAL_IMM` exists, so this is worth
+a few percent rather than the 20% the previous draft of this document guessed.
 
-**5. The frame re-snapshot on call and return.** Every `CALL` and every `RET` sets `reload`, which
-unwinds to the top of the interpreter loop and re-derives the frame reference, the code pointer and
-the base address. Twice per call. The cost did not show up in the ablation (the call mechanism
-measures faster than CPython's) so it is not the priority the earlier draft of this document
-guessed it was — but it is still two full re-snapshots per call that a fixed frame array could
-avoid.
+What is **not** on the list, because it was measured and did not work: shrinking `Value`
+(1.4%), deleting `SAFE_POINT` (0.6%), and hoisting the module-level tables by hand (the compiler
+had already done it, and spelling it out was slower).
 
 ## Two bugs found by the work itself
 
@@ -309,4 +374,9 @@ number attached. Every claim in this document is one or the other, labelled, and
 disagreed the disagreement is written down rather than smoothed over.
 
 The machine also drifts by ±10% between sessions, so the ratios are given as ranges across
-consecutive runs. A single number would look more precise and mean less.
+consecutive runs. A single number would look more precise and mean less. One measurement trap
+worth naming, because it happened here: a table of ratios was collected against a stale binary —
+`build/` had been rebuilt and `build-lto/` had not — and reported `calls` at 1.55× when the
+optimised build was at 1.39×. The tell was that a direct timing of the same program disagreed
+with the table. When two measurements of the same thing disagree, one of them is measuring
+something else.
