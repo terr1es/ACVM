@@ -742,16 +742,37 @@ struct AdbBindings {
     AdbBreakFn addBreak = nullptr;
 };
 
-/// Loads `adb.dll` from the same places the VM looks for a module library.
+/// Loads `adb` from the same places the VM looks for a module library.
+///
+/// The directories are searched explicitly rather than left to the loader, for the reason
+/// `librarySearchDirs` gives: Windows searches the application directory and the POSIX
+/// loaders do not, so a relocated toolchain has to behave the same on all three.
 AdbBindings loadAdb(std::string& error) {
     AdbBindings bindings;
     std::vector<std::string> candidates;
+
+    // The names come from the one function that knows them. Writing them out here is how
+    // this broke: the list held `adb.dll` for the lib directory on every platform, and
+    // `libadb.so`, which the build never produces.
+    const std::vector<std::string> names = libraryFileNames("adb");
+    std::vector<std::string> dirs;
+    const std::filesystem::path exeDir = executableDir();
+    if (!exeDir.empty()) {
+        dirs.push_back(exeDir.generic_string());
+    }
 #ifdef ACVM_LIB_DIR
-    candidates.push_back(std::string(ACVM_LIB_DIR) +
-                         (sizeof(void*) == 8 ? "/adb.dll" : "/adb.dll"));
+    dirs.push_back(ACVM_LIB_DIR);
 #endif
-    candidates.push_back("adb.dll");
-    candidates.push_back("libadb.so");
+    for (const std::string& dir : dirs) {
+        for (const std::string& name : names) {
+            candidates.push_back(dir + "/" + name);
+        }
+    }
+    // Last, the bare names: the loader's own search path, which is where an adb installed
+    // system-wide will be.
+    for (const std::string& name : names) {
+        candidates.push_back(name);
+    }
 
     for (const std::string& path : candidates) {
         void* handle = vmOpenLibrary(path);

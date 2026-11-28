@@ -58,11 +58,16 @@ jobs:
           status=$?
           if [ $status -ne 0 ]; then
             echo "::error::ctest exited $status"
-            # The failing test names, then the assertion lines that say why.
-            grep -E "^\s*[0-9]+ - |The following tests FAILED|\*\*\*Failed|FAILED" test.log \
+            grep -E "^\s*[0-9]+ - " test.log \
               | head -20 | while IFS= read -r l; do echo "::error::failed| $l"; done
-            grep -E "MISMATCH|Expected|expected|Assertion|assert|error:" test.log \
-              | head -12 | while IFS= read -r l; do echo "::error::why| $l"; done
+            # Every assertion line the test module prints. The previous version matched
+            # only "expected"/"MISMATCH", which missed the `[FAIL] label: expected X, got Y`
+            # shape this suite actually uses -- so the annotations named the test and not
+            # the reason, and the reason is the only part worth having.
+            grep -E "\[FAIL\]|\[TRAP\]|trap|Trap|expected|got |cannot |could not|refus" test.log \
+              | head -24 | while IFS= read -r l; do echo "::error::why| $l"; done
+            # A test that dies before printing anything leaves only the tail useful.
+            tail -12 test.log | while IFS= read -r l; do echo "::error::tail| $l"; done
           fi
           exit $status
       - name: Install and run one program
@@ -100,11 +105,16 @@ jobs:
           status=$?
           if [ $status -ne 0 ]; then
             echo "::error::ctest exited $status"
-            # The failing test names, then the assertion lines that say why.
-            grep -E "^\s*[0-9]+ - |The following tests FAILED|\*\*\*Failed|FAILED" test.log \
+            grep -E "^\s*[0-9]+ - " test.log \
               | head -20 | while IFS= read -r l; do echo "::error::failed| $l"; done
-            grep -E "MISMATCH|Expected|expected|Assertion|assert|error:" test.log \
-              | head -12 | while IFS= read -r l; do echo "::error::why| $l"; done
+            # Every assertion line the test module prints. The previous version matched
+            # only "expected"/"MISMATCH", which missed the `[FAIL] label: expected X, got Y`
+            # shape this suite actually uses -- so the annotations named the test and not
+            # the reason, and the reason is the only part worth having.
+            grep -E "\[FAIL\]|\[TRAP\]|trap|Trap|expected|got |cannot |could not|refus" test.log \
+              | head -24 | while IFS= read -r l; do echo "::error::why| $l"; done
+            # A test that dies before printing anything leaves only the tail useful.
+            tail -12 test.log | while IFS= read -r l; do echo "::error::tail| $l"; done
           fi
           exit $status
       - name: Install and run one program
@@ -157,11 +167,16 @@ jobs:
           status=$?
           if [ $status -ne 0 ]; then
             echo "::error::ctest exited $status"
-            # The failing test names, then the assertion lines that say why.
-            grep -E "^\s*[0-9]+ - |The following tests FAILED|\*\*\*Failed|FAILED" test.log \
+            grep -E "^\s*[0-9]+ - " test.log \
               | head -20 | while IFS= read -r l; do echo "::error::failed| $l"; done
-            grep -E "MISMATCH|Expected|expected|Assertion|assert|error:" test.log \
-              | head -12 | while IFS= read -r l; do echo "::error::why| $l"; done
+            # Every assertion line the test module prints. The previous version matched
+            # only "expected"/"MISMATCH", which missed the `[FAIL] label: expected X, got Y`
+            # shape this suite actually uses -- so the annotations named the test and not
+            # the reason, and the reason is the only part worth having.
+            grep -E "\[FAIL\]|\[TRAP\]|trap|Trap|expected|got |cannot |could not|refus" test.log \
+              | head -24 | while IFS= read -r l; do echo "::error::why| $l"; done
+            # A test that dies before printing anything leaves only the tail useful.
+            tail -12 test.log | while IFS= read -r l; do echo "::error::tail| $l"; done
           fi
           exit $status
       - name: Install and run one program

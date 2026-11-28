@@ -44,6 +44,18 @@ void* vmMainModule();
 /// whichever tree happened to be present when it was compiled.
 std::string vmExecutablePath();
 
+/// The file names a `library "name"` could have on this platform, in the order to try:
+/// `name.dll` on Windows, `libname.so` then `name.so` on Linux, `libname.dylib` then
+/// `name.dylib` on macOS. A name that already carries one of those extensions comes back
+/// unchanged.
+///
+/// Shared with the driver, which loads `adb` by name for `--adb`. That call site used to
+/// spell the names itself -- `adb.dll` twice and `libadb.so` once -- which was wrong on
+/// every platform but Windows: the first looked for a `.dll` under a POSIX lib directory,
+/// and the second named a file the build does not produce, because the modules set
+/// `PREFIX ""` and come out as `adb.so`.
+std::vector<std::string> libraryFileNames(const std::string& name);
+
 class VM {
 public:
     VM(std::ostream& out, std::ostream& err);
@@ -234,6 +246,23 @@ private:
     bool readBytes(std::uint64_t addr, void* dst, std::size_t len) const;
     bool writeBytes(std::uint64_t addr, const void* src, std::size_t len);
     bool zeroBytes(std::uint64_t addr, std::size_t len);
+
+    /// A direct pointer to a 4-byte slot, or nullptr when the general path is required.
+    ///
+    /// The scalar path a hot opcode takes is `loadScalar → memType (bounds check) → readBytes
+    /// (page lookup, memcpy, mask, sign-extend) → Value (32 bytes)`, and the store side is the
+    /// mirror image. That is 27–30 cycles to add one to a loop counter, measured; a plain
+    /// `int32` in a resident page needs an add and a store.
+    ///
+    /// Null means "do not take the shortcut": the page has never been written (it reads as
+    /// zeros rather than existing), or the slot straddles a page boundary. Both are rare and
+    /// both fall back to the general path, so the shortcut is an optimisation and never the
+    /// definition of the behaviour.
+    ///
+    /// Deliberately narrow — 4 bytes, signed integer, resident page. A caller must have already
+    /// checked that its operand is that shape; this only answers "may I write here directly".
+    [[nodiscard]] std::int32_t* residentInt32(std::uint64_t addr);
+    [[nodiscard]] const std::int32_t* residentInt32(std::uint64_t addr) const;
     /// Copies within VM memory, memmove-style, without an intermediate buffer.
     bool copyBytes(std::uint64_t dst, std::uint64_t src, std::size_t len);
     /// Compares two ranges of VM memory without copying either out.
