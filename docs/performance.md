@@ -310,10 +310,10 @@ a demonstration rather than a tier. It now beats CPython 3.13 on all four.
 
 | benchmark | interpreter | `--jit` | vs CPython 3.13 |
 |---|---|---|---|
-| `empty` | 0.445 s | 0.117 s | 11.0× faster |
-| `arith` | 0.507 s | 0.041 s | 19.4× faster |
-| `array` | 0.311 s | 0.047 s | 10.1× faster |
-| `calls` | 3.249 s | 1.504 s | 1.45× faster |
+| `empty` | 0.421 s | 0.111 s | 10.4× faster |
+| `arith` | 0.463 s | 0.038 s | 18.4× faster |
+| `array` | 0.282 s | 0.042 s | 9.5× faster |
+| `calls` | 2.960 s | 1.009 s | 2.0× faster |
 
 Five causes. The two largest were not missing opcodes at all -- they were instructions the
 compiled body was still paying for on every call.
@@ -370,6 +370,24 @@ be bound" mistake, read as a reason to remove an unrelated piece of code. Worth 
 a vague assembler error is not evidence about which lowering is at fault.
 
 Together: 2.148 s to 1.504 s, 30% of the benchmark.
+
+### The last C++ call per invocation
+
+Each compiled call still ended by calling `jitbridge::returnToCaller`, which popped the frame
+and pushed a 32-byte `Value` onto the interpreter's stack -- so that the caller, one instruction
+later, could pop it again into a native slot. The value stack was being used as a mailbox
+between two pieces of generated code that both had registers.
+
+The setup a caller hands over (`CallSetup`, already used to pass the frame's page) now also
+carries `resultSlot`: the caller's own native slot. A compiled callee writes its result there
+instead of pushing it, and **stops popping its own frame** -- the caller pops, because only the
+caller can tell a normal return from a bail into the interpreter. 1.504 s to 1.009 s, 33%.
+
+Getting that wrong once is instructive: the flag was tied to `returnsValue`, so a `void` callee
+took the old path and popped its own frame, and the caller popped again on the way out. The
+symptom was `call depth exceeded in 'checkOtherContexts'` on a program with no deep recursion at
+all -- the frame stack draining from a double pop, not from a leak. Delivery and ownership have
+to be one decision, not two.
 
 ### What is actually left
 
