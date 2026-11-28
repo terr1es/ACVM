@@ -286,6 +286,21 @@ private:
     /// The cache has to be dropped whenever the page table can change -- a new page allocated,
     /// memory reset, or a different frame -- so `forgetCachedPage()` is called from the
     /// interpreter's frame snapshot rather than being woven into the accessor.
+    /// The last frame whose pages the JIT pinned, so a recursive call at the same depth does
+    /// not resolve them again.
+    ///
+    /// A frame's pages are a function of (base, size) and nothing else: pages are allocated on
+    /// first touch and never moved or freed. Recursion re-enters the same depth with the same
+    /// base immediately after returning from it, so one entry is enough -- `fib` allocates its
+    /// frame, calls, unwinds, and calls again at the same address.
+    struct PinnedPages {
+        std::uint64_t base = ~std::uint64_t{0};
+        std::uint64_t size = ~std::uint64_t{0};
+        int count = 0;
+        void* pages[8] = {};
+    };
+    mutable PinnedPages m_pinned;
+
     mutable std::uint64_t m_cachedPageIndex = ~std::uint64_t{0};
     mutable std::int32_t* m_cachedPage = nullptr;
     void forgetCachedPage() const {

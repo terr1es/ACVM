@@ -72,8 +72,22 @@ inline constexpr bool kJitSupported = false;
 /// through the bridge helpers below.
 /// Returns 0 for a trap, 1 for a normal finish, 2 for "yielded at a safe point". An int
 /// rather than a bool because the third outcome exists and has to survive a nested call.
+/// What the caller worked out about the frame before entering it.
+///
+/// Both fields are facts the callee would otherwise have to re-derive: the frame base it is
+/// about to use, and -- when the frame fits inside one page, which is every frame that is not
+/// a large local array -- the page that base lives in, already created.
+///
+/// The callee still verifies the base. A setup worked out for one frame must never be applied
+/// to another, and the check is one compare.
+struct CallSetup {
+    std::uint64_t frameBase = 0;
+    /// Null means "this frame spans more than one page, resolve them yourself".
+    void* firstPage = nullptr;
+};
+
 using JitFunction = std::int64_t (*)(VM* vm, void* process, std::uint64_t frameBase,
-                                     std::string* error);
+                                     std::string* error, const CallSetup* setup);
 
 /// Per-module cache of compiled functions.
 ///

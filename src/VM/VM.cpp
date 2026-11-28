@@ -1325,7 +1325,7 @@ bool VM::runQuantum(Process& process, std::string& error) {
         // of all things, is running interpreted.
         if (JitFunction native = m_jit.entryFor(*m_module, index, m_jitRefusal)) {
             const std::int64_t outcome =
-                native(this, &process, process.frames.front().base, &error);
+                native(this, &process, process.frames.front().base, &error, nullptr);
             if (outcome == 0) {
                 return false;          // trap; the message is already in `error`
             }
@@ -1577,6 +1577,27 @@ int VM::JitBridge::pinFramePages(VM& vm, std::uint64_t frameBase,
     if (count > static_cast<std::uint64_t>(maxPages)) {
         return 0;
     }
+    if (count <= 8) {
+        PinnedPages& cached = vm.m_pinned;
+        if (cached.base == frameBase && cached.size == frameSize && cached.count != 0) {
+            for (std::uint64_t i = 0; i < count; ++i) {
+                out[i] = cached.pages[i];
+            }
+            return static_cast<int>(count);
+        }
+        for (std::uint64_t i = 0; i < count; ++i) {
+            std::uint8_t* page = vm.m_memory->get(firstPage + i, true);
+            if (page == nullptr) {
+                return 0;
+            }
+            out[i] = page;
+            cached.pages[i] = page;
+        }
+        cached.base = frameBase;
+        cached.size = frameSize;
+        cached.count = static_cast<int>(count);
+        return static_cast<int>(count);
+    }
     for (std::uint64_t i = 0; i < count; ++i) {
         // `true`: a frame slot may be written before it is read, so the page has to exist.
         std::uint8_t* page = vm.m_memory->get(firstPage + i, true);
@@ -1611,8 +1632,33 @@ bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int 
         return false;
     }
 
-    vm.zeroBytes(frameBase, frameSize);
+    // Resolve the frame's page once, here, and use it for everything that follows.
+    //
+    // `zeroBytes` and `storeScalar` each look the page up for themselves -- correctly, because
+    // neither knows it is writing a frame -- and this is three or four lookups of one page per
+    // call. A frame that fits in a single page is the overwhelmingly common case (anything
+    // without a large local array), and then the base address is a pointer the caller already
+    // has to compute anyway.
+    CallSetup setup;
+    setup.frameBase = frameBase;
+    const std::uint64_t pageOffset = frameBase & kPageMask;
+    if (pageOffset + frameSize <= kPageSize) {
+        setup.firstPage = vm.m_memory->get(frameBase >> kPageShift, true);
+    }
+    if (setup.firstPage != nullptr) {
+        std::memset(static_cast<std::uint8_t*>(setup.firstPage) + pageOffset, 0,
+                    static_cast<std::size_t>(frameSize));
+    } else if (!vm.zeroBytes(frameBase, frameSize)) {
+        if (error != nullptr) {
+            *error = "cannot allocate the frame of '" + callee.name + "'";
+        }
+        return false;
+    }
     p.stackTop += frameSize;
+
+    const auto framePointer = [&]() -> std::uint8_t* {
+        return static_cast<std::uint8_t*>(setup.firstPage) + pageOffset;
+    };
     for (int i = 0; i < argc && static_cast<std::size_t>(i) < callee.params.size(); ++i) {
         const ParamInfo& param = callee.params[static_cast<std::size_t>(i)];
         const std::int64_t raw = args[i];
@@ -1630,6 +1676,31 @@ bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int 
                 vm.readBytes(from, large.data(), param.size);
                 vm.writeBytes(frameBase + param.offset, large.data(), param.size);
             }
+        } else if (setup.firstPage != nullptr &&
+                   static_cast<std::uint64_t>(param.offset) + param.size <= frameSize) {
+            // A scalar in a frame that has one page: write the bytes straight in. `storeScalar`
+            // would mask to the declared width and then copy, which for a type whose `bits`
+            // and `size` agree is the same thing as writing the low `size` bytes.
+            //
+            // The low bytes are the value because this is little-endian. That is not a new
+            // assumption: this whole path only runs from generated x86-64 code.
+            const MemType& type = vm.memType(param.memType);
+            const std::uint8_t* source = reinterpret_cast<const std::uint8_t*>(&raw);
+            std::uint8_t* destination = framePointer() + param.offset;
+            const bool plain = (type.kind == MemType::Kind::Int ||
+                                type.kind == MemType::Kind::Bool ||
+                                type.kind == MemType::Kind::Char) &&
+                               (type.size == 1 || type.size == 2 || type.size == 4 ||
+                                type.size == 8) &&
+                               type.bits == type.size * 8;
+            if (plain) {
+                std::memcpy(destination, source, type.size);
+            } else {
+                const bool isPtr = (pointerMask & (1u << i)) != 0;
+                const Value value = isPtr ? Value::fromPtr(static_cast<std::uint64_t>(raw))
+                                          : Value::fromInt(static_cast<Int128>(raw));
+                vm.storeScalar(frameBase + param.offset, param.memType, value);
+            }
         } else {
             const bool isPtr = (pointerMask & (1u << i)) != 0;
             const Value value = isPtr ? Value::fromPtr(static_cast<std::uint64_t>(raw))
@@ -1646,7 +1717,9 @@ bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int 
     if (JitFunction native = vm.m_jit.entryFor(*vm.m_module,
                                                static_cast<std::size_t>(functionIndex),
                                                vm.m_jitRefusal)) {
-        const std::int64_t outcome = native(&vm, &p, pushedBase, error);
+        // `setup` was built above, for this frame, and its page is the one the frame was
+        // zeroed through.
+        const std::int64_t outcome = native(&vm, &p, pushedBase, error, &setup);
         if (outcome == 0) {
             // Unwind what was set up, so the caller's failure path sees the stack it had.
             p.stackTop = previousTop;
@@ -1785,7 +1858,7 @@ bool VM::JitBridge::callFunction(VM& vm, void* process, int functionIndex, int a
     if (JitFunction native = vm.m_jit.entryFor(*vm.m_module,
                                               static_cast<std::size_t>(functionIndex),
                                               vm.m_jitRefusal)) {
-        const std::int64_t outcome = native(&vm, process, frameBase, error);
+        const std::int64_t outcome = native(&vm, process, frameBase, error, nullptr);
         if (outcome == 0) {
             return false;
         }

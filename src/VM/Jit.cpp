@@ -456,9 +456,36 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     assembler.movImm(kTmp1, Width::Qword, 0xFFFF);
     assembler.and_(kRegPageOffset, kTmp1, Width::Qword);
 
-    // Pin every page the frame touches: one call for the whole function. The pointers stay
-    // valid because a page is never reclaimed or moved once it exists.
+    // Resolve the frame's pages.
+    //
+    // The caller usually already knows them -- it just computed the frame base, and for
+    // anything but a large local array the whole frame sits in one page that it had to touch
+    // anyway. When it says so, the page goes straight into the page table and no helper is
+    // called at all. Otherwise this asks the bridge, which is the general case: a frame that
+    // spans pages, or an entry reached from somewhere that had nothing to say (the top-level
+    // call, the interpreter's CALL).
+    //
+    // The setup is verified, not trusted: `setup->frameBase` has to be this frame's base.
+    // A setup computed for a different frame would otherwise point this function at the wrong
+    // page, which is a wrong answer rather than a slow one.
     {
+        auto resolved = assembler.newLabel();
+        auto general = assembler.newLabel();
+        // The fifth argument, after six pushes and the frame: 48 + 40 past the return address.
+        assembler.mov(kTmp1, mem(Reg::Rsp, static_cast<std::int32_t>(kFrameBytes) + 88),
+                      Width::Qword);
+        assembler.test(kTmp1, kTmp1, Width::Qword);
+        assembler.jcc(Cond::Equal, general);
+        assembler.mov(kTmp2, mem(kTmp1, 0), Width::Qword);       // setup->frameBase
+        assembler.cmp(kTmp2, kRegBase, Width::Qword);
+        assembler.jcc(Cond::NotEqual, general);
+        assembler.mov(kTmp2, mem(kTmp1, 8), Width::Qword);       // setup->firstPage
+        assembler.test(kTmp2, kTmp2, Width::Qword);
+        assembler.jcc(Cond::Equal, general);
+        assembler.mov(mem(Reg::Rsp, static_cast<std::int32_t>(kPageTableOffset)), kTmp2);
+        assembler.jmp(resolved);
+
+        assembler.bind(general);
         assembler.mov(kArg1, kRegVm);
         assembler.mov(kArg2, kRegBase);
         assembler.movImm(kArg3, Width::Qword,
@@ -474,6 +501,7 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         assembler.addImm(Reg::Rsp, 48);
         assembler.test(kRegA, kRegA, Width::Byte);
         assembler.jcc(Cond::Equal, failureExit);
+        assembler.bind(resolved);
     }
 
     // -- the promoted slot ---------------------------------------------------
