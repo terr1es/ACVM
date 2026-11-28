@@ -99,6 +99,29 @@ struct CallSetup {
 using JitFunction = std::int64_t (*)(VM* vm, void* process, std::uint64_t frameBase,
                                      std::string* error, const CallSetup* setup);
 
+/// What generated code needs to know about the address space in order to dereference a
+/// run-time address itself.
+///
+/// `base` is the value that turns a VM address into a host address: `host = base + vmAddr`.
+/// `commitMap` has one byte per 64 KB page, non-zero when that page is committed -- so a
+/// pointer into memory that was never written can be sent to the helper instead of faulting
+/// the process, which is what makes an inline dereference safe rather than merely fast.
+///
+/// Both are stable for the VM's lifetime: the reservation is never moved and the map is sized
+/// once. That is what lets generated code hold them in its frame for a whole function body.
+///
+/// Null when the address space was not reserved, in which case every access keeps going
+/// through the bridge and the JIT is exactly as fast as it was.
+struct MemoryView {
+    const std::uint8_t* base = nullptr;
+    const std::uint8_t* commitMap = nullptr;
+    std::uint64_t commitMapSize = 0;
+
+    [[nodiscard]] bool inlineLoads() const {
+        return base != nullptr && commitMap != nullptr && commitMapSize > 0;
+    }
+};
+
 /// Per-module cache of compiled functions.
 ///
 /// One entry per function index, and `failed` is sticky: a function that could not be
@@ -117,6 +140,11 @@ public:
     [[nodiscard]] std::size_t refusedCount() const { return m_refused; }
 
     JitMode mode = JitMode::Off;
+    /// Set by the VM before the first compile; see `MemoryView`.
+    MemoryView memory;
+    /// Set by the VM before the first compile. Only used to resolve a `library` call's
+    /// symbol at compile time, so the call can be emitted rather than handed over.
+    VM* m_vm = nullptr;
 
 private:
     struct Entry {
@@ -136,8 +164,13 @@ private:
 /// register value to be flushed back to memory at the point of the unsupported
 /// instruction and re-read afterwards, which is where a JIT stops being simple and starts
 /// producing wrong answers at the edges.
+/// `vm` is used for one thing: resolving a `library` call's native symbol so the call can
+/// be emitted directly instead of handed to the interpreter. Null disables that, which is
+/// what a caller with no VM to resolve through gets.
 std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                                                      const Function& function,
+                                                     const MemoryView& memory,
+                                                     VM* vm,
                                                      std::string& whyNot);
 
 namespace jitbridge {

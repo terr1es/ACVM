@@ -172,16 +172,16 @@ with the same generator, threshold and ordering, and prints identical inversion 
 
 | Engine | Time | vs CPython 3.13 | vs C++ `-O2` |
 |---|---:|---:|---:|
-| ACVM interpreter | 96.7 ms | 2.1× slower | 25× slower |
-| ACVM `--jit` | 22.3 ms | 2.0× faster | 5.7× slower |
-| CPython 3.13 | 45.7 ms | — | 12× slower |
-| C++ `-O0` (clang) | 5.1 ms | 9.0× faster | 1.3× slower |
-| C++ `-O2` (clang) | 3.9 ms | 12× faster | — |
+| ACVM interpreter | 99.1 ms | 2.4× slower | 23× slower |
+| ACVM `--jit` | 13.6 ms | 3.1× faster | 3.1× slower |
+| CPython 3.13 | 41.8 ms | — | 9.5× slower |
+| C++ `-O0` (clang) | 5.3 ms | 7.9× faster | 1.2× slower |
+| C++ `-O2` (clang) | 4.4 ms | 9.5× faster | — |
 
 Run-to-run variation is 2–5%; ratios are accurate to two significant figures.
 
-The interpreter is within 2.1× of CPython on a pointer-heavy program. `--jit` places it 2.0×
-ahead of CPython and 5.7× behind unoptimized C++. The remaining gap to C++ follows from
+The interpreter is within 2.4× of CPython on a pointer-heavy program. `--jit` places it 3.1×
+ahead of CPython and 3.1× behind unoptimized C++. The remaining gap to C++ follows from
 absent inlining, from register allocation limited to a few pinned slots, and from a call that
 traverses one C++ frame per invocation.
 
@@ -189,34 +189,34 @@ Per-benchmark comparison against CPython, same run:
 
 | Benchmark | Interpreter | `--jit` | CPython 3.13 | `--jit` vs CPython |
 |---|---:|---:|---:|---:|
-| empty loop | 397.3 ms | 98.0 ms | 890.8 ms | 9.1× faster |
-| integer arithmetic | 495.4 ms | 26.3 ms | 453.3 ms | 17.3× faster |
-| branch-dense | 890.9 ms | 140.3 ms | 735.3 ms | 5.2× faster |
-| array walk | 118.6 ms | 24.0 ms | 125.3 ms | 5.2× faster |
-| string search | 486.9 ms | 53.8 ms | 41.2 ms | 1.3× slower |
-| hash set | 102.3 ms | 101.9 ms | 36.4 ms | 2.8× slower |
-| double accumulation | 240.3 ms | 21.9 ms | 145.9 ms | 6.7× faster |
-| recursion (`fib 10` × 300,000) | 2686.0 ms | 992.1 ms | 1805.2 ms | 1.8× faster |
-| quicksort (50,000 ints) | 97.6 ms | 15.9 ms | 41.4 ms | 2.6× faster |
+| empty loop | 424.8 ms | 105.0 ms | 883.4 ms | 8.4× faster |
+| integer arithmetic | 463.1 ms | 23.1 ms | 407.4 ms | 17.6× faster |
+| branch-dense | 826.6 ms | 135.8 ms | 651.5 ms | 4.8× faster |
+| array walk | 111.2 ms | 17.9 ms | 108.1 ms | 6.0× faster |
+| string search | 451.2 ms | 30.5 ms | 43.2 ms | 1.4× faster |
+| hash set | 93.1 ms | 66.4 ms | 38.0 ms | 1.8× slower |
+| double accumulation | 235.9 ms | 20.8 ms | 136.6 ms | 6.6× faster |
+| recursion (`fib 10` × 300,000) | 2572.8 ms | 999.0 ms | 1768.7 ms | 1.8× faster |
+| quicksort (50,000 ints) | 99.1 ms | 13.6 ms | 41.8 ms | 3.1× faster |
 
-Seven of the nine are faster than CPython under `--jit`. The two that are not are both cases
-where the work per operation is a language boundary crossing rather than arithmetic, and the
-reasons are worth separating because they are different:
+Eight of the nine are faster than CPython under `--jit`. The one that is not is the hash set,
+at 1.9×, and the reason is now a single measurable quantity rather than a missing optimisation.
 
-- **String search, 1.3× slower.** The search itself is compiled; what is not is the byte load
-  behind `text[i]`. `LOAD` takes its address from the stack, so the address is a run-time value,
-  and the JIT cannot inline it: the page table in a compiled frame holds only the pages pinned
-  at entry -- the function's own frame -- while a string's bytes live wherever they were
-  allocated. Inlining that walk was tried and crashed on the first program with a heap string.
-  Each character, then, is one bridge call.
-- **Hash set, 2.8× slower.** The table is C now, and the C part takes 13 ms of the 102; the
-  other 89 is three boundary crossings per operation: the Axiom wrapper's call, the `s->handle`
-  read (another `LOAD`, same reason as above), and the native call itself. Measured against a
-  bare native call in a loop, the crossings are 85% of the time.
+A VM address is a host address plus a fixed offset. The address range is reserved from the
+operating system once and committed page by page as the program touches it, so a raw pointer
+into VM memory works in C and in generated code. That is what let three things happen at once:
+`LOAD` became an inline page test and a dereference instead of a call into C++ (string search
+went from 1.3× slower to 1.4× faster), a `library` call with scalar arguments became the call it
+is rather than an interpreter round trip, and the hash wrappers -- which are nothing but such a
+call -- started compiling at all.
 
-Both are consequences of one design decision -- that VM memory is paged and separately
-allocated, so native code cannot walk it -- rather than of the tiers being slow. [`docs/performance.md`](docs/performance.md) contains the analysis, the
-per-instruction costs, and the changes that were measured and reverted.
+What remains in the hash set is the calling convention. Each operation is a compiled call into
+`hashSetIntAdd`, which is a compiled call into C, and the first of those goes through the
+interpreter's frame setup: measured at 42 ns against 5 for the call itself. The loop around them
+is interpreted too, because `main` receives a struct and the JIT does not implement aggregate
+returns; that is a separate gap, and closing it was measured to reach about 51 ms against
+CPython's 38 -- still behind. Beating it needs a calling convention for compiled calls, which
+is where this JIT stops being simple.
 
 Two qualifications apply to these tables:
 
@@ -505,10 +505,19 @@ deviations. The most significant:
   not fit the VM's signed 128-bit cell.
 - `doubleA.B` parses but is stored as binary64.
 - Aggregate `<` is rejected. `==` and `!=` compare storage bytes.
+- VM memory is a reserved address range, not a lookup table. One region is reserved from the
+  operating system at start-up and pages are committed inside it on first touch, so a VM
+  address is a host address plus a fixed offset. `ACVM_DEBUG_MEMORY=1` reports which mode the
+  run got: when the reservation fails -- an address already taken, a hardened runtime that
+  refuses fixed mappings -- every access falls back to the paged store this replaced, which is
+  correct but slower. `ACVM_FORCE_PAGED_MEMORY=1` selects the fallback deliberately, and the
+  test suite is run both ways.
 - The JIT compiles a subset. String literals, aggregate copies, `GLOBAL_ADDR`, `TRAP`, the
-  fused array load and scalar `double` arithmetic are lowered; builtins, global variable
-  access, library calls and indirect calls are hand-off points, so a function is compiled up to
-  the first of these and interpreted from there. Scalar `double` covers load, store, add,
+  fused array load, scalar `double` arithmetic and `LOAD` are lowered; builtins, global
+  variable access, indirect calls and `library` calls whose arguments are not all scalars are
+  hand-off points, so a function is compiled up to the first of these and interpreted from
+  there. Aggregate returns are not implemented, so a function that returns a struct is
+  refused -- and so is a caller that receives one. Scalar `double` covers load, store, add,
   subtract, multiply, divide, compare and conversion in both directions -- before it existed
   any function containing a float literal was refused outright, because the literal is usually
   the first instruction and a refusal at the first instruction refuses the function. A function whose first instruction requires the interpreter is refused. The

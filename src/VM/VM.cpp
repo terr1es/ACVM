@@ -16,6 +16,7 @@
 // used to include only <mach-o/dyld.h>, which happens to work when the SDK
 // pulls the others in transitively and stops working when it does not.
 #include <dlfcn.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -24,6 +25,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <sstream>
@@ -87,25 +90,74 @@ std::uint16_t doubleToHalf(double value) {
 
 } // namespace
 
+//  The VM's address space is reserved, not faked.
+//
+//  ── what was here before, and why it had to go ───────────────────────────
+//
+//  Pages used to be independent 64 KB heap blocks held in a hash map: an address like
+//  0x4000'1234 was a key, not a pointer, and `get()` translated it. That translation was
+//  invisible to the interpreter and expensive everywhere else. Native libraries could not
+//  be handed a VM pointer at all -- a `ptr` parameter without an element count is refused
+//  by the compiler, and with one the array is copied in and out through a staging buffer.
+//  Compiled code could not dereference a run-time address either, so every `LOAD` -- every
+//  string index, every struct field through a pointer -- was a call into C++ that looked
+//  the page up, built a `Value` and copied eight bytes.
+//
+//  Now the whole address range is reserved from the operating system once, and pages are
+//  committed inside it on first touch. A VM address *is* a host address plus a fixed
+//  offset, which makes raw pointers work, and makes an inline page test possible.
+//
+//  ── reserve, then commit ────────────────────────────────────────────────
+//
+//  Reserved memory costs no physical memory and no swap: it is an entry in the page tables
+//  and nothing more. Committing a page is what makes it readable, and both kernels
+//  guarantee committed anonymous memory reads as zeros -- which is why the explicit
+//  `memset` per page is gone as well.
+//
+//  The budget still counts *committed* pages, so `kMaxMemoryBytes` means what it did: a
+//  program cannot touch more than that, and the rest of the reservation stays free.
+//
+//  ── falling back ────────────────────────────────────────────────────────
+//
+//  The reservation can fail -- an address already taken, a hardened runtime that refuses
+//  fixed mappings. Then `base` stays null and every access takes the paged path this file
+//  used before. Correctness does not depend on the reservation; only speed does. The mode
+//  is reported by `contiguous()` so a test can assert which one it got rather than assume.
 struct VM::PageStore {
-    std::unordered_map<std::uint64_t, std::unique_ptr<std::uint8_t[]>> pages;
+    /// Where the reservation starts and how far it reaches.
+    ///
+    /// The low end is the first address the layout uses (`kGlobalBase`) and the high end
+    /// is past `kArenaBase` plus the room its stride needs for 64 processes. One region
+    /// covering every base keeps the test a single comparison.
+    static constexpr std::uint64_t kRegionBase = VM::kGlobalBase;
+    static constexpr std::uint64_t kRegionEnd = 0xC000'0000;
+    static constexpr std::uint64_t kRegionBytes = kRegionEnd - kRegionBase;
 
-    /// Direct-mapped cache in front of the hash map. A program's working set
-    /// touches a handful of pages repeatedly, so this turns almost every
-    /// access into a compare plus a pointer load instead of a hash lookup.
-    ///
-    /// 128 entries, not 32. The narrow case (a handful of live pages) was already
-    /// covered by 32, but the expensive case was not: an 8 MB array is 128 pages,
-    /// and marshalling it walks all 128 twice -- once in, once out. With 32 slots
-    /// each page evicts another before it is ever reused, so the hash runs for all
-    /// 256 accesses. 128 holds the whole walk.
-    ///
-    /// The map stays because the address space is sparse and wide, not compact:
-    /// the stack starts at 0x1000'0000 (page 4096) and the arena at 0x8000'0000
-    /// (page 32768). A flat vector indexed by page number would need one slot per
-    /// page between 0 and 32768 no matter how little the program touches, and the
-    /// address space is not bounded by kMaxMemoryBytes -- that is only the budget
-    /// for bytes actually allocated.
+    /// One byte per page rather than one bit: the check is `movzx` against zero instead of
+    /// a shift, a mask and a test, and the whole map is 48 KB of contiguous memory that
+    /// stays in cache. Indexed by page number, so `map[page] != 0` means committed.
+    static constexpr std::uint64_t kPageSlots = kRegionBytes / kPageSize;
+
+    /// Pages are handed out on first touch, so a program that walks a pointer across the
+    /// address space would keep asking for 64 KB blocks until the machine swaps to death.
+    /// Cap the total; the interpreter traps once this is crossed instead of taking the
+    /// operating system down.
+    static constexpr std::uint64_t kMaxPages = VM::kMaxMemoryBytes / kPageSize;
+
+    std::uint64_t maxPages = kMaxPages;
+    std::uint64_t pageCount = 0;
+    bool exhausted = false;
+
+    /// Committed-page map; non-null whenever `region` is. Sized once, never moved, so the
+    /// address handed to generated code stays valid.
+    std::uint8_t* map = nullptr;
+
+    /// Handed out once the cap is hit, so a caller that ignores `exhausted` cannot
+    /// dereference null; the run traps before it can matter.
+    std::uint8_t scratch[kPageSize] = {};
+
+    // ── the paged fallback ──
+    std::unordered_map<std::uint64_t, std::unique_ptr<std::uint8_t[]>> pages;
     static constexpr unsigned kCacheEntries = 32;
     struct CacheEntry {
         std::uint64_t index = ~std::uint64_t{0};
@@ -113,39 +165,127 @@ struct VM::PageStore {
     };
     CacheEntry cache[kCacheEntries];
 
-    /// Pages are handed out on first touch, so a program that walks a pointer
-    /// across the address space would keep asking for 64 KB blocks until the
-    /// machine swaps to death. Cap the total and let the interpreter trap on
-    /// the next instruction instead of taking the operating system down.
-    static constexpr std::uint64_t kMaxPages = VM::kMaxMemoryBytes / kPageSize;
+    /// The OS reservation. Null when the reservation failed.
+    std::uint8_t* region = nullptr;
 
-    /// Page budget; `setMemoryLimit` lowers it (never raises it past kMaxPages).
-    std::uint64_t maxPages = kMaxPages;
-    std::uint64_t pageCount = 0;
-    bool exhausted = false;
-    /// Handed out once the cap is hit, so a caller that ignores `exhausted`
-    /// cannot dereference null; the run traps before it can matter.
-    std::uint8_t scratch[kPageSize] = {};
+    /// What a VM address is offset by to become a host address.
+    ///
+    /// Not `region` itself: reserving at an exact address fails on Windows (probed --
+    /// `VirtualAlloc` at 0x10000 returns ERROR_INVALID_ADDRESS even though the range is
+    /// free, because the first 64 KB of a process is never mappable and the request is
+    /// taken as overlapping it). Reserving *anywhere* succeeds, and the layout's constants
+    /// do not require the mapping to sit at their values -- only that one fixed offset
+    /// relates them. So the offset is recorded and every address is relative to it.
+    std::int64_t bias = 0;
 
+    PageStore() {
+        // A way to run the fallback on a machine where the reservation works. The paged
+        // path is what a hardened runtime or a taken address range gets, and it is not
+        // otherwise reachable from a test -- so without this it only ever runs in the
+        // report of a bug.
+        if (std::getenv("ACVM_FORCE_PAGED_MEMORY") != nullptr) {
+            return;
+        }
+        // 64 KB of headroom below the first page: page 0 of the layout starts at
+        // kRegionBase, and the reservation is placed so that `bias + kRegionBase` is the
+        // first byte of it.
+        constexpr std::uint64_t kFirstPage = kRegionBase / kPageSize;
+        constexpr std::uint64_t kFirstPageOffset = kFirstPage * kPageSize;
+#if defined(_WIN32)
+        void* reserved = ::VirtualAlloc(nullptr, kRegionBytes, MEM_RESERVE, PAGE_NOACCESS);
+#else
+        void* reserved = ::mmap(nullptr, kRegionBytes, PROT_NONE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (reserved == MAP_FAILED) {
+            reserved = nullptr;
+        }
+#endif
+        if (reserved == nullptr) {
+            return;
+        }
+        region = static_cast<std::uint8_t*>(reserved);
+        // `bias + kRegionBase` must be `region`, so that page `kFirstPage` lands on the
+        // first reserved byte and the reservation covers every page the layout names.
+        bias = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(region)) -
+               static_cast<std::int64_t>(kFirstPageOffset);
+        map = static_cast<std::uint8_t*>(std::calloc(kPageSlots, 1));
+        if (map == nullptr) {
+            releaseRegion();
+        }
+    }
+
+    ~PageStore() {
+        std::free(map);
+        releaseRegion();
+    }
+
+    [[nodiscard]] bool contiguous() const { return region != nullptr; }
+
+    void releaseRegion() {
+        if (region == nullptr) {
+            std::free(map);
+            map = nullptr;
+            return;
+        }
+#if defined(_WIN32)
+        ::VirtualFree(region, 0, MEM_RELEASE);   // takes every committed page with it
+#else
+        ::munmap(region, kRegionBytes);
+#endif
+        std::free(map);
+        map = nullptr;
+        region = nullptr;
+    }
+
+    /// Host pointer for page `index`, committing it when `create` is set.
+    ///
+    /// Returns null for a read of a page that was never written, keeping the semantics the
+    /// paged version had: untouched memory reads as zeros, and `readBytes` supplies them,
+    /// rather than the read allocating a page.
     std::uint8_t* get(std::uint64_t index, bool create) {
+        if (region != nullptr) {
+            // Page 0 of the layout is below the reservation; nothing addresses it, and
+            // treating it as out of range keeps every returned pointer inside the mapping.
+            constexpr std::uint64_t kFirstPage = kRegionBase / kPageSize;
+            if (index < kFirstPage || index >= kPageSlots) {
+                return create ? scratch : nullptr;
+            }
+            std::uint8_t* address = region + (index - kFirstPage) * kPageSize;
+            if (map[index] != 0) {
+                return address;
+            }
+            if (!create) {
+                return nullptr;
+            }
+            if (pageCount >= maxPages) {
+                exhausted = true;
+                return scratch;
+            }
+#if defined(_WIN32)
+            void* committed = ::VirtualAlloc(address, kPageSize, MEM_COMMIT, PAGE_READWRITE);
+            if (committed == nullptr) {
+                return scratch;
+            }
+#else
+            if (::mprotect(address, kPageSize, PROT_READ | PROT_WRITE) != 0) {
+                return scratch;
+            }
+#endif
+            // The kernel zero-fills committed anonymous memory, so there is nothing to
+            // clear here -- and nothing to cache, because `base + index * kPageSize` is
+            // already the answer.
+            map[index] = 1;
+            ++pageCount;
+            return address;
+        }
+
+        // ---- paged fallback: unchanged ----
         CacheEntry& entry = cache[index % kCacheEntries];
         if (entry.index == index) {
-            // A cached *miss* only answers a reader. A writer asking for the same
-            // page has to fall through and allocate it.
-            //
-            // This is not hypothetical, and it was a real access violation: the
-            // native-call path read-copies an array into a scratch buffer and
-            // write-copies it back, so the first write to a freshly `alloc`ed
-            // buffer finds its own miss in the cache. Returning the cached null
-            // made `memcpy` write to address 0 -- uncatchable, since that is the
-            // process, not the interpreter. Any native function that fills an
-            // uninitialised buffer hit it; local arrays escaped because their page
-            // already existed.
             if (entry.page != nullptr || !create) {
                 return entry.page;
             }
         }
-
         const auto it = pages.find(index);
         if (it != pages.end()) {
             entry.index = index;
@@ -153,15 +293,13 @@ struct VM::PageStore {
             return entry.page;
         }
         if (!create) {
-            // Remember the miss too: consecutive reads of untouched memory
-            // should not each pay for a hash lookup.
             entry.index = index;
             entry.page = nullptr;
             return nullptr;
         }
         if (pageCount >= maxPages) {
             exhausted = true;
-            entry.index = ~std::uint64_t{0};   // do not cache the scratch page
+            entry.index = ~std::uint64_t{0};
             return scratch;
         }
         auto block = std::make_unique<std::uint8_t[]>(kPageSize);
@@ -176,7 +314,27 @@ struct VM::PageStore {
 };
 
 VM::VM(std::ostream& out, std::ostream& err)
-    : m_out(out), m_err(err), m_memory(new PageStore()) {}
+    : m_out(out), m_err(err), m_memory(new PageStore()) {
+    // Hand the address-space view to the JIT once, here. Both addresses are stable for the
+    // VM's lifetime, which is what lets a compiled function keep them in its frame.
+    if (m_memory->contiguous()) {
+        m_jit.memory.base = memoryBase();
+        m_jit.memory.commitMap = m_memory->map;
+        m_jit.memory.commitMapSize = PageStore::kPageSlots;
+    }
+    m_jit.m_vm = this;
+
+    if (std::getenv("ACVM_DEBUG_MEMORY") != nullptr) {
+        // Whether the reservation succeeded decides what is fast, and it can differ
+        // between machines -- an address already in use, a hardened runtime that refuses
+        // fixed mappings. Saying so once is the difference between "the optimisation did
+        // not help" and "the optimisation did not apply".
+        std::fprintf(stderr, "[memory] %s, base offset %p, %llu page slots\n",
+                     m_memory->contiguous() ? "contiguous reservation" : "paged fallback",
+                     static_cast<const void*>(memoryBase()),
+                     static_cast<unsigned long long>(PageStore::kPageSlots));
+    }
+}
 
 
 //===----------------------------------------------------------------------===//
@@ -539,6 +697,20 @@ void VM::refreshDebugInfo() {
 //===----------------------------------------------------------------------===//
 
 bool VM::memoryExhausted() const { return m_memory->exhausted; }
+
+bool VM::memoryIsContiguous() const { return m_memory->contiguous(); }
+
+const std::uint8_t* VM::memoryBase() const {
+    if (!m_memory->contiguous()) {
+        return nullptr;
+    }
+    return reinterpret_cast<const std::uint8_t*>(
+        static_cast<std::uintptr_t>(m_memory->bias));
+}
+
+const std::uint8_t* VM::memoryCommitMap() const { return m_memory->map; }
+
+std::uint64_t VM::memoryCommitMapSize() const { return PageStore::kPageSlots; }
 
 void VM::setMemoryLimit(std::uint64_t bytes) {
     const std::uint64_t pages = bytes / kPageSize;

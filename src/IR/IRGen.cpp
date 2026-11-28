@@ -38,7 +38,9 @@ void describeExternalParams(const FuncInfo& info, Function& function) {
     for (std::size_t i = 0; i < info.params.size(); ++i) {
         const Type* type = info.params[i];
         ExternalParam param;
-        if (type != nullptr && type->kind == TypeKind::String) {
+        if (type != nullptr && type->isFloat()) {
+            param.isFloat = true;
+        } else if (type != nullptr && type->kind == TypeKind::String) {
             // A string crosses as (char pointer, length). It arrives as a
             // descriptor address otherwise, which is a pointer to `{data, len}`
             // in VM memory -- useful to nothing on the C side.

@@ -1356,8 +1356,8 @@ reached, so the program remains correct and loses only speed.
   an access does not cost what it costs in C.
 
 Measured on `examples/quicksort_max.ax` (50 000 integers, one algorithm implemented for four
-engines): the interpreter is 2.4× behind CPython 3.13, `--jit` is 2.6× ahead of it, and C++
-`-O2` is 2.6× ahead of `--jit`. The measurements and their method are in
+engines): the interpreter is 2.4× behind CPython 3.13, `--jit` is 3.1× ahead of it, and C++
+`-O2` is 3.1× ahead of `--jit`. The measurements and their method are in
 [`README.md`](README.md#performance) and [`docs/performance.md`](docs/performance.md).
 
 The residual gap to C++ is per-dispatch and per-call cost rather than algorithmic: the

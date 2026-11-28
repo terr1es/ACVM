@@ -45,6 +45,7 @@
 #include "acvm/JIT/X64Assembler.h"
 #include "acvm/VM/VM.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -167,6 +168,58 @@ constexpr std::size_t kSlotBytes = 8;
 constexpr std::size_t kShadowSpace = 32;
 constexpr std::size_t kPageTableOffset = kShadowSpace;
 
+/// The native entry for a `library` call, when the whole call can be emitted instead of
+/// handed to the interpreter -- or null when it cannot.
+///
+/// This is the difference between a native call that costs a register move and one that
+/// costs an interpreter round trip: pushing every argument onto the value stack as a
+/// `Value`, dispatching, popping the result back. Measured at about 52 ns against 5, and a
+/// hash set makes two calls per operation.
+///
+/// Conditions, each of which has to hold:
+///
+///   * every parameter is a scalar. An array or a string is marshalled through a staging
+///     buffer by the interpreter, and reproducing that here would mean reproducing the
+///     buffer and both copies -- not the call.
+///   * at most six, because the boundary passes them in six 64 bit registers and this
+///     emits no more than that.
+///   * no scalar `double`: the boundary cannot carry one, and the interpreter rejects it
+///     with a message this path has no way to build.
+///   * a `void` or integer result. A double result would arrive in an SSE register.
+///   * the symbol resolves. A missing one is a deployment error, and the interpreter's
+///     message names the library and the symbol -- refusing here leaves that path intact.
+///
+/// Resolving at compile time is safe because the interpreter resolves on first call anyway
+/// and the answer is cached; it is also necessary, because the address becomes an immediate
+/// in the emitted code.
+void* inlineableExternal(const Module& module, int functionIndex, VM* vm) {
+    if (vm == nullptr || functionIndex < 0 ||
+        static_cast<std::size_t>(functionIndex) >= module.functions.size()) {
+        return nullptr;
+    }
+    const Function& callee = module.functions[static_cast<std::size_t>(functionIndex)];
+    // `params` is empty for an external function -- it has no body, so no frame and no
+    // parameter slots were ever laid out. `externalParams` is the only description of the
+    // call that exists, which is why the checks below read it and not `params`.
+    if (!callee.isExternal() || callee.externalReturnKind == 2) {
+        return nullptr;
+    }
+    if (callee.externalParams.size() > 6) {
+        return nullptr;
+    }
+    for (const ExternalParam& param : callee.externalParams) {
+        if (param.isArray || param.isString || param.isFloat) {
+            return nullptr;
+        }
+    }
+    // The reason is deliberately dropped: this is a decision about speed, and the paths
+    // that report the failure -- the interpreter's first call, or the hand-off -- produce
+    // the message a user needs. Repeating it here would report a deployment error from a
+    // compilation that was only ever trying to save a call.
+    std::string ignored;
+    return vm->resolveExternal(callee, static_cast<std::size_t>(functionIndex), ignored);
+}
+
 /// The `int32` memory type, for the bridge calls that still need one.
 ///
 /// The fused forms have `int32` baked into their encoding, so no memType is carried -- except
@@ -271,6 +324,10 @@ constexpr std::size_t kScratchSlot = kMaxValueSlots;
 /// Counts down a chunk of the runaway-loop budget. Kept in the frame rather than in a
 /// register so it survives the calls a loop body makes.
 constexpr std::size_t kBudgetSlot = kMaxValueSlots + 1;
+/// The `MemoryView` addresses, held in the frame rather than in registers -- every register
+/// is spoken for -- and only read by the inline `LOAD` path.
+constexpr std::size_t kMemBaseSlot = kMaxValueSlots + 2;
+constexpr std::size_t kMemMapSlot = kMaxValueSlots + 3;
 constexpr std::int32_t kBudgetChunk = 4096;
 
 /// The prologue pushes six registers, so rsp is 8 mod 16 when the frame is subtracted.
@@ -278,7 +335,7 @@ constexpr std::int32_t kBudgetChunk = 4096;
 /// requires at every call site: a misaligned stack breaks SSE spills in unrelated code and
 /// shows up as a crash far from here.
 constexpr std::size_t kFrameBytes =
-    ((kValueBase + (kMaxValueSlots + 1) * kSlotBytes + 8 + 15) / 16) * 16 + 8;
+    ((kValueBase + (kMaxValueSlots + 4) * kSlotBytes + 8 + 15) / 16) * 16 + 8;
 static_assert(kFrameBytes % 16 == 8, "the frame must leave rsp 16 byte aligned");
 
 constexpr Reg kRegVm = Reg::Rbx;
@@ -425,6 +482,8 @@ void emitWidthCheck(X64Assembler& assembler, X64Assembler::Label trapExit,
 
 std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                                                      const Function& function,
+                                                     const MemoryView& memory,
+                                                     VM* vm,
                                                      std::string& whyNot) {
     if (!kJitSupported) {
         // First check, so the reason names the real cause on any host that cannot run the
@@ -537,6 +596,20 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
 
     assembler.movImm(kRegA, Width::Dword, kBudgetChunk);
     assembler.mov(mem(Reg::Rsp, slotOffset(kBudgetSlot)), kRegA);
+
+    // The address-space view, once per function. Constants from the compile-time
+    // `MemoryView`, so they are immediates rather than loads.
+    assembler.movImm(kRegA, Width::Qword,
+                     memory.base != nullptr
+                         ? static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(memory.base))
+                         : 0);
+    assembler.mov(mem(Reg::Rsp, slotOffset(kMemBaseSlot)), kRegA);
+    assembler.movImm(kRegA, Width::Qword,
+                     memory.commitMap != nullptr
+                         ? static_cast<std::int64_t>(
+                               reinterpret_cast<std::uintptr_t>(memory.commitMap))
+                         : 0);
+    assembler.mov(mem(Reg::Rsp, slotOffset(kMemMapSlot)), kRegA);
 
     assembler.mov(kRegPageOffset, kRegBase);
     assembler.movImm(kTmp1, Width::Qword, 0xFFFF);
@@ -912,8 +985,13 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // entry per call.
             if (!needsInterpreter && candidate.op == OpCode::Call && candidate.a >= 0 &&
                 static_cast<std::size_t>(candidate.a) < module.functions.size()) {
-                needsInterpreter =
-                    module.functions[static_cast<std::size_t>(candidate.a)].isExternal();
+                // An external call is a hand-off only when it cannot be emitted. When it
+                // can, it is an ordinary call instruction and nothing here applies -- which
+                // is what lets a wrapper like `hashSetIntAdd` compile at all.
+                const Function& target =
+                    module.functions[static_cast<std::size_t>(candidate.a)];
+                needsInterpreter = target.isExternal() &&
+                                   inlineableExternal(module, candidate.a, vm) == nullptr;
             }
             if (!needsInterpreter) {
                 continue;
@@ -2191,13 +2269,60 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 refusal = "stack underflow in LOAD";
                 break;
             }
-            // The bridge, not an inlined walk.
+            // An inlined dereference when the address space is real memory.
             //
-            // The page table in this frame holds only the pages pinned at entry -- the
-            // function's own frame. A `LOAD` address can point anywhere in the arena, so
-            // walking that table for it reads an entry that was never filled. Tried and it
-            // crashed on the first program with a heap string: the pinned table is an
-            // optimisation for frame slots, not a map of memory.
+            // The address comes from the stack, so it is only known at run time -- which is
+            // why this used to be a call to `loadThroughPointer` for every one: a C++ call,
+            // a memType lookup and a `Value` construction to move eight bytes. Every string
+            // index, every struct field reached through a pointer and every `s->handle` in
+            // the standard library paid it.
+            //
+            // The guard is the commit map, not the frame's page table. The page table holds
+            // only the pages pinned at entry -- this function's own frame -- and a `LOAD`
+            // address can point anywhere, so using it here read an entry that was never
+            // filled; that mistake crashed on the first program with a heap string. The
+            // commit map is one byte per page for the whole address space, which is what
+            // makes this test possible, and a miss goes to the bridge rather than faulting.
+            // Allocated only when the inline path is emitted: `finalize` refuses to hand
+            // back code when a label it knows about was never bound -- because that means
+            // the lowering forgot one -- so declaring them unconditionally tripped that
+            // check in the paged fallback, where neither is used.
+            const bool inlineLoad = memory.inlineLoads();
+            X64Assembler::Label slowLoad = 0;
+            X64Assembler::Label loadDone = 0;
+            if (inlineLoad) {
+                slowLoad = assembler.newLabel();
+                loadDone = assembler.newLabel();
+                assembler.mov(kTmp1, mem(Reg::Rsp, slotOffset(depth - 1)));
+                assembler.test(kTmp1, kTmp1);
+                assembler.jcc(Cond::Equal, nullExit);
+                // Page index, bounded before it indexes the map: an arbitrary pointer must
+                // not read past the end of it.
+                assembler.mov(kRegA, kTmp1);
+                assembler.shr(kRegA, 16, Width::Qword);
+                assembler.cmpImm(kRegA, static_cast<std::int32_t>(memory.commitMapSize));
+                assembler.jcc(Cond::AboveEqual, slowLoad);
+                assembler.mov(kTmp2, mem(Reg::Rsp, slotOffset(kMemMapSlot)));
+                assembler.movzx(kRegA, memIndex(kTmp2, kRegA, 1, 0), Width::Byte);
+                assembler.test(kRegA, kRegA);
+                assembler.jcc(Cond::Equal, slowLoad);
+                // `base + address`, then the value at the declared width.
+                assembler.mov(kTmp2, mem(Reg::Rsp, slotOffset(kMemBaseSlot)));
+                assembler.add(kTmp2, kTmp1, Width::Qword);
+                {
+                    const Width width = widthOfBits(info.bits);
+                    if (width == Width::Qword || info.isFloat) {
+                        assembler.mov(kRegA, mem(kTmp2, 0), Width::Qword);
+                    } else if (info.isUnsigned) {
+                        assembler.movzx(kRegA, mem(kTmp2, 0), width);
+                    } else {
+                        assembler.movsx(kRegA, mem(kTmp2, 0), width);
+                    }
+                }
+                assembler.mov(mem(Reg::Rsp, slotOffset(depth - 1)), kRegA);
+                assembler.jmp(loadDone);
+                assembler.bind(slowLoad);
+            }
             assembler.mov(kTmp1, mem(Reg::Rsp, slotOffset(depth - 1)));
             assembler.test(kTmp1, kTmp1);
             assembler.jcc(Cond::Equal, nullExit);
@@ -2209,6 +2334,9 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 reinterpret_cast<const void*>(&jitbridge::loadThroughPointer));
             assembler.test(kRegA, kRegA, Width::Byte);
             assembler.jcc(Cond::Equal, failureExit);
+            if (inlineLoad) {
+                assembler.bind(loadDone);
+            }
             break;
         }
 
@@ -2263,6 +2391,59 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // A `library` call never reaches here: its arguments are marshalled by the
             // interpreter's external-call path, which the bridge does not reproduce, so the
             // hand-off analysis makes it a bail point before lowering gets this far.
+            // A `library` call whose arguments are all scalars, emitted as the call it is.
+            //
+            // The interpreter's path pushes every argument onto the value stack as a
+            // `Value`, dispatches, and pops the result -- about 52 ns against 5 for the
+            // call itself. Nothing in that path is needed here: the arguments are already
+            // eight byte values in this frame's slots, and the ABI wants them in the same
+            // registers either way.
+            //
+            // The 48 bytes subtracted below are the shadow space plus room for the fifth
+            // and sixth arguments, which the ABI puts on the stack rather than in
+            // registers. Forty-eight keeps rsp 16 byte aligned, which the ABI requires at
+            // every call -- and a misaligned call breaks SSE spills in the callee, far from
+            // here.
+            if (void* symbol = inlineableExternal(module, inst.a, vm)) {
+                const int argc = inst.b < 0 ? 0 : inst.b;
+                if (argc > 6) {
+                    refusal = "library call with more than six arguments";
+                    break;
+                }
+                if (depth < static_cast<std::size_t>(argc)) {
+                    refusal = "stack underflow in CALL";
+                    break;
+                }
+                const std::size_t first = depth - static_cast<std::size_t>(argc);
+                constexpr std::int32_t kOutgoing = 48;
+                assembler.subImm(Reg::Rsp, kOutgoing);
+                const Reg valueRegs[4] = {kArg1, kArg2, kArg3, kArg4};
+                for (int i = 0; i < argc && i < 4; ++i) {
+                    assembler.mov(valueRegs[i],
+                                  mem(Reg::Rsp, slotOffset(first +
+                                                           static_cast<std::size_t>(i)) +
+                                                     kOutgoing));
+                }
+                if (argc > 4) {
+                    assembler.mov(kRegA, mem(Reg::Rsp,
+                                             slotOffset(first + 4) + kOutgoing));
+                    assembler.mov(mem(Reg::Rsp, 32), kRegA);
+                }
+                if (argc > 5) {
+                    assembler.mov(kRegA, mem(Reg::Rsp,
+                                             slotOffset(first + 5) + kOutgoing));
+                    assembler.mov(mem(Reg::Rsp, 40), kRegA);
+                }
+                assembler.callAbsolute(symbol);
+                assembler.addImm(Reg::Rsp, kOutgoing);
+                depth = first;
+                if (callee.returnsValue) {
+                    assembler.mov(mem(Reg::Rsp, slotOffset(depth)), kRegA);
+                    ++depth;
+                }
+                break;
+            }
+
             if (callee.returnsAggregate) {
                 refusal = "call returning an aggregate";
                 break;
@@ -2568,7 +2749,7 @@ JitFunction JitCache::entryFor(const Module& module, std::size_t functionIndex,
     }
 
     std::string reason;
-    auto block = compileFunction(module, module.functions[functionIndex], reason);
+    auto block = compileFunction(module, module.functions[functionIndex], memory, m_vm, reason);
     // `ACVM_JIT_DEBUG=1` reports every decision. The `--stats` summary keeps only the first
     // refusal, which is fine for "what is most often in the way" and useless for "why did this
     // function stop being compiled" -- the one question a change like this has to answer.

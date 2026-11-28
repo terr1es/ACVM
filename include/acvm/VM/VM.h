@@ -168,6 +168,24 @@ public:
 
     [[nodiscard]] bool memoryExhausted() const;
 
+    /// True when the address space was reserved from the operating system, so a VM address
+    /// is a host address plus `memoryBase()`. False means the paged fallback is in use and
+    /// no raw pointer exists for VM memory.
+    ///
+    /// Exposed because generated code needs the base, and because a test should assert
+    /// which mode it got rather than silently measuring the fallback.
+    [[nodiscard]] bool memoryIsContiguous() const;
+
+    /// Host address of VM address 0. Valid only when `memoryIsContiguous()`.
+    [[nodiscard]] const std::uint8_t* memoryBase() const;
+
+    /// One byte per 64 KB page, indexed by page number: non-zero means committed. Valid
+    /// only when `memoryIsContiguous()`.
+    [[nodiscard]] const std::uint8_t* memoryCommitMap() const;
+
+    /// Number of entries in the commit map; a page index at or past this is out of range.
+    [[nodiscard]] std::uint64_t memoryCommitMapSize() const;
+
     /// Bridge for generated code: the entire surface the JIT is allowed to use. It is
     /// public because `Process` is a private nested type -- living here is what lets
     /// these three functions name it without making the whole process state public.

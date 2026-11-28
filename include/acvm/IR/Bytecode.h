@@ -515,6 +515,12 @@ struct ParamInfo {
 /// kinds are deliberately few: a scalar is passed by value, an array is passed
 /// as a pointer to a contiguous copy plus its element count.
 struct ExternalParam {
+    /// True for a scalar `float` / `double` parameter.
+    ///
+    /// Recorded because nothing else distinguishes it: an array is `isArray`, a string is
+    /// `isString`, and a plain scalar carries no type at all -- so a `double` looked
+    /// exactly like an `int64` here while the call site rejects it at run time.
+    bool isFloat = false;
     /// True when the Axiom parameter was `ptr T` and the next parameter is its
     /// element count. The VM then copies `count * elemSize` bytes into a
     /// scratch buffer and passes (buffer, count).
