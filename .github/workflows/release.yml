@@ -49,13 +49,10 @@ jobs:
           cmake --install build --prefix stage
           cp README.md TUTORIAL.md LICENSE stage/
           tar -C stage -czf acvm-${{ github.ref_name }}-linux-x86_64.tar.gz .
-          sha256sum acvm-*.tar.gz > SHA256SUMS-linux.txt
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: |
-            acvm-*.tar.gz
-            SHA256SUMS-linux.txt
+          path: acvm-*.tar.gz
 
   macos:
     # The VM and the JIT use mmap with W^X flipping, which is why this is a
@@ -75,13 +72,10 @@ jobs:
           cmake --install build --prefix stage
           cp README.md TUTORIAL.md LICENSE stage/
           tar -C stage -czf acvm-${{ github.ref_name }}-macos-arm64.tar.gz .
-          shasum -a 256 acvm-*.tar.gz > SHA256SUMS-macos.txt
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: |
-            acvm-*.tar.gz
-            SHA256SUMS-macos.txt
+          path: acvm-*.tar.gz
 
   windows:
     runs-on: windows-latest
@@ -102,7 +96,6 @@ jobs:
             # clang defaults to libstdc++ rather than libc++, so a toolchain without
             # this package links the DLL form only and the whole archive fails here.
             mingw-w64-ucrt-x86_64-gcc-libs
-            zip
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -118,16 +111,25 @@ jobs:
         run: |
           cmake --install build --prefix stage
           cp README.md TUTORIAL.md LICENSE stage/
-          # `zip` rather than 7z: the UCRT64 environment has no 7-Zip, and `zip -r`
-          # keeps the directory structure the notes describe.
-          (cd stage && zip -qr ../acvm-${{ github.ref_name }}-windows-x86_64.zip .)
-          sha256sum acvm-*.zip > SHA256SUMS-windows.txt
+
+      # 7-Zip from the runner image rather than the MSYS2 `zip` package. Asking pacman
+      # for one more package was enough to fail the whole job during setup -- "the process
+      # cmd.exe failed with exit code 1" -- while the same list without it built here and
+      # on the other two platforms. Windows now installs exactly what the ci workflow
+      # installs, which is known to work, and the archiver is one the image already has.
+      #
+      # Not `Compress-Archive`: on PowerShell 5.1 it writes backslash separators into the
+      # archive, which every non-Windows unzip then reports as a malformed path.
+      - name: Zip
+        shell: pwsh
+        run: |
+          $name = "acvm-${{ github.ref_name }}-windows-x86_64.zip"
+          & "C:\Program Files\7-Zip\7z.exe" a -tzip -mx=9 $name ".\stage\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed with $LASTEXITCODE" }
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: |
-            acvm-*.zip
-            SHA256SUMS-windows.txt
+          path: acvm-*.zip
 
   release:
     needs: [linux, macos, windows]
@@ -139,9 +141,12 @@ jobs:
       - name: Collect
         run: |
           mkdir -p assets
-          find dist -type f \( -name 'acvm-*' -o -name 'SHA256SUMS-*' \) -exec mv {} assets/ \;
-          cat assets/SHA256SUMS-*.txt > assets/SHA256SUMS.txt
-          rm assets/SHA256SUMS-*.txt
+          find dist -type f -name 'acvm-*' -exec mv {} assets/ \;
+          # One hasher, one format, LF line endings. Each platform job used to write its
+          # own checksum file and this step concatenated them, which mixed `sha256sum`
+          # output with PowerShell's and left a CRLF file that `sha256sum -c` refuses.
+          # Hashing the downloaded bytes also proves the upload round trip.
+          (cd assets && sha256sum acvm-* > SHA256SUMS.txt)
           ls -l assets
       - uses: softprops/action-gh-release@v2
         with:
