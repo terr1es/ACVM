@@ -852,6 +852,12 @@ function main():void {
 - Indexing is bounds-checked; `@(p + i)` is not.
 - Arrays do not decay to pointers.
 
+The bounds check is part of the access, not something the compiler emits around it. When the
+array is a global and the index a variable, `buf[i]` compiles to one instruction -- the load,
+the check and the scaling folded together -- which is what keeps an array walk within a factor
+of two of CPython instead of a factor of six. Pointer arithmetic has no check to fold, which is
+why `@p` remains the faster form for a sequential walk: see [14](#14-writing-fast-code).
+
 ### 7.5 Tuples
 
 ```axiom
@@ -1280,27 +1286,53 @@ arithmetic wraps modulo 2^N instead, matching the specification.
 
 ## 14. Writing fast code
 
-The VM is an interpreter, so the cost model is instruction count plus per-instruction
-overhead. In rough order of impact:
+Axiom runs on an interpreter by default and on a compiler with `--jit`. They reward different
+things, so this section is in two parts.
+
+### 14.1 What both tiers reward
+
+The cost model is instruction count plus per-instruction overhead. In rough order of impact:
 
 1. **Move per-element work into C.** The standard library already does this: `sort` and
-   friends take `(ptr T, count)` and operate on the whole array in one call. A million-
-   element loop in Axiom costs a million dispatches; the same loop in `stdlib/algorithm.c`
-   costs one.
-2. **Prefer arrays and pointers over `map`.** Hash lookup is a function call and a probe
+   friends take `(ptr T, count)` and operate on the whole array in one call. A million-element
+   loop in Axiom costs a million dispatches; the same loop in `stdlib/algorithm.c` costs one.
+2. **Walk with a pointer, not an index.** `@p` and `p++` are one instruction each; `data[i]`
+   is a bounds check, a scale and an add. The optimizer fuses `buf[i]` into a single
+   instruction when the index is a variable and `buf` a global, but a pointer walk still has
+   no bounds check to perform at all.
+3. **Prefer arrays and pointers over `map`.** Hash lookup is a function call and a probe
    sequence; indexing is an add and a load.
-3. **Keep hot values in locals.** A local lives in the frame and is loaded directly; a
-   global goes through the globals table.
-4. **Avoid allocation in loops.** `alloc` is cheap per call but the region is not
-   reclaimed until it ends, so a loop that allocates grows memory monotonically.
-5. **Do not fight the optimizer.** At `-O2` it folds constants, propagates locals, removes
+4. **Keep hot values in locals.** A local lives in the frame and is loaded directly; a global
+   goes through the globals table.
+5. **Avoid allocation in loops.** `alloc` is cheap per call but the region is not reclaimed
+   until it ends, so a loop that allocates grows memory monotonically.
+6. **Do not fight the optimizer.** At `-O2` it folds constants, propagates locals, removes
    dead stores and threads jumps. If you write a load-bearing `comptime` computation, check
    with `--stats-detail` that it actually disappeared.
 
-The measured comparison for a quicksort tuned to the instruction floor is in the README:
-ACVM is 39–50× slower than unoptimized C++ and 2.5–3.3× slower than CPython 3.13, while
-executing a comparable number of instructions per element. The gap is per-dispatch cost,
-not algorithmic.
+### 14.2 When the two tiers diverge
+
+`--jit` compiles a whole function or refuses it; there is no partial compilation and no
+re-profiling. What it cannot compile it hands to the interpreter at the instruction it
+reached, so a program still runs correctly and only loses speed.
+
+- **Loops over locals are where the JIT pays.** A loop body in registers is 4–18× faster than
+  the same body dispatched. If a function is refused -- `--jit` says why, with
+  `ACVM_JIT_DEBUG=1` -- the reason is usually an opcode it does not lower, and the fix is
+  usually to move that operation out of the loop.
+- **Calls are the JIT's weakest point.** Each invocation costs one C++ frame. Compute that
+  is spread across many small functions benefits less than the same compute in one loop.
+- **Recursion benefits least.** A recursive function pays the call on every level.
+- **Memory still goes through the page table.** Neither tier has a flat address space, so an
+  access is not free the way it is in C.
+
+Measured on `examples/quicksort_max.ax` (50 000 integers, same algorithm in four engines):
+the interpreter is 2.2× behind CPython 3.13, `--jit` is 2.0× ahead of it, and C++ `-O2` is
+6.7× ahead of `--jit`. The numbers and how they are taken are in
+[`README.md`](README.md#performance) and [`docs/performance.md`](docs/performance.md).
+
+The gap to C++ is per-dispatch and per-call cost, not algorithmic: the quicksort executes a
+comparable number of instructions per element to CPython's bytecode count.
 
 ## 15. Style
 

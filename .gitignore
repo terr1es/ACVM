@@ -58,3 +58,8 @@ bench/build/
 *.swp
 *.tmp
 build-lto/
+
+# Bench build products: compare.py --build writes these beside the sources.
+docs/bench/_empty.cpp
+docs/bench/_tiny.ax
+docs/bench/_tiny.py

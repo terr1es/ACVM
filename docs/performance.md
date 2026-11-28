@@ -31,11 +31,11 @@ interpreters with no compilation tier:
 
 | benchmark | Axiom | CPython 3.13 | ratio |
 |---|---|---|---|
-| `empty` | 0.443 s | 0.941 s | 2.12× **faster** |
-| `arith` | 0.524 s | 0.473 s | 1.11× slower |
-| `array` | 0.277 s | 0.117 s | 2.41× slower |
-| `calls` | 2.602 s | 1.784 s | 1.46× slower |
-| `quicksort` | 0.095 s | 0.036 s | 2.64× slower |
+| `empty` | 439.7 ms | 925.9 ms | 2.11× **faster** |
+| `arith` | 495.8 ms | 445.5 ms | 1.11× slower |
+| `array` | 214.0 ms | 116.2 ms | 1.84× slower |
+| `calls` | 2851.8 ms | 1886.4 ms | 1.51× slower |
+| `quicksort` | 105.1 ms | 46.3 ms | 2.27× slower |
 
 **One of five ahead.** A bare loop wins because fused instructions cut its body to four; the
 rest lose, and `array` loses worst. This is the honest state of the interpreter and it is
@@ -45,11 +45,11 @@ With the JIT on, which is not a like-for-like comparison and should not be read 
 
 | benchmark | interpreter | `--jit` | vs CPython |
 |---|---|---|---|
-| `empty` | 0.397 s | 0.096 s | 8.94× faster |
-| `arith` | 0.461 s | 0.023 s | 18.51× faster |
-| `array` | 0.277 s | 0.031 s | 3.82× faster |
-| `calls` | 2.615 s | 0.973 s | 1.84× faster |
-| `quicksort` | 0.095 s | 0.023 s | 1.84× faster |
+| `empty` | 439.7 ms | 101.0 ms | 9.17× faster |
+| `arith` | 495.8 ms | 26.0 ms | 17.13× faster |
+| `array` | 214.0 ms | 27.5 ms | 4.23× faster |
+| `calls` | 2851.8 ms | 1050.8 ms | 1.80× faster |
+| `quicksort` | 105.1 ms | 23.8 ms | 1.95× faster |
 
 The two columns describe different things. CPython 3.13 has a specializing interpreter and no
 JIT; Axiom has an ordinary interpreter and an optional compiler. Beating CPython with
@@ -60,21 +60,18 @@ the first table.
 through an insertion-sorted, median-of-three Hoare quicksort. It is worth reading as the answer
 to "how much faster in practice": 1.94× with the JIT, not the 9-18× the tight loops show.
 
-### Why `array` loses by the most
+### `array`: the fragmented access, and what fusing it left behind
 
-2.41× behind CPython on the interpreter, and the largest deficit in the suite. It is not one slow
-instruction -- `LOAD_LOCAL` has a resident-page fast path, `CMP_LOCAL_IMM` is four instructions,
-`GLOBAL_ADDR` is a bounds check and an add. It is the instruction count per element.
-
-One `buf[i]` read is 18 bytecode instructions:
+It was the largest deficit in the suite and the only one where the loss was structural rather
+than per-instruction. One `buf[i]` read used to be 18 bytecode instructions:
 
     STORE_LOCAL   idx, i64       ; stage the index in a 64-bit slot
     CONST_INT     0              ; lower bound
-    CMP_BRANCH    i64 <          ; bounds check
+    CMP_BRANCH    i64 <
     TRAP
     LOAD_LOCAL    idx
     CONST_INT     1000           ; upper bound
-    CMP_BRANCH    i64 >=         ; bounds check
+    CMP_BRANCH    i64 >=
     TRAP
     GLOBAL_ADDR   buf
     LOAD_LOCAL    idx
@@ -83,42 +80,34 @@ One `buf[i]` read is 18 bytecode instructions:
     ADD           ptr
     LOAD          i32
 
-Twelve of those eighteen are address computation and bounds checking; four are the two constant
-loads alone. CPython executes the same expression as one `BINARY_OP` with the list, its length
-and its element pointer already in registers.
+Twelve of those eighteen were address computation, and four were the two constant loads.
+CPython runs the same expression as one `BINARY_OP` with the list, its length and its element
+pointer already in registers. The deficit was granularity, not implementation quality -- which
+is why a bare loop wins 2.1× (fused forms, four-instruction body) while array access lost 2.4×.
 
-So the gap is not implementation quality, it is granularity: on a bare loop Axiom's fused forms
-get the body down to four instructions and it wins 2.1×; on array access the IR has no fused form
-and the machine is being asked to do in twelve instructions what CPython does in one.
+`LOAD_GLOBAL_INDEXED` is that sequence in one instruction. `a` is the global; `b` carries the
+frame slot holding the index, the element's memory type, and a width bit:
 
-Measured per-instruction cost in this suite, which is what says the interpreter core is not the
-problem:
+  * the width bit is not cosmetic. Pointer arithmetic is 64-bit, so the front end stages the
+    index into an `i64` slot and the sequence this fuses reads `LOAD_LOCAL frame+32 i64`, not
+    the `i32` variable it came from. Reading four bytes of that slot is right for every small
+    index and wrong for a large one -- the worst kind of wrong -- so the width is carried and
+    the load reads what the slot holds.
+  * the bounds check is kept inside the instruction rather than assumed from the front end's
+    two checks. A fused instruction has to be safe on its own, or it is a bounds check that
+    exists only when the optimiser happened to run.
 
-| benchmark | instructions | ns per instruction |
-|---|---|---|
-| `empty` | 100 000 006 | 4.17 |
-| `arith` | 70 000 010 | 6.79 |
-| `array` | 36 026 013 | 8.00 |
+Worth **214.0 ms from 277.0 ms** on the array benchmark, and 18 → 13 instructions per read. The JIT
+was taught the same instruction in the same change: without it the loop fell back to the
+interpreter and the compiled array benchmark went from 30 ms to 236 ms, which is how a new
+fused instruction becomes a *regression* if only one tier learns it.
 
-The array loop's instructions cost twice the empty loop's, and the difference is `LOAD`, which
-still goes through the general `loadScalar` -- a switch over width and kind, a `memcpy`, a mask, a
-sign extension -- plus a 32-byte `Value` push. The empty loop touches none of that.
-
-Two things were tried here:
-
-  * **Loading straight into the stack slot** instead of into a local that is then copied in.
-    32-byte move saved per read. Worth 3.5%. Kept. The first version appended the slot before the
-    load and returned on failure, which left a value on the stack that the bytecode did not
-    account for -- the array benchmark trapped with "stack underflow in an arithmetic
-    instruction". A failed instruction must not have already changed the stack.
-  * **Fusing `GLOBAL_ADDR; LOAD_LOCAL; CONST; MUL; ADD` into an indexed load.** Not done. It is
-    the change that would matter -- it is what CPython has and what Axiom's `CMP_LOCAL_IMM`
-    already is for comparisons -- and it is a new IR instruction plus a bounds-check elision,
-    which is a piece of work rather than a tweak.
-
-`--jit` is 3.8× ahead on the same benchmark, because compiled code does the address arithmetic in
-registers and the bounds checks are already hoisted. That gap between 2.41× behind and 3.8× ahead
-is the clearest statement of where the interpreter's ceiling is.
+**What the change left behind.** The front end still emits its two bounds checks, so an array
+read is now checked twice: 6 of the 13 remaining instructions are redundant, 46% of the loop
+body. Removing them is a real optimisation and not a tweak -- the checks are separate basic
+blocks with `TRAP` between them, other branches can target them, and dropping them means
+retargeting jumps. It is the next thing worth doing here, and it is measured rather than
+guessed.
 
 ### A correction
 
@@ -406,16 +395,11 @@ left operand. Worth 5–12% depending on the benchmark.
 
 The JIT used to be slower than the interpreter on every benchmark in this file, which made it
 a demonstration rather than a tier. It now beats CPython 3.13 on all five benchmarks here -- by
-1.7-1.9x on the two that are programs rather than loops, and much more on the loops. CPython has
+1.8-2.3x on the two that are programs rather than loops, and much more on the loops. CPython has
 no compilation tier, so this is not a like-for-like comparison; see "Where it stands".
 
-| benchmark | interpreter | `--jit` | vs CPython 3.13 |
-|---|---|---|---|
-| `empty` | 0.443 s | 0.099 s | 9.50× faster |
-| `arith` | 0.524 s | 0.026 s | 18.24× faster |
-| `array` | 0.298 s | 0.030 s | 3.88× faster |
-| `calls` | 2.602 s | 1.007 s | 1.77× faster |
-| `quicksort` | 0.095 s | 0.019 s | 1.94× faster |
+The numbers are the second table under "Where it stands" and are not repeated here. What
+follows is why they are what they are.
 
 Five causes. The two largest were not missing opcodes at all -- they were instructions the
 compiled body was still paying for on every call.
@@ -519,7 +503,7 @@ the data structure, and the data structure is done.
 
 ### What is actually left
 
-`calls` is now 1.85× faster than CPython. Each invocation still costs one C++ call
+`calls` is now 1.80× faster than CPython. Each invocation still costs one C++ call
 (`callFromSlots`), one call back into generated code, and a frame zeroing that goes through the
 page table -- measured at 8.9% by ablation. A direct call that inlines the frame setup and jumps
 to the callee's entry would remove the first two; doing the zeroing in the callee's prologue,

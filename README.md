@@ -144,42 +144,62 @@ Details, including every deliberate deviation from the language specification, a
 
 ## Performance
 
-`examples/quicksort_max.ax` is a quicksort tuned down to the instruction floor. The same
-algorithm on the same data (cross-checked by checksum) across three engines:
+Two engines, four tiers, one algorithm. Every number below comes from
+`docs/bench/compare.py` on one machine, with process startup measured and subtracted on
+each side -- a 20 ms native binary is mostly loader, and quoting the raw wall clock made C++
+look four times slower than it is.
 
-| n | ACVM | CPython 3.13 | C++ `-O0` | C++ `-O2` |
-| ---: | ---: | ---: | ---: | ---: |
-| 50 000 | 89.2 ms | 33.5 ms | 2.83 ms | 1.90 ms |
-| 200 000 | 386 ms | 156 ms | 10.84 ms | 7.47 ms |
-| 1 000 000 | 2064 ms | 1082 ms | 53.1 ms | 37.0 ms |
+`examples/quicksort_max.ax` is a quicksort tuned down to the instruction floor: 50 000
+integers, Hoare partitioning with median-of-three by comparison, insertion sort below 20
+elements, recursing into the smaller side. `docs/bench/qs.cpp` is the same algorithm in C++
+-- same generator, same threshold, same order -- and prints the same inversion counts, which
+is what makes the columns comparable rather than merely adjacent.
 
-- 31–39× slower than unoptimized C++, 47–56× slower than `-O2`
-- 1.9–2.7× slower than CPython 3.13
+| engine | time | vs CPython | vs C++ `-O2` |
+| --- | ---: | ---: | ---: |
+| ACVM, interpreter | 105.1 ms | 2.3× slower | 30× slower |
+| ACVM, `--jit` | 23.8 ms | 1.9× **faster** | 6.8× slower |
+| CPython 3.13 | 46.3 ms | — | 13× slower |
+| C++ `-O0` (clang) | 4.7 ms | 9.9× faster | 1.3× slower |
+| C++ `-O2` (clang) | 3.5 ms | 13× faster | — |
 
-The CPython comparison is the interesting one. Counting with `sys.settrace`, CPython
-executes **179 bytecodes per element** and ACVM executes **175 instructions** — the same
-amount of work. The remaining difference is the cost of a single dispatch, about 10 ns
-against CPython's 3.3 ns.
+Run-to-run variation is 2–5% on this machine; treat the ratios as two significant figures.
 
-That gap used to be 3.8× rather than 3.0×. The dispatch loop was the first thing worth
-attacking, because it was paying for structure rather than for work: every instruction
-re-read `frames.back()`, copied the `Frame`, re-derived the code pointer and the base
-address, and returned through an `enum` the caller switched on. Hoisting that into a loop
-with the instruction pointer held in a register removed roughly a quarter of the wall
-clock, and a fast path for native-width integers removed a little more — the generic
-arithmetic path works in 128 bits with masks and range checks at every width, which is
-right for `int128` and wasteful for an `int`.
+Axiom's interpreter is within 2.3× of CPython on a pointer-heavy program, and the JIT takes
+it past CPython and to 5.1× off unoptimized C++. That last gap is the price of not
+having a native compiler: no inlining, no register allocation beyond a few pinned slots, and
+a call that still goes through one C++ frame per invocation.
 
-What remains is not dispatch overhead. It is the 32-byte `Value` copy on every push and
-pop, memory access through a page table rather than a flat array, and a `MemType` lookup
-per instruction. Closing that means changing the representation of `Value` and the memory
-model, not adding more fused instructions — the instruction count is already at the floor.
+Against CPython the comparison by benchmark, on the same run:
 
-These numbers were measured on one machine (llvm-mingw, Windows x86-64) and are reported
-as ratios rather than absolute times for that reason. The ACVM column is derived from the
-original cross-engine run by applying the factor measured for the dispatch rework on a
-single machine (1.23× at 50 000, 1.25× at 200 000, 1.29× at 1 000 000); the other three
-columns were not re-run, so they remain as measured together.
+| benchmark | interpreter | `--jit` | CPython 3.13 | `--jit` vs CPython |
+| --- | ---: | ---: | ---: | ---: |
+| empty loop | 440 ms | 101 ms | 926 ms | 9.2× faster |
+| arithmetic | 496 ms | 26 ms | 446 ms | 17.2× faster |
+| array walk | 214 ms | 28 ms | 116 ms | 4.2× faster |
+| recursion (`fib 10` × 300 000) | 2852 ms | 1051 ms | 1886 ms | 1.8× faster |
+
+The interpreter wins the bare loop and loses the rest. That is the honest shape: fused
+instructions cut a four-instruction loop body, and everything that touches memory or calls a
+function pays for a granularity the IR does not fuse. `docs/performance.md` has the analysis,
+the per-instruction costs, and the changes that were measured and thrown away.
+
+Two caveats worth stating rather than burying:
+
+- **The JIT is not a like-for-like comparison.** CPython 3.13 has a specializing interpreter
+  and no compilation tier. Beating it with `--jit` says little; the interpreter row is the
+  one that measures the interpreter.
+- **Only one size is measured.** Axiom has no command-line argument mechanism, so the
+  example is fixed at its tuned 50 000. An earlier revision of this table had three sizes
+  and three different measurement methods behind them, which is worse than one size done
+  one way.
+
+Run it yourself:
+
+```bash
+./docs/bench/compare.py path/to/acvm          # Axiom and CPython
+./docs/bench/compare.py path/to/acvm --build  # plus C++, compiled from docs/bench/qs.cpp
+```
 
 ## The JIT
 
@@ -192,18 +212,18 @@ acvm run  prog.ax   --jit
 acvm exec prog.acvm --jit
 ```
 
-Measured on the same machine as the table above, best of three:
+The same benchmarks as the table above, same run:
 
 | Program | Interpreter | `--jit` | |
 |---|---:|---:|---|
-| `while` loop, 20 000 000 iterations | 2213 ms | 157 ms | 14× |
-| `for i in 0..n` loop, 20 000 000 iterations | 3507 ms | 491 ms | 7.1× |
-| the same loop written in `main` | 3536 ms | 521 ms | 6.8× |
-| `examples/quicksort_max.ax` | 174 ms | 51 ms | 3.4× |
-| `examples/quicksort.ax` | 94 ms | 89 ms | 1.06× |
+| empty loop | 440 ms | 101 ms | 4.4× |
+| arithmetic | 496 ms | 26 ms | 19× |
+| array walk | 214 ms | 28 ms | 7.8× |
+| recursion (`fib 10` × 300 000) | 2852 ms | 1051 ms | 2.7× |
+| `examples/quicksort_max.ax` | 105 ms | 24 ms | 4.4× |
 
-The spread is the whole story, and it is about **which functions get compiled**, not about
-how good the arithmetic is:
+The spread is the whole story, and it is about **which functions get compiled** and **how
+much of the loop is arithmetic rather than calls**, not about how good the arithmetic is:
 
 * **The entry function is compiled.** The interpreter only reached compiled code through
   CALL, so `main` used to run interpreted however much arithmetic it did — and `main` is
@@ -216,18 +236,24 @@ how good the arithmetic is:
 * **`for i in 0..n` fuses its local accesses.** IRGen emits a local's address for every
   store and for the generic load, so a range loop is `LOCAL_ADDR; SWAP; STORE` and
   `LOCAL_ADDR; LOAD` pairs — 216 and 112 of them across `examples/`. Each was a bridge
-  call, a memType lookup and a 32 byte `Value`; now each is a single move. That row was
-  4.7× before.
+  call, a memType lookup and a 32 byte `Value`; now each is a single move.
+* **`buf[i]` is one instruction, in both tiers.** `GLOBAL_ADDR; LOAD_LOCAL; CONST size;
+  MUL; ADD; LOAD` plus the two bounds checks the front end emitted made one array element
+  cost eighteen instructions. `LOAD_GLOBAL_INDEXED` carries the index slot and the element
+  type, re-checks the bounds itself, and is lowered by the JIT as well, so the interpreter
+  and the compiler agree about what an out-of-range index does instead of the compiler
+  trusting a check it did not emit.
 * **A program that declares a `process` keeps its entry function interpreted.** Compiled
   code cannot yield, and `main` finishing ends the run — so a compiled `main` never gave
   the scheduler a turn and a worker process never ran at all (measured: a counter of 6
   interpreted against 0 compiled). Callees stay compiled; the entry function does not.
 
-`examples/quicksort_max.ax` now compiles all five of its functions including the recursive
-partition, but each call still goes through the interpreter's calling convention —
-arguments pushed onto the value stack one helper call at a time, a frame zeroed, the page
-table consulted — so the win there is bounded by call overhead rather than by arithmetic.
-`quicksort.ax` is dominated by startup and printing and gets almost nothing.
+`examples/quicksort_max.ax` compiles all five of its functions, including the recursive
+partition. A call from compiled code is one bridge rather than three — the arguments stay in
+the caller's native slots, the frame is set up from those, and the result is written back to
+the caller's slot instead of being pushed onto the interpreter's value stack and popped again.
+That took the call benchmark from slower than the interpreter to 1.8× faster than CPython.
+What remains is one C++ call per invocation, which is why recursion gains least.
 
 **Compilation stops at the first instruction the interpreter owns.** A half-compiled body
 would have to flush every live register back to memory at the unsupported instruction and
@@ -477,12 +503,14 @@ The ones most likely to be noticed:
   its maximum does not fit the VM's signed 128-bit cell.
 - `doubleA.B` is accepted syntactically but stored as binary64.
 - Aggregate `<` is rejected. `==` / `!=` compare storage bytes.
-- The JIT (`--jit`) compiles a subset. String literals and aggregate *copies* are lowered;
-  builtins, globals, library calls and indirect calls are hand-off points, so a function is
-  compiled up to the first of them and interpreted from there. A function whose *first*
-  instruction needs the interpreter is refused instead, since compiling a prologue and
-  handing straight back costs more than it saves. The interpreter is always the fallback and
-  always the definition of correct behaviour.
+- The JIT (`--jit`) compiles a subset. String literals, aggregate copies, `GLOBAL_ADDR`,
+  `TRAP` and the fused array load are lowered; builtins, global *variable* access, library
+  calls and indirect calls are hand-off points, so a function is compiled up to the first of
+  them and interpreted from there. A function whose *first* instruction needs the interpreter
+  is refused instead, since compiling a prologue and handing straight back costs more than it
+  saves. The interpreter is always the fallback and always the definition of correct
+  behaviour -- which is why a new fused instruction is a change to *both* tiers: the JIT has
+  to be taught it, or a compiled loop silently loses the fusion and runs interpreted.
 - `--jit` is turned off while `--adb` is attached: compiled code has no instruction-level
   address mapping, so a breakpoint inside it could not stop anything.
 - A program that declares a `process` keeps its *entry function* interpreted, because
