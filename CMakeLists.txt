@@ -603,7 +603,8 @@ if(ACVM_BUILD_TESTS)
                             parallel_check threadpool_check generics_check union_check
                             generic_struct_check address_assign_check
                             ternary_check int128_check methods_check
-                            compare_branch_check ${ACVM_EXTRALIB_CHECKS})
+                            compare_branch_check scalar_fastpath_check
+                            ${ACVM_EXTRALIB_CHECKS})
         acvm_add_script_check(${check_name})
     endforeach()
 

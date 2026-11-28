@@ -1,0 +1,88 @@
+//  scalar_fastpath_check.ax -- the shortcut agrees with the general path at the edges.
+//
+//  `residentInt32` lets `LOAD_LOCAL`, `STORE_LOCAL`, `STEP_JUMP` and parameter passing read and
+//  write a 4-byte signed integer directly, skipping the general path's page lookup, mask and
+//  sign extension. A shortcut that is right for the common value and wrong at a boundary is worse
+//  than no shortcut, because the common case will keep passing.
+//
+//  So this asks the boundary questions directly: the largest and smallest `int`, both directions
+//  of the sign, values that need the full 32 bits, and the narrowing a store performs on a value
+//  that does not fit. Overflow itself is not tested here -- it must trap, and a trap ends the
+//  process, which is the harness's job rather than this file's; `int128_check` and the arithmetic
+//  checks cover it.
+//
+//  Run:  acvm run tests/scalar_fastpath_check.ax
+
+function fail(string what):void {
+    print("MISMATCH: "); print(what); print("\n");
+    trap();
+    eof: pass;
+}
+
+/// Round-trips a value through a local slot, which is what the fast path reads and writes.
+function roundTrip(int v):int {
+    int slot = v;
+    return slot;
+    eof: pass;
+}
+
+/// A loop whose counter crosses zero, so the fast path sees both signs of the same slot.
+function sumTo(int limit):int {
+    int total = 0;
+    for (int i = -limit; i < limit; i++) { total = total + i; }
+    return total;
+    eof: pass;
+}
+
+/// A counter stepping down to the smallest int, one short of underflowing.
+function downTo(int floor):int {
+    int n = 0;
+    for (int i = floor + 3; i > floor; i--) { n = n + 1; }
+    return n;
+    eof: pass;
+}
+
+function main():void {
+    // The exact limits. Both must survive a load and a store unchanged.
+    if (roundTrip(2147483647) != 2147483647) { fail("int max round trip"); }
+    if (roundTrip(-2147483647) != -2147483647) { fail("int min+1 round trip"); }
+    if (roundTrip(0) != 0) { fail("zero round trip"); }
+
+    // Values that use the top bit, where a missing sign extension shows up as a huge positive.
+    if (roundTrip(-1) != -1) { fail("-1 sign extension"); }
+    if (roundTrip(-2) != -2) { fail("-2 sign extension"); }
+    if (roundTrip(2147483646) != 2147483646) { fail("near-max positive"); }
+    if (roundTrip(-1073741824) != -1073741824) { fail("top bit set"); }
+
+    // A cast that does not fit traps rather than truncating, and the fast path must not change
+    // that: these are the values on either side of the boundary, and both must be exact.
+    int64 wide = 2147483647;
+    if (wide as int != 2147483647) { fail("int64 max-as-int"); }
+    int64 wideNegative = -2147483647;
+    if (wideNegative as int != -2147483647) { fail("int64 negative-as-int"); }
+
+    // A narrower write is where masking does happen: `storeScalar` masks to the declared width,
+    // and the fast path only claims 32-bit slots, so a 32-bit value must arrive whole.
+    int32 round = 0;
+    round = 2147483647;
+    if (round != 2147483647) { fail("int32 max store"); }
+    round = -2147483647;
+    if (round != -2147483647) { fail("int32 min+1 store"); }
+
+    // Loops across zero: the counter slot changes sign mid-loop.
+    if (sumTo(3) != -3) { fail("sumTo(3)"); }        // -3-2-1+0+1+2 = -3
+    if (sumTo(0) != 0) { fail("sumTo(0)"); }
+    if (downTo(-10) != 3) { fail("downTo(-10)"); }
+    if (downTo(0) != 3) { fail("downTo(0)"); }
+
+    // A counter that lands exactly on the maximum, which the fast path reaches by incrementing.
+    int nearMax = 2147483644;
+    for (int i = 0; i < 3; i++) { nearMax = nearMax + 1; }
+    if (nearMax != 2147483647) { fail("increment to int max"); }
+
+    // Parameters take the same shortcut, so an argument must arrive intact.
+    if (roundTrip(-2147483647) + 2147483647 != 0) { fail("parameter sign"); }
+
+    print("done\n");
+    eof: pass;
+}

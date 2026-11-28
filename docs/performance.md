@@ -2,9 +2,9 @@
 
 How fast the interpreter runs a program, what was measured, and what is still on the table.
 
-The goal set for this work was CPython 3.13. Arithmetic and array access reached parity;
-function calls are still about three times behind. Everything below is measured rather than
-estimated, and the numbers that are exact (instruction counts) are marked as such.
+The goal set for this work was CPython 3.13. Arithmetic and array access now beat it; a bare loop
+is within the noise of parity; function calls are about two and a half times behind, and that is
+the one place the analysis below is still an open problem rather than a solved one.
 
 ## Method
 
@@ -26,37 +26,113 @@ counts are the ones to believe — the wall-clock numbers move by ±10% between 
 
 | benchmark | Axiom | CPython 3.13 | ratio |
 |---|---|---|---|
-| `empty` | 2.653 s | 1.213 s | 2.19× slower |
-| `arith` | 0.832 s | 0.734 s | 1.13× slower |
-| `array` | 0.421 s | 0.421 s | at parity (±10%) |
-| `calls` | 6.300 s | 2.137 s | 2.95× slower |
+| `empty` | 1.365 s | 1.280 s | 1.07× slower |
+| `arith` | 0.698 s | 0.777 s | 1.11× **faster** |
+| `array` | 0.338 s | 0.394 s | 1.17× **faster** |
+| `calls` | 5.226 s | 2.090 s | 2.50× slower |
 
-Three consecutive runs, so the spread is visible rather than hidden behind one number:
+Two consecutive runs, so the spread is visible rather than hidden behind one number:
 
-| benchmark | ratio, three runs |
+| benchmark | ratio, two runs |
 |---|---|
-| `empty` | 2.19×, 2.18×, 2.17× |
-| `arith` | 1.13×, 0.84×, 1.11× |
-| `array` | 1.00×, 0.89×, 0.96× |
-| `calls` | 2.95×, 2.97×, 2.83× |
+| `empty` | 1.17×, 1.07× |
+| `arith` | 0.79×, 0.90× |
+| `array` | 0.85×, 0.86× |
+| `calls` | 2.40×, 2.50× |
 
-`arith` and `array` sit on either side of CPython depending on the run, so they are reported as
-parity rather than as wins. `empty` and `calls` are consistently behind, and consistently by
-about that much.
+Arithmetic and array access are now faster than CPython rather than level with it. `empty` is
+within the noise of parity. `calls` is the one benchmark still clearly behind, and the rest of
+this document is largely about why.
 
-Per-instruction cost, computed from the same runs:
+## Why it was slow, and why the first answer was wrong
 
-| benchmark | instructions | ns/instruction |
+The first round of this work reduced instruction counts by 60% on `empty` and produced 11% of
+time. That ratio — a big drop in instructions, a small drop in seconds — was the actual finding,
+and it took a second round to read it correctly.
+
+**Instruction count had stopped predicting time.** Fitting time against instruction count over six
+variants of the same loop (0 to 5 extra statements in the body, 20M iterations each) gave:
+
+| body statements | instructions | time | ns/instruction |
+|---|---|---|---|
+| 0 | 80 000 014 | 1.188 s | 14.85 |
+| 1 | 160 000 014 | 1.893 s | 11.83 |
+| 2 | 220 000 014 | 2.315 s | 10.52 |
+| 3 | 280 000 014 | 2.863 s | 10.23 |
+| 4 | 340 000 014 | 3.321 s | 9.77 |
+| 5 | 400 000 014 | 3.760 s | 9.40 |
+
+The marginal instruction costs **8.05 ns**. The four-instruction loop body cost **60.9 ns**, which
+at the marginal rate would be 32 ns. Twenty-nine nanoseconds per iteration were unaccounted for,
+and the amount did not change when the body grew — so it belonged to the control sequence, not to
+instruction count.
+
+Ablating that sequence opcode by opcode put **30 ns on `STEP_JUMP` alone**. A single `i++` and a
+jump, at 90 cycles. And the confirmation: each fused opcode replaced three or four general ones
+while costing three times as much as each of them —
+
+| shape | instructions per iteration | time |
 |---|---|---|
-| `empty` | 200 000 008 | 13.3 |
-| `arith` | 80 000 012 | 10.4 |
-| `array` | 40 036 017 | 10.5 |
-| `calls` | 665 400 012 | 9.5 |
+| `a++` at `-O0` (LOAD/ADD/STORE) | 7 | 90.2 ns |
+| `a++` at `-O1` (fused `STEP_LOCAL`) | 5 | 96.7 ns |
+| empty loop at `-O0` | 6 | 59.2 ns |
+| empty loop at `-O1` (`CMP_BRANCH`+`STEP_JUMP`) | 4 | 57.0 ns |
 
-CPython spends about 13.7 ns per bytecode on `empty` (1.213 s for 50M iterations of two
-bytecodes). Axiom's dispatch is therefore in the same range as CPython's per operation, and often
-cheaper. **What remains is mostly the number of instructions per unit of work**, not the cost of
-one — with `empty` as the exception, discussed below.
+Fusing `a++` made it **slower**. The fusions were hiding work from the instruction count, not from
+the clock.
+
+### What the opcodes were doing
+
+`STEP_JUMP`, `STEP_LOCAL`, `LOAD_LOCAL` and `STORE_LOCAL` all went through the general scalar path:
+
+```
+memType (bounds check)
+  -> loadScalar (page lookup, memcpy, mask, sign-extend)
+    -> Value (32 bytes)
+      -> computeBinary (a large non-inlined call, with float/pointer/int/native-width/generic arms)
+        -> storeScalar (the mirror image)
+```
+
+Twenty-seven to thirty cycles to add one to an `int32`. Nothing there is wrong — every step is
+needed for *some* type — but a loop counter is the one case that needs none of it.
+
+`VM::residentInt32` now hands back a direct pointer when the slot is a 4-byte signed integer, in a
+page that already exists, not straddling a page boundary and not misaligned. On that path
+`STEP_JUMP` is an add, an overflow check and a store. Null means "take the general path", so the
+shortcut is an optimisation and never the definition of the behaviour: a slot in a page that was
+never written still reads as zeros, a misaligned slot still goes through `memcpy`, and a counter
+that overflows still traps where it did before (verified: `int i = 2147483646; for (; i < INT32_MAX;
+i++)` prints the last value then traps).
+
+`STEP_JUMP` alone took `empty` from 2.653 s to 1.679 s. The same shortcut on `LOAD_LOCAL`,
+`STORE_LOCAL` and parameter passing took the rest.
+
+## Why `calls` is still 2.4× behind
+
+This one is now almost entirely a per-instruction story, and the numbers separate cleanly.
+
+| | Axiom | CPython 3.13 |
+|---|---|---|
+| time per call | 101 ns | 47.6 ns |
+| items per call | 12.5 instructions | 11.1 bytecodes |
+| cost per item | 8.05 ns | 4.3 ns |
+
+**The call mechanism itself is faster in Axiom.** Measured against the same loop without a call:
+Axiom pays 13 ns per call, CPython pays 21.9 ns — a frame push and pop against
+`_PyEvalFramePushAndInit` with its freelist handling.
+
+So the 2.4× is `12.5 × 8.05` against `11.1 × 4.3`. Axiom executes a comparable number of
+operations and pays about twice as much for each. Two reasons remain:
+
+1. **A `Value` is 32 bytes, CPython's stack slot is a pointer.** Every push and pop moves 32 bytes.
+   `CONST_INT` is 16% of `fib`'s instructions and it is nothing but a 32-byte push.
+2. **`computeBinary` is one large function** with arms for float, pointer, native-width int,
+   generic 128-bit and the six comparisons. It cannot be specialised per call site, so every
+   arithmetic instruction pays its branch ladder. CPython's specialised `BINARY_OP` variants are
+   separate code paths chosen once, at the call site.
+
+Both are addressable, and neither was attempted here. The first is the `Value` change this document
+has been deferring; the second is specialization.
 
 ## What changed
 
@@ -152,31 +228,43 @@ left operand. Worth 5–12% depending on the benchmark.
 
 ## What is still on the table
 
-**1. `empty` costs 13.3 ns per instruction while everything else costs 9.5–10.5.** That is the
-honest anomaly in the table. A four-instruction loop body does nothing but move values through
-the stack: two `LOAD_LOCAL`s, a comparison and a step, each touching a page-translated frame slot
-and copying 32-byte `Value`s. The other benchmarks have real arithmetic to amortise that against.
-Closing it means making the common memory access cheaper, not making dispatch cheaper.
+In the order I would do them, most valuable first.
 
-**2. `Value` is 32 bytes.** It holds an `Int128`, which forces 16-byte alignment, so a stack slot
-is 32 bytes and every push or pop moves that. CPython's stack holds 8-byte pointers. Making the
-common case (`int32`, `int64`, `float`, pointer) 16 bytes would halve the traffic on the hottest
-data path in the VM. It is also the largest change here: `Value` is the type everything else is
-written against, and the 128-bit cases would have to move to a side path. Not attempted in this
-round — the measurement above says to fix memory access first, because that is where the 30-odd
-cycles per slot actually go.
+**1. `Value` is 32 bytes.** This is now the top item, and the reason is quantitative rather than
+aesthetic: it is the remaining explanation for `calls` being 2.4× behind. It holds an `Int128`,
+which forces 16-byte alignment, so a stack slot is 32 bytes and every push or pop moves that.
+CPython's stack holds 8-byte pointers. `CONST_INT` alone is 16% of `fib`'s instructions and does
+nothing but push 32 bytes. Making the common case (`int32`, `int64`, `float`, pointer) 16 bytes
+would halve the traffic on the hottest data path in the VM. It is also the largest change here:
+`Value` is the type everything else is written against, and the 128-bit cases would have to move
+to a side path. The previous round deferred it on the grounds that memory access was the real
+cost; that turned out to be right, and it has now been fixed, which promotes this to the front.
 
-**3. The page-translated memory model.** Every variable read is
-`loadScalar → readBytes → PageStore::get → memcpy`, then a mask and a sign extension. A fast path
-that recognises "address is in the current frame, type is 4 or 8 bytes, page is cache-resident"
-and reads straight through would cut the common access to a few cycles. Worth doing carefully: the
-checks are the safety property — a stray pointer must trap rather than fault — so they have to
-stay for every other case.
+**2. Specialise arithmetic.** `computeBinary` is one function with arms for float, pointer,
+native-width int, generic 128-bit and the six comparisons. Every arithmetic instruction pays that
+branch ladder because the arms cannot be selected per call site. CPython's specialised
+`BINARY_OP_INT_ADD` and friends are separate code paths, chosen once. Two obvious cases here:
+`ADD`/`SUB` with a memType of `int32` are almost all of real arithmetic and could be a single
+compare-and-add at the top of the dispatch arm, before the general function is called.
 
-**4. The call path, again.** 9.5 ns per instruction at 12.5 instructions per call is about 119 ns
-per call, against CPython's 40 ns. The remaining cost is frame setup: `frames.push_back`, a full
-re-snapshot of the interpreter state on `reload`, and `stackTop` bookkeeping. Worth profiling
-before touching.
+**3. `SAFE_POINT` before every `CALL`.** 8% of `fib`'s instructions. It is cheap now — one branch
+when nothing is watching — but it is still a dispatch. The predicate is computed from four members
+on every execution; caching it in one `bool` that is updated at the four places those members
+change would make it a single load. The reason it was written as a recomputation is recorded in
+`VM.h`, and any caching has to update it at `setDebugHooks`, at process creation, when the JIT
+raises `m_frameFloor`, and on module load.
+
+**4. A comparison with an immediate.** `LOAD_LOCAL i; CONST_INT 2; CMP_BRANCH` is 24% of `fib`'s
+instructions and does nothing but ask "is `i` less than two". An opcode carrying the immediate in
+its own operand would make it one instruction, saving 16% of `fib` and about the same in any loop
+with a constant bound.
+
+**5. The frame re-snapshot on call and return.** Every `CALL` and every `RET` sets `reload`, which
+unwinds to the top of the interpreter loop and re-derives the frame reference, the code pointer and
+the base address. Twice per call. The cost did not show up in the ablation (the call mechanism
+measures faster than CPython's) so it is not the priority the earlier draft of this document
+guessed it was — but it is still two full re-snapshots per call that a fixed frame array could
+avoid.
 
 ## Two bugs found by the work itself
 
@@ -209,8 +297,16 @@ for "which slot does this write" (`writesSlot`).
 
 ## What not to conclude
 
-Three of the four ratios moved by less than the noise between sessions, while their instruction
-counts changed by 17–60%. That is not a contradiction: this machine drifts by ±10%, and a 25%
-instruction reduction on a program that is partly memory-bound shows up as less than 25% of time.
-Instruction count is the honest metric for a change to the instruction stream; wall clock is the
-honest metric for the user. Both are reported here, and neither is presented as the other.
+**Instruction count is not a proxy for time, and this document has the receipts.** A 60% cut in
+`empty`'s instructions bought 11% of its time, because the instructions that remained were the
+expensive ones. A later round cut 0% of the instructions and took 37% of the time, by making the
+same four instructions cheaper.
+
+Both numbers are honest, and they answer different questions. Instruction count says how much work
+the program asked for. Wall clock says how much it cost. A change can improve either without the
+other, so a report that shows one and infers the other is not a measurement — it is a guess with a
+number attached. Every claim in this document is one or the other, labelled, and where the two
+disagreed the disagreement is written down rather than smoothed over.
+
+The machine also drifts by ±10% between sessions, so the ratios are given as ranges across
+consecutive runs. A single number would look more precise and mean less.
