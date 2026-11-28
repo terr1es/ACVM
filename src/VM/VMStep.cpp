@@ -1204,6 +1204,17 @@ VM::Step VM::step(Process& process, std::string& error) {
                             readBytes(argument.asPtr(), large.data(), param.size);
                             writeBytes(frameBase + param.offset, large.data(), param.size);
                         }
+                    } else if (const MemType& paramType = memType(param.memType);
+                               paramType.kind == MemType::Kind::Int && paramType.size == 4 &&
+                               paramType.bits == 32 && !paramType.isUnsigned) {
+                        // Same int32 shortcut as `STORE_LOCAL`: every scalar parameter on every
+                        // call went through the general store, which is a page lookup, a
+                        // `memcpy`, a mask and a narrowing, to write four bytes.
+                        if (std::int32_t* cell = residentInt32(frameBase + param.offset)) {
+                            *cell = static_cast<std::int32_t>(argument.asInt());
+                        } else {
+                            storeScalar(frameBase + param.offset, param.memType, argument);
+                        }
                     } else {
                         storeScalar(frameBase + param.offset, param.memType, argument);
                     }
@@ -1391,8 +1402,23 @@ VM::Step VM::step(Process& process, std::string& error) {
                 return Step::SafePoint;
 
             case OpCode::LoadLocal: {
+                // Fast path for a signed 32-bit slot in a resident page: the same shortcut, and
+                // for the same reason, as the one in STEP_JUMP below. `loadScalar` is a general
+                // function that has to handle 1, 2, 4, 8 and 16 byte integers, unsignedness,
+                // floats of three widths and pointers -- and a variable read is the most common
+                // instruction there is.
+                const int loadType = inst.b & 0xFF;
+                const std::uint64_t loadAddress = baseAddress + static_cast<std::uint64_t>(inst.a);
+                const MemType& loadMemType = memType(loadType);
+                if (loadMemType.kind == MemType::Kind::Int && loadMemType.size == 4 &&
+                    loadMemType.bits == 32 && !loadMemType.isUnsigned) {
+                    if (const std::int32_t* cell = residentInt32(loadAddress)) {
+                        process.stack.push_back(Value::fromInt(*cell));
+                        continue;
+                    }
+                }
                 Value value;
-                if (!loadScalar(baseAddress + static_cast<std::uint64_t>(inst.a), inst.b & 0xFF, value)) {
+                if (!loadScalar(loadAddress, loadType, value)) {
                     return fail(TrapKind::Unreachable, "invalid memory type in LOAD_LOCAL");
                 }
                 pushValue(value);
@@ -1400,11 +1426,32 @@ VM::Step VM::step(Process& process, std::string& error) {
             }
 
             case OpCode::StoreLocal: {
+                // The fast path does not pop when the value has to stay: `STORE_LOCAL keep`
+                // exists so an assignment can leave its value on the stack, and popping it only
+                // to push it back is two 32-byte moves for nothing.
+                const int storeType = inst.b & 0xFF;
+                const std::uint64_t storeAddress = baseAddress + static_cast<std::uint64_t>(inst.a);
+                const MemType& storeMemType = memType(storeType);
+                if (storeMemType.kind == MemType::Kind::Int && storeMemType.size == 4 &&
+                    storeMemType.bits == 32 && !storeMemType.isUnsigned) {
+                    if (std::int32_t* cell = residentInt32(storeAddress)) {
+                        if (process.stack.empty()) {
+                            return fail(TrapKind::Unreachable, "stack underflow in STORE_LOCAL");
+                        }
+                        // Narrowing rather than checking, which is what `storeScalar` does for a
+                        // 32-bit type: a value that does not fit is truncated, not trapped.
+                        *cell = static_cast<std::int32_t>(process.stack.back().asInt());
+                        if ((inst.b & 0x100) == 0) {
+                            process.stack.pop_back();
+                        }
+                        continue;
+                    }
+                }
                 Value value;
                 if (!popValue(value)) {
                     return fail(TrapKind::Unreachable, "stack underflow in STORE_LOCAL");
                 }
-                if (!storeScalar(baseAddress + static_cast<std::uint64_t>(inst.a), inst.b & 0xFF, value)) {
+                if (!storeScalar(storeAddress, storeType, value)) {
                     return fail(TrapKind::Unreachable, "invalid memory type in STORE_LOCAL");
                 }
                 if ((inst.b & 0x100) != 0) {
@@ -1492,11 +1539,37 @@ VM::Step VM::step(Process& process, std::string& error) {
                     baseAddress + static_cast<std::uint64_t>(stepJump::slotOf(inst.b));
                 const bool negative = stepJump::isNegative(inst.b);
                 const int typeIndex = stepJump::memTypeOf(inst.b);
+
+                // Fast path: a signed 32-bit counter in a page that already exists.
+                //
+                // Every `for` loop counter in every program is this shape, and it is the
+                // single most expensive instruction in a loop -- measured at 30 ns against 9 ns
+                // for an ordinary instruction, because the general path it used to take is
+                // `memType (bounds check) → loadScalar (page lookup, memcpy, mask, sign-extend)
+                // → Value (32 bytes) → computeBinary (a large non-inlined call) → storeScalar
+                // (the mirror image)`.
+                //
+                // The shortcut is an add and a store. Overflow is checked with the same
+                // builtin the general path uses, so a counter that would overflow falls
+                // through to it and traps exactly where it did before.
+                const MemType& type = memType(typeIndex);
+                if (type.kind == MemType::Kind::Int && type.size == 4 && type.bits == 32 &&
+                    !type.isUnsigned) {
+                    if (std::int32_t* cell = residentInt32(slot)) {
+                        std::int32_t next = 0;
+                        if (!__builtin_add_overflow(*cell, negative ? -1 : 1, &next)) {
+                            *cell = next;
+                            ip = static_cast<std::size_t>(inst.a);
+                            continue;
+                        }
+                        // Overflowed: fall through, so the general path produces the trap.
+                    }
+                }
+
                 Value current;
                 if (!loadScalar(slot, typeIndex, current)) {
                     return fail(TrapKind::Unreachable, "invalid memory type in STEP_JUMP");
                 }
-                const MemType& type = memType(typeIndex);
                 Value updated;
                 TrapKind trapKind = TrapKind::Unreachable;
                 if (!computeBinary(negative ? OpCode::Sub : OpCode::Add, type, current,

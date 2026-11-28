@@ -603,8 +603,34 @@ bool VM::writeBytes(std::uint64_t addr, const void* src, std::size_t len) {
     return true;
 }
 
-bool VM::copyBytes(std::uint64_t dst, std::uint64_t src, std::size_t len) {
-    // Copies page by page instead of staging the whole range in a `std::vector<uint8_t>`.
+std::int32_t* VM::residentInt32(std::uint64_t addr) {
+    if (m_memory == nullptr) {
+        return nullptr;
+    }
+    const std::uint64_t offset = addr & kPageMask;
+    if (offset + 4 > kPageSize) {
+        return nullptr;   // straddles a page: let the general path copy it in two pieces
+    }
+    if ((offset & 3) != 0) {
+        // A misaligned slot. Frame layout aligns an `int` to four bytes so this does not arise
+        // from a well-typed program, but the pointer this returns is dereferenced as
+        // `std::int32_t*`, and on a target that faults on misaligned access that would be a
+        // crash rather than a wrong answer. The general path uses `memcpy` and has no such
+        // requirement, so refusing here costs nothing.
+        return nullptr;
+    }
+    std::uint8_t* page = m_memory->get(addr >> kPageShift, false);
+    if (page == nullptr) {
+        return nullptr;   // never written, so it reads as zero -- general path knows that
+    }
+    return reinterpret_cast<std::int32_t*>(page + offset);
+}
+
+const std::int32_t* VM::residentInt32(std::uint64_t addr) const {
+    return const_cast<VM*>(this)->residentInt32(addr);
+}
+
+bool VM::copyBytes(std::uint64_t dst, std::uint64_t src, std::size_t len) {    // Copies page by page instead of staging the whole range in a `std::vector<uint8_t>`.
     //
     // The staged version allocated on every `MEM_COPY`, and `MEM_COPY` is how a struct or an
     // array is assigned -- so `a = b` for two 40 byte structs was two allocations, one read
