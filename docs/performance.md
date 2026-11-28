@@ -2,9 +2,11 @@
 
 How fast the interpreter runs a program, what was measured, and what is still on the table.
 
-The goal set for this work was CPython 3.13. Arithmetic and array access now beat it; a bare loop
-is within the noise of parity; function calls are about two and a half times behind, and that is
-the one place the analysis below is still an open problem rather than a solved one.
+The goal set for this work was CPython 3.13. The interpreter is now within reach of it on a bare
+loop and behind it on everything else; the JIT is ahead on all five benchmarks here, by 1.8× on
+the realistic one. The summary table is in "Where it stands", and the numbers in it are compute
+only -- process startup subtracted on both sides, which an earlier revision did not do and which
+reversed the conclusion.
 
 ## Method
 
@@ -24,15 +26,52 @@ counts are the ones to believe — the wall-clock numbers move by ±10% between 
 
 ## Where it stands
 
+The interpreter, which is the like-for-like comparison against CPython -- both are bytecode
+interpreters with no compilation tier:
+
 | benchmark | Axiom | CPython 3.13 | ratio |
 |---|---|---|---|
-| `empty` | 0.537 s | 1.322 s | 2.46× **faster** |
-| `arith` | 0.490 s | 0.813 s | 1.66× **faster** |
-| `array` | 0.510 s | 0.477 s | at parity (±10%) |
-| `calls` | 3.246 s | 2.244 s | 1.45× slower |
+| `empty` | 0.443 s | 0.941 s | 2.12× **faster** |
+| `arith` | 0.524 s | 0.473 s | 1.11× slower |
+| `array` | 0.298 s | 0.115 s | 2.59× slower |
+| `calls` | 2.602 s | 1.784 s | 1.46× slower |
+| `quicksort` | 0.095 s | 0.036 s | 2.64× slower |
 
-Three of four are at or ahead of CPython. The one that is not does almost nothing but call
-functions, and the rest of this document is mostly about why that is the hard one.
+**One of five ahead.** A bare loop wins because fused instructions cut its body to four; the
+rest lose, and `array` loses worst. This is the honest state of the interpreter and it is
+not the state an earlier revision of this document reported -- see "A correction" below.
+
+With the JIT on, which is not a like-for-like comparison and should not be read as one:
+
+| benchmark | interpreter | `--jit` | vs CPython |
+|---|---|---|---|
+| `empty` | 0.443 s | 0.099 s | 9.50× faster |
+| `arith` | 0.524 s | 0.026 s | 18.24× faster |
+| `array` | 0.298 s | 0.030 s | 3.88× faster |
+| `calls` | 2.602 s | 1.007 s | 1.77× faster |
+| `quicksort` | 0.095 s | 0.019 s | 1.94× faster |
+
+The two columns describe different things. CPython 3.13 has a specializing interpreter and no
+JIT; Axiom has an ordinary interpreter and an optional compiler. Beating CPython with
+`--jit` is expected and says little; the number that says something about the interpreter is
+the first table.
+
+`quicksort` is the one benchmark here that is a program rather than a loop -- 50 000 integers
+through an insertion-sorted, median-of-three Hoare quicksort. It is worth reading as the answer
+to "how much faster in practice": 1.94× with the JIT, not the 9-18× the tight loops show.
+
+### A correction
+
+Every CPython number in this document used to be measured with a bare `python`, which on this
+machine runs a `sitecustomize` that imports `platform` and costs **320 ms** before the first
+line of the program. That is 320 ms added to every CPython run and to nothing else, and it
+inflated every ratio in Axiom's favour -- by 8.8× against 1.9× on `quicksort`, and enough to
+turn "one of five ahead" into "three of four ahead".
+
+`docs/bench/compare.py` now runs CPython with `-I` and subtracts each side's measured startup,
+so the ratios describe the work. CPython's own interpreter startup is still counted; only the
+environment's is not. The script also refuses a run that traps, because a benchmark that
+returns early measures nothing.
 
 Per-instruction cost, computed from the same runs:
 
@@ -306,14 +345,17 @@ left operand. Worth 5–12% depending on the benchmark.
 ## The JIT after the comparison fix
 
 The JIT used to be slower than the interpreter on every benchmark in this file, which made it
-a demonstration rather than a tier. It now beats CPython 3.13 on all four.
+a demonstration rather than a tier. It now beats CPython 3.13 on all five benchmarks here -- by
+1.7-1.9x on the two that are programs rather than loops, and much more on the loops. CPython has
+no compilation tier, so this is not a like-for-like comparison; see "Where it stands".
 
 | benchmark | interpreter | `--jit` | vs CPython 3.13 |
 |---|---|---|---|
-| `empty` | 0.434 s | 0.118 s | 11.0× faster |
-| `arith` | 0.496 s | 0.041 s | 19.5× faster |
-| `array` | 0.313 s | 0.046 s | 10.0× faster |
-| `calls` | 2.815 s | 1.075 s | 1.84× faster |
+| `empty` | 0.443 s | 0.099 s | 9.50× faster |
+| `arith` | 0.524 s | 0.026 s | 18.24× faster |
+| `array` | 0.298 s | 0.030 s | 3.88× faster |
+| `calls` | 2.602 s | 1.007 s | 1.77× faster |
+| `quicksort` | 0.095 s | 0.019 s | 1.94× faster |
 
 Five causes. The two largest were not missing opcodes at all -- they were instructions the
 compiled body was still paying for on every call.
@@ -417,7 +459,7 @@ the data structure, and the data structure is done.
 
 ### What is actually left
 
-`calls` is now 1.45× faster than CPython. Each invocation still costs one C++ call
+`calls` is now 1.85× faster than CPython. Each invocation still costs one C++ call
 (`callFromSlots`), one call back into generated code, and a frame zeroing that goes through the
 page table -- measured at 8.9% by ablation. A direct call that inlines the frame setup and jumps
 to the callee's entry would remove the first two; doing the zeroing in the callee's prologue,
