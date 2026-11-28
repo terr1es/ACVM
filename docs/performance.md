@@ -310,10 +310,10 @@ a demonstration rather than a tier. It now beats CPython 3.13 on all four.
 
 | benchmark | interpreter | `--jit` | vs CPython 3.13 |
 |---|---|---|---|
-| `empty` | 0.421 s | 0.111 s | 10.4× faster |
-| `arith` | 0.463 s | 0.038 s | 18.4× faster |
-| `array` | 0.282 s | 0.042 s | 9.5× faster |
-| `calls` | 2.960 s | 1.009 s | 2.0× faster |
+| `empty` | 0.434 s | 0.118 s | 11.0× faster |
+| `arith` | 0.496 s | 0.041 s | 19.5× faster |
+| `array` | 0.313 s | 0.046 s | 10.0× faster |
+| `calls` | 2.815 s | 1.075 s | 1.84× faster |
 
 Five causes. The two largest were not missing opcodes at all -- they were instructions the
 compiled body was still paying for on every call.
@@ -388,6 +388,32 @@ took the old path and popped its own frame, and the caller popped again on the w
 symptom was `call depth exceeded in 'checkOtherContexts'` on a program with no deep recursion at
 all -- the frame stack draining from a double pop, not from a leak. Delivery and ownership have
 to be one decision, not two.
+
+### The two things that were asked for, and what measuring them said
+
+**Moving the frame zeroing into the prologue.** The estimate was 8.9% from an ablation two
+rounds ago. Re-measured: **1.6%**. The ablation that produced 8.9% was against `zeroBytes`,
+which built a vector of zeros before writing; a later round replaced it with a single `memset`
+on a page the caller had already resolved, and took almost all of the cost with it. The number
+was stale, not the analysis.
+
+**Inlining the frame push.** The precondition is done: the frame array is a fixed 10 000-slot
+allocation rather than a vector, so its address cannot move, and generated code can address it
+at offsets 0 and 8. That alone is worth 27% on a benchmark that calls an empty function
+20 000 000 times.
+
+Finishing it -- having the caller push the frame, zero it, copy the arguments and jump to the
+callee's entry, with no C++ call at all -- turns out to cost more instructions than it saves.
+The callee's frame base is `callerBase + callerFrameSize`, which is a compile-time constant, so
+the address is one `add`; but the fast path still needs an entry-table read, a capacity check, a
+page-straddle check, the zeroing (one store per 8 bytes), a store per argument, eight
+instructions to push the frame, the `stackTop` update, and a five-argument call setup built on
+the stack. Measured in emitted instructions for `fib`: **about 39, against the 7 the current
+path uses**, to skip a C++ function whose body is 30-50 instructions.
+
+So the ceiling is roughly 10-15%, for a hundred instructions of assembler emitting a calling
+convention that has to agree with `callFromSlots` exactly. Not worth it. The measured win was in
+the data structure, and the data structure is done.
 
 ### What is actually left
 
