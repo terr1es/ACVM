@@ -125,14 +125,22 @@ jobs:
       # image as plain strings, so `grep` reads it without objdump being installed.
       - name: No toolchain runtime in the import table
         run: |
-          found=0
+          exe=stage/bin/acvm.exe
+          if [ ! -f "$exe" ]; then
+            echo "::error::the install step produced no $exe"
+            ls -l stage stage/bin 2>&1 | head -30
+            exit 1
+          fi
+          echo "checking $(wc -c < "$exe") bytes of $exe"
+          found=""
           for dll in libstdc++-6.dll libc++.dll libunwind.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
-            if grep -a -q "$dll" stage/bin/acvm.exe; then
-              echo "::error::acvm.exe imports $dll, which the archive does not ship"
-              found=1
+            if grep -a -q "$dll" "$exe"; then
+              echo "::error::acvm.exe references $dll, which the archive does not ship"
+              found="$found $dll"
             fi
           done
-          if [ $found -ne 0 ]; then
+          if [ -n "$found" ]; then
+            echo "::error::toolchain runtime referenced:$found"
             exit 1
           fi
           echo "import table names no toolchain runtime"

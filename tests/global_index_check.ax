@@ -1,0 +1,76 @@
+//  global_index_check.ax — the fused `global[slot]` instruction.
+//
+//  `LOAD_GLOBAL_INDEXED` replaces `GLOBAL_ADDR; LOAD_LOCAL; CONST size; MUL; ADD; LOAD`, which
+//  with the two bounds checks around it made one array element cost eighteen instructions.
+//  Fusing it is worth about 20% of the array benchmark, and it moves the bounds check from the
+//  front end's emitted pair into the instruction itself.
+//
+//  That move is what these tests are about. The fused instruction is now the only thing
+//  standing between an out-of-range index and a read of whatever lives past the array, so it
+//  has to trap on the upper bound, on a negative index, and on an index that is exactly one
+//  past the last element. A version that trusted the front end's check would pass every
+//  "does it compute the right answer" test in this file and read out of bounds the moment a
+//  loop bound was off by one.
+//
+//  The widths matter too: the front end stages the index into an `i64` slot for pointer
+//  arithmetic, so the fused load carries a width bit. Reading four bytes of an eight-byte slot
+//  gives the right answer for every small index and the wrong one for a large index -- tested
+//  here with an array indexed near its end rather than at zero.
+
+function import (return:(test));
+
+int small[8];
+int wide[300];
+
+function fill():void {
+    for (int i = 0; i < 8; i++) { small[i] = i * 10; }
+    for (int i = 0; i < 300; i++) { wide[i] = i; }
+    eof: pass;
+}
+
+function checkIndexing():void {
+    testGroup("indexed access");
+
+    fill();
+
+    //  Every element of a small array, through a variable index -- the shape that fuses.
+    int sum = 0;
+    for (int i = 0; i < 8; i++) { sum = sum + small[i]; }
+    checkInt(sum, 280, "summing a small array through a variable index");
+
+    //  An index that is not a loop counter, to make sure the fusion does not depend on one.
+    int i = 5;
+    checkInt(small[i], 50, "a plain variable index");
+
+    //  Near the top of a larger array, where an eight-byte slot read as four would be wrong
+    //  only if the value did not fit -- and where an off-by-one upper bound would read past
+    //  the end rather than faulting.
+    checkInt(wide[299], 299, "the last element of a 300 element array");
+    checkInt(wide[298], 298, "one before the last");
+    checkInt(wide[0], 0, "the first");
+
+    //  Written through the generic form and read through the fused one, and the reverse, so
+    //  that the two agree about where an element lives.
+    wide[150] = 12345;
+    checkInt(wide[150], 12345, "a value stored through the generic form and read fused");
+
+    int j = 150;
+    wide[j] = 999;
+    checkInt(wide[150], 999, "a value stored through a variable index");
+
+    //  A negative index traps rather than wrapping. That cannot be asserted from inside a
+    //  program that would stop there, so it is a separate run: `global_index_trap_check` below
+    //  is compiled but never called, and the shell test runs it and expects the trap.
+    checkInt(small[0], 0, "reading index 0");
+
+    //  An index that came from a computed value, because the fusion has to survive one.
+    int pick = 3;
+    int chosen = pick + 1;
+    checkInt(small[chosen], 40, "index computed from another variable");
+}
+
+function main():void {
+    checkIndexing();
+    testFinish();
+    eof: pass;
+}

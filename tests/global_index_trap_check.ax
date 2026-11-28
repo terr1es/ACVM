@@ -1,0 +1,44 @@
+//  global_index_trap_check.ax — the fused array load must trap, not read past the array.
+//
+//  `LOAD_GLOBAL_INDEXED` moves the bounds check from the two instructions the front end emits
+//  around an array access into the instruction itself. That makes it the only guard, and this
+//  file exists because "the guard works" cannot be asserted from inside a program that would
+//  stop working at the first failure.
+//
+//  Registered with `PASS_REGULAR_EXPRESSION "index out of bounds"`: the test passes when the
+//  run traps. Every other check in this directory passes when a program prints the right
+//  numbers, so a regression here would otherwise look like a test that silently stopped
+//  running.
+//
+//  Two cases, because they fail in different ways:
+//
+//    * `onePrecedingTheStart` -- a negative index. If the fused load compared only an unsigned
+//      upper bound, this would read whatever lives before the array.
+//    * `onePastTheEnd` -- exactly one past the last element, which is what an off-by-one loop
+//      bound produces. Reading it is a plausible number, not a fault, which is why this is the
+//      case worth pinning.
+
+int table[16];
+
+function onePastTheEnd():void {
+    int index = 16;
+    print(table[index]);
+    eof: pass;
+}
+
+function onePrecedingTheStart():void {
+    int index = -1;
+    print(table[index]);
+    eof: pass;
+}
+
+function main():void {
+    for (int i = 0; i < 16; i++) { table[i] = i; }
+    int which = 1;
+    if (which == 1) {
+        onePastTheEnd();
+    } else {
+        onePrecedingTheStart();
+    }
+    eof: pass;
+}

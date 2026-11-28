@@ -207,16 +207,29 @@ jobs:
       # machine with "the code execution cannot proceed". The import table is the only
       # thing that answers the question, and the DLL names appear in the image as plain
       # strings, so `grep` reads it without needing objdump installed.
+      #
+      # Every path through this step prints something. It failed once with no annotation
+      # at all -- no `::error::` and no output in `check-runs/<id>/output` -- which leaves
+      # nothing to distinguish "a DLL was found" from "the file was not there" from "the
+      # loop never ran". A check that cannot say why it failed costs a whole run.
       - name: Windows import table names no toolchain runtime
         run: |
-          found=0
+          exe=stage/bin/acvm.exe
+          if [ ! -f "$exe" ]; then
+            echo "::error::the install step produced no $exe"
+            ls -l stage stage/bin 2>&1 | head -30
+            exit 1
+          fi
+          echo "checking $(wc -c < "$exe") bytes of $exe"
+          found=""
           for dll in libstdc++-6.dll libc++.dll libunwind.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
-            if grep -a -q "$dll" stage/bin/acvm.exe; then
-              echo "::error::acvm.exe imports $dll, which is not in the archive"
-              found=1
+            if grep -a -q "$dll" "$exe"; then
+              echo "::error::acvm.exe references $dll, which the archive does not ship"
+              found="$found $dll"
             fi
           done
-          if [ $found -ne 0 ]; then
+          if [ -n "$found" ]; then
+            echo "::error::toolchain runtime referenced:$found"
             exit 1
           fi
           echo "import table names no toolchain runtime"
