@@ -619,11 +619,15 @@ std::int32_t* VM::residentInt32(std::uint64_t addr) {
         // requirement, so refusing here costs nothing.
         return nullptr;
     }
-    std::uint8_t* page = m_memory->get(addr >> kPageShift, false);
-    if (page == nullptr) {
+    const std::uint64_t pageIndex = addr >> kPageShift;
+    if (pageIndex != m_cachedPageIndex) {
+        m_cachedPageIndex = pageIndex;
+        m_cachedPage = reinterpret_cast<std::int32_t*>(m_memory->get(pageIndex, false));
+    }
+    if (m_cachedPage == nullptr) {
         return nullptr;   // never written, so it reads as zero -- general path knows that
     }
-    return reinterpret_cast<std::int32_t*>(page + offset);
+    return m_cachedPage + static_cast<std::ptrdiff_t>(offset >> 2);
 }
 
 const std::int32_t* VM::residentInt32(std::uint64_t addr) const {

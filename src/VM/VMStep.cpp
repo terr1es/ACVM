@@ -697,7 +697,18 @@ VM::Step VM::step(Process& process, std::string& error) {
         const Instruction* const code = function.code.data();
         const std::size_t codeSize = function.code.size();
         const std::uint64_t baseAddress = frame.base;
+        // The constant pool of this frame's function, for the opcodes that read an operand from
+        // it. It changes with the frame, so it belongs in the snapshot; the memory-type table
+        // does not, and is hoisted above the loop.
+        const Value* const constants = function.constants.data();
         std::size_t ip = frame.ip;
+
+        // A page in the store is a heap allocation that is never moved and never freed -- the
+        // store only ever `find`s or `emplace`s -- so a pointer into one stays valid for as long
+        // as the VM exists. Frames are contiguous VM memory, so consecutive calls usually land
+        // in the same page. Dropping the cache on every frame change made a call-heavy program
+        // re-resolve the page twice per call for no benefit; the accessor compares page indices
+        // itself, which is all it needs to decide whether its pointer is still the right one.
 
         // Set by the two instructions that change the frame stack; ends the inner loop so
         // the snapshot above is taken again.
@@ -784,7 +795,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                     static_cast<std::size_t>(inst.a) >= function.constants.size()) {
                     return fail(TrapKind::Unreachable, "invalid constant index");
                 }
-                pushValue(function.constants[static_cast<std::size_t>(inst.a)]);
+                pushValue(constants[static_cast<std::size_t>(inst.a)]);
                 continue;
 
             case OpCode::ConstStr:
@@ -1556,8 +1567,7 @@ VM::Step VM::step(Process& process, std::string& error) {
             case OpCode::AddSubLocalImm: {
                 // `LOAD_LOCAL slot; CONST c; ADD|SUB`: read a slot, add or subtract, push.
                 const std::uint64_t slot = baseAddress + static_cast<std::uint64_t>(inst.a);
-                const Value& constant =
-                    function.constants[static_cast<std::size_t>(addSubLocal::constantOf(inst.b))];
+                const Value& constant = constants[static_cast<std::size_t>(addSubLocal::constantOf(inst.b))];
                 const std::int32_t rhs = static_cast<std::int32_t>(constant.asInt());
 
                 std::int32_t lhs = 0;
@@ -1599,8 +1609,7 @@ VM::Step VM::step(Process& process, std::string& error) {
                 // yet, and that is the only case left to handle.
                 const std::uint64_t slot =
                     baseAddress + static_cast<std::uint64_t>(compareLocal::slotOf(inst.b));
-                const Value& constant =
-                    function.constants[static_cast<std::size_t>(compareLocal::constantOf(inst.b))];
+                const Value& constant = constants[static_cast<std::size_t>(compareLocal::constantOf(inst.b))];
                 const std::int32_t rhs = static_cast<std::int32_t>(constant.asInt());
 
                 std::int32_t lhs = 0;

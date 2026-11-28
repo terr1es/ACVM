@@ -263,6 +263,22 @@ private:
     /// checked that its operand is that shape; this only answers "may I write here directly".
     [[nodiscard]] std::int32_t* residentInt32(std::uint64_t addr);
     [[nodiscard]] const std::int32_t* residentInt32(std::uint64_t addr) const;
+
+    /// The last page `residentInt32` resolved, and a way to make it forget.
+    ///
+    /// A frame is one allocation of at most a few hundred bytes, so every local access in a
+    /// function hits the same 64 KB page. `PageStore::get` was a modulo, an index compare and
+    /// a load for each of them; one compare against the page index gets the same answer.
+    ///
+    /// The cache has to be dropped whenever the page table can change -- a new page allocated,
+    /// memory reset, or a different frame -- so `forgetCachedPage()` is called from the
+    /// interpreter's frame snapshot rather than being woven into the accessor.
+    mutable std::uint64_t m_cachedPageIndex = ~std::uint64_t{0};
+    mutable std::int32_t* m_cachedPage = nullptr;
+    void forgetCachedPage() const {
+        m_cachedPageIndex = ~std::uint64_t{0};
+        m_cachedPage = nullptr;
+    }
     /// Copies within VM memory, memmove-style, without an intermediate buffer.
     bool copyBytes(std::uint64_t dst, std::uint64_t src, std::size_t len);
     /// Compares two ranges of VM memory without copying either out.
