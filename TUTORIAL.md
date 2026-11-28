@@ -1,12 +1,12 @@
 # Axiom — a tutorial
 
-Axiom is a statically typed, compiled language with explicit integer widths, precise
-overflow behaviour, value-semantic aggregates, and single-exit functions. This document
-teaches the language from an empty file to concurrency and the standard library.
+Axiom is a statically typed, compiled language with explicit integer widths, exact overflow
+behaviour, value-semantic aggregates, and single-exit functions. This document proceeds from an
+empty file through concurrency and the standard library.
 
-Every complete program below is executed by `tools/verify_tutorial.py`, and where the
-document states an output, it is compared line by line. If a program in here stops
-working, that script fails.
+Every complete program in this document is executed by `tools/verify_tutorial.py`, and each
+stated output is compared line by line. A program that stops producing its documented output
+fails that script.
 
 ```
 python tools/verify_tutorial.py
@@ -30,9 +30,9 @@ python tools/verify_tutorial.py
 | [11](#11-concurrency) | Concurrency |
 | [12](#12-standard-library) | Standard library |
 | [13](#13-errors-and-diagnostics) | Errors and diagnostics |
-| [14](#14-writing-fast-code) | Writing fast code |
-| [15](#15-style) | Style |
-| [16](#16-pitfalls) | Pitfalls |
+| [14](#14-writing-efficient-code) | Writing efficient code |
+| [15](#15-conventions) | Conventions |
+| [16](#16-common-errors) | Common errors |
 | [17](#17-cheat-sheet) | Cheat sheet |
 
 ## 0. Setup and first program
@@ -62,14 +62,14 @@ function main():void {
 hello, axiom
 ```
 
-Three things to notice, because they are where a C programmer trips:
+Three syntactic properties account for most of the difference from C at first reading:
 
-1. **Statements end with `;`.** Declarations do too.
-2. **The function body does not end with `}`.** It ends with `eof: pass;`, and that is
-   the only real exit (see [§5.2](#52-eof-single-exit)).
-3. **The return type follows a colon**, not a leading keyword.
+1. **Statements and declarations end with `;`.**
+2. **A function body does not end with `}`.** It ends with `eof: pass;`, which is its only exit
+   (see [§5.2](#52-eof-single-exit)).
+3. **The return type follows a colon**; there is no leading return-type keyword.
 
-### 0.3 A slightly larger program
+### 0.3 A larger program
 
 ```axiom
 struct Point {
@@ -616,19 +616,18 @@ function main():void {
 2 -1
 ```
 
-Consequences, all enforced:
+Consequences, all of them enforced:
 
-| Rule | Why |
+| Rule | Reason |
 |---|---|
-| No `return` inside `eof` | It already is the return |
-| No `import` inside `eof` | Nothing may start after the exit |
-| Omitting `eof` means `eof: pass;` | Convenience for the common case |
-| `eof` holds cleanup only | Business logic there runs on every path, including early returns |
-| `eof` is **not** `finally` | A trap aborts the process; `eof` does not run |
+| No `return` inside `eof` | It is the return |
+| No `import` inside `eof` | Nothing may begin after the exit |
+| Omitting `eof` means `eof: pass;` | Convention for the common case |
+| `eof` holds cleanup only | Other logic there runs on every path, including early returns |
+| `eof` is **not** `finally` | A trap aborts the process and `eof` does not run |
 
-That last row is the important one. `eof` runs when a function returns; it does not run
-when the program traps. Do not use it to release resources you also rely on after a
-crash.
+`eof` executes when a function returns; it does not execute when the program traps. It is
+consequently unsuitable for releasing a resource whose state has to survive a failure.
 
 ### 5.3 Recursion
 
@@ -730,14 +729,15 @@ function main():void {
 7
 ```
 
-`alloc` returns `ptr void`; cast to the element type you want. Always check for `null`.
+`alloc` returns `ptr void`, which must be cast to the element type. The result requires a
+`null` check before use.
 
-### 6.4 What is not allowed
+### 6.4 Prohibited operations
 
 - Dereferencing `null` traps.
-- Storing a pointer to a local into a longer-lived structure traps or dangles — the VM
-  does not track lifetimes. Keep pointers to arena memory or to caller-owned data.
-- `ptr` arithmetic on `void` is refused: there is no element size to scale by.
+- Storing a pointer to a local in a longer-lived structure traps or dangles; the VM does not
+  track lifetimes. Pointers are valid only to arena memory or to caller-owned data.
+- `ptr` arithmetic on `void` is refused: there is no element size by which to scale.
 
 ## 7. Aggregates
 
@@ -856,7 +856,7 @@ The bounds check is part of the access, not something the compiler emits around 
 array is a global and the index a variable, `buf[i]` compiles to one instruction -- the load,
 the check and the scaling folded together -- which is what keeps an array walk within a factor
 of two of CPython instead of a factor of six. Pointer arithmetic has no check to fold, which is
-why `@p` remains the faster form for a sequential walk: see [14](#14-writing-fast-code).
+why `@p` remains the faster form for a sequential walk: see [14](#14-writing-efficient-code).
 
 ### 7.5 Tuples
 
@@ -923,16 +923,15 @@ Rules:
 
 | Rule | Detail |
 |---|---|
-| Receiver spelling | exactly `self` or `ptr self`, no name of your own |
-| Value receiver | writes are refused: they would edit a copy the caller never sees |
-| Pointer receiver | needs an addressable object; a temporary is rejected |
+| Receiver spelling | exactly `self` or `ptr self`; other names are rejected |
+| Value receiver | writes are refused: they would modify a copy the caller does not observe |
+| Pointer receiver | requires an addressable object; a temporary is rejected |
 | Static methods | called as `Type.method(...)`; instance methods as `obj.method(...)` |
-| Storage | none — `sizeof` is unchanged by methods |
-| Generic methods | not supported yet; a method inside a **generic struct** is fine |
+| Storage | none — `sizeof` is unaffected by methods |
+| Generic methods | not supported; a method inside a **generic struct** is supported |
 
-A struct whose methods mutate through `ptr self` must be initialised before the first
-call: `Counter c = {0};`. The definite-assignment rule applies to methods like any other
-write.
+A struct whose methods mutate through `ptr self` requires initialisation before the first call:
+`Counter c = {0};`. Definite assignment applies to methods as to any other write.
 
 ## 9. Generics
 
@@ -1002,17 +1001,16 @@ function sumOf<T>(T a, T b):T {
 }
 ```
 
-That error is the design: saying "this template does not work for this type" at the
-offending operator is more useful than requiring the author to declare constraints up
-front, at this language's current size. A side effect worth knowing: `maxOf<Point>`
-**also** fails, because `<` is not defined for aggregates (see below).
+The diagnostic is the design: reporting that a template does not apply to a type, at the operator
+that fails, is more useful than requiring constraints to be declared in advance at this
+language's current size. One consequence: `maxOf<Point>` also fails, because `<` is not defined
+for aggregates (see below).
 
-### 9.4 What aggregates can and cannot do
+### 9.4 Aggregate operations
 
-`==` and `!=` on aggregates compare storage bytes. `<`, `<=`, `>`, `>=` are **compile
-errors** — field order is arbitrary, and byte order is not what anyone means by
-"smaller". To order structs, compare the field you mean, or sort by a key with
-`sortIndicesByKey`.
+`==` and `!=` on aggregates compare storage bytes. `<`, `<=`, `>`, `>=` are **compile errors**:
+field order is arbitrary, and byte order carries no meaning for an aggregate. To order structs,
+compare the intended field, or sort by a key with `sortIndicesByKey`.
 
 ## 10. Modules and native libraries
 
@@ -1069,25 +1067,25 @@ file.
 module "json" version "0.1.0";
 ```
 
-A file-level directive, sibling to `library`. The name must equal the file's own stem and
-the version must be `MAJOR.MINOR.PATCH`; both are checked, because package tooling will
-trust this string and a stale one would resolve the wrong module silently.
+A file-level directive, sibling to `library`. The name must equal the file's own stem and the
+version must be `MAJOR.MINOR.PATCH`; both are checked, because package tooling will trust this
+string and a stale one would resolve the wrong module silently.
 
 ### 10.4 Name collisions across files
 
 | Situation | Behaviour |
 |---|---|
 | Same signature twice in one file | **error** |
-| Entry file vs an imported file | entry file wins (you may override a library helper) |
+| Entry file vs an imported file | entry file wins (a library helper may be overridden) |
 | Two imported files, same signature | **error** — neither is privileged |
 | Either side `private`, different files | independent; `private` scopes the name |
 
-The third row matters: before it was enforced, which definition won depended on `import`
-order, so adding an unrelated import could swap out a function the program depended on,
-with nothing at the call site to show it.
+The third row is load-bearing: before it was enforced, the winning definition depended on
+`import` order, so an unrelated import could replace a function the program depended on, with
+nothing at the call site to indicate it.
 
-`private` is file-scoped in the real sense: other files cannot see the name **and are not
-affected by it**. Two libraries may each have a `private helper` with the same signature.
+`private` is file-scoped in the strict sense: other files cannot see the name **and are not
+affected by it**. Two libraries may each declare a `private helper` with the same signature.
 
 ### 10.5 Calling C
 
@@ -1183,19 +1181,19 @@ function process worker():void {
 }
 ```
 
-The core of the module is `atomicAdd`, an atomic load/store pair, `mutex` create/lock/
-unlock/destroy, semaphores, and bounded channels.
+The core of the module is `atomicAdd`, an atomic load/store pair, `mutex` create/lock/unlock/
+destroy, semaphores, and bounded channels.
 
-### 11.5 parallel: real threads
+### 11.5 parallel: OS threads
 
-`parallel` runs a function on a pool of OS threads. It is for pure computation: the body
-gets no VM services, so no allocation, no globals it can safely write, no printing.
+`parallel` runs a function on a pool of OS threads. It is intended for pure computation: the
+body receives no VM services, so no allocation, no safely writable globals, and no printing.
 
 ## 12. Standard library
 
 Imported by name; names are unqualified at the call site.
 
-| Module | What it gives you |
+| Module | Contents |
 |---|---|
 | `algorithm` | `sort`, `sortInts`, `sortInt64s`, `sortFloats`, `binarySearch`, `reverseInts`, `sortIndicesByKey`, and generic forms -- plus `sortBy` / `minByIndex` / `findIf`, which take a key or a predicate as a `Func` |
 | `map` | `MapIntInt`, `MapIntStr`, `MapStrInt`, `MapStrStr`, and pointer-keyed variants |
@@ -1278,101 +1276,100 @@ int a = 2147483647;
 int b = a + 1;      // traps: signed overflow in 'main'
 ```
 
-The trap message names the function and the operation, because "somewhere in your program
-an integer overflowed" is not actionable.
+The trap message names the function and the operation, because locating the overflow only at
+program level is not actionable.
 
-Overflow is precise, not wrapping: each `intN` traps at its own boundary. Unsigned
-arithmetic wraps modulo 2^N instead, matching the specification.
+Overflow is exact rather than wrapping: each `intN` traps at its own boundary. Unsigned
+arithmetic wraps modulo 2^N, as the specification requires.
 
-## 14. Writing fast code
+## 14. Writing efficient code
 
-Axiom runs on an interpreter by default and on a compiler with `--jit`. They reward different
-things, so this section is in two parts.
+Axiom executes on an interpreter by default and on a compiler with `--jit`. The two tiers are
+rewarded by different properties, so this section is divided accordingly.
 
-### 14.1 What both tiers reward
+### 14.1 Properties rewarded by both tiers
 
-The cost model is instruction count plus per-instruction overhead. In rough order of impact:
+The cost model is instruction count plus per-instruction overhead, in approximate order of
+impact:
 
-1. **Move per-element work into C.** The standard library already does this: `sort` and
-   friends take `(ptr T, count)` and operate on the whole array in one call. A million-element
-   loop in Axiom costs a million dispatches; the same loop in `stdlib/algorithm.c` costs one.
-2. **Walk with a pointer, not an index.** `@p` and `p++` are one instruction each; `data[i]`
-   is a bounds check, a scale and an add. The optimizer fuses `buf[i]` into a single
-   instruction when the index is a variable and `buf` a global, but a pointer walk still has
-   no bounds check to perform at all.
-3. **Prefer arrays and pointers over `map`.** Hash lookup is a function call and a probe
+1. **Move per-element work into C.** The standard library does this: `sort` and its relatives
+   take `(ptr T, count)` and operate on the whole array in one call. A million-element loop in
+   Axiom costs a million dispatches; the same loop in `stdlib/algorithm.c` costs one.
+2. **Walk with a pointer rather than an index.** `@p` and `p++` are one instruction each;
+   `data[i]` is a bounds check, a scale and an add. The optimizer fuses `buf[i]` into a single
+   instruction when the index is a variable and `buf` a global, but a pointer walk has no
+   bounds check to perform at all.
+3. **Prefer arrays and pointers to `map`.** Hash lookup is a function call and a probe
    sequence; indexing is an add and a load.
-4. **Keep hot values in locals.** A local lives in the frame and is loaded directly; a global
-   goes through the globals table.
-5. **Avoid allocation in loops.** `alloc` is cheap per call but the region is not reclaimed
+4. **Keep frequently used values in locals.** A local resides in the frame and is loaded
+   directly; a global is reached through the globals table.
+5. **Avoid allocation inside loops.** `alloc` is cheap per call, but a region is not reclaimed
    until it ends, so a loop that allocates grows memory monotonically.
-6. **Do not fight the optimizer.** At `-O2` it folds constants, propagates locals, removes
-   dead stores and threads jumps. If you write a load-bearing `comptime` computation, check
-   with `--stats-detail` that it actually disappeared.
+6. **Do not obstruct the optimizer.** At `-O2` it folds constants, propagates locals, removes
+   dead stores and threads jumps. A `comptime` computation the program depends on should be
+   confirmed eliminated with `--stats-detail`.
 
-### 14.2 When the two tiers diverge
+### 14.2 Behaviour of the two tiers
 
 `--jit` compiles a whole function or refuses it; there is no partial compilation and no
-re-profiling. What it cannot compile it hands to the interpreter at the instruction it
-reached, so a program still runs correctly and only loses speed.
+re-profiling. What it cannot compile is handed to the interpreter at the instruction it
+reached, so the program remains correct and loses only speed.
 
-- **Loops over locals are where the JIT pays.** A loop body in registers is 4–18× faster than
-  the same body dispatched. If a function is refused -- `--jit` says why, with
-  `ACVM_JIT_DEBUG=1` -- the reason is usually an opcode it does not lower, and the fix is
-  usually to move that operation out of the loop.
-- **Calls are the JIT's weakest point.** Each invocation costs one C++ frame. Compute that
-  is spread across many small functions benefits less than the same compute in one loop.
-- **Recursion benefits least.** A recursive function pays the call on every level.
-- **Memory still goes through the page table.** Neither tier has a flat address space, so an
-  access is not free the way it is in C.
+- **Loops over locals gain most from the JIT.** A loop body in registers is 4–18× faster than
+  the same body dispatched. When a function is refused -- `--jit` reports the reason, and
+  `ACVM_JIT_DEBUG=1` reports it per function -- the cause is usually an opcode the lowering
+  does not implement, and the remedy is usually to move that operation outside the loop.
+- **Calls are the weakest point of the JIT.** Each invocation costs one C++ frame. Computation
+  distributed across many small functions gains less than the same computation in one loop.
+- **Recursion gains least.** A recursive function pays the call at every level.
+- **Memory access still traverses the page table.** Neither tier has a flat address space, so
+  an access does not cost what it costs in C.
 
-Measured on `examples/quicksort_max.ax` (50 000 integers, same algorithm in four engines):
-the interpreter is 2.2× behind CPython 3.13, `--jit` is 2.0× ahead of it, and C++ `-O2` is
-6.7× ahead of `--jit`. The numbers and how they are taken are in
+Measured on `examples/quicksort_max.ax` (50 000 integers, one algorithm implemented for four
+engines): the interpreter is 2.1× behind CPython 3.13, `--jit` is 2.1× ahead of it, and C++
+`-O2` is 6.2× ahead of `--jit`. The measurements and their method are in
 [`README.md`](README.md#performance) and [`docs/performance.md`](docs/performance.md).
 
-The gap to C++ is per-dispatch and per-call cost, not algorithmic: the quicksort executes a
-comparable number of instructions per element to CPython's bytecode count.
+The residual gap to C++ is per-dispatch and per-call cost rather than algorithmic: the
+quicksort executes a comparable number of operations per element to CPython's bytecode count.
 
-## 15. Style
+## 15. Conventions
 
-The project's own conventions, which the codebase follows:
+The conventions the codebase follows:
 
-- **Comments explain why, not what.** The code says what it does; a comment earns its
-  place by recording the alternative that was tried and rejected, or the failure that
-  forced the design.
-- **Name the trap in the comment.** Where a rule exists because something broke, say what
-  broke. `// do not merge these: it produced a wrong answer at O2` outlives any amount of
-  `// careful!`.
-- **One blank line between functions**, and a section banner before a group of related
-  ones.
-- **Prefer early returns**; they show the exit conditions first.
-- **No abbreviations in public names**; `count`, not `cnt`. Local loop counters may be `i`.
-- **Test names state the behaviour**, not the function: `"the false arm when the condition
-  is false"`.
+- **Comments state why, not what.** The code states what it does; a comment justifies itself by
+  recording the alternative that was rejected, or the failure that forced the design.
+- **Record the failure in the comment.** Where a rule exists because something broke, name what
+  broke. `// do not merge these: it produced a wrong answer at O2` is more durable than any
+  amount of `// careful!`.
+- **One blank line between functions**, and a section banner before a group of related ones.
+- **Prefer early returns**; they state the exit conditions first.
+- **No abbreviations in public names**; `count`, not `cnt`. Loop counters may be `i`.
+- **Test names describe behaviour**, not the function under test: `"the false arm when the
+  condition is false"`.
 
-## 16. Pitfalls
+## 16. Common errors
 
-Collected from real mistakes, in the order they usually bite:
+Recorded from observed mistakes:
 
-| Pitfall | What happens |
+| Error | Result |
 |---|---|
-| Forgetting `;` after a `struct` | `expected ';' after the struct declaration` |
-| Treating `a` as a pointer | The whole array is copied; pass `#a[0]` plus a length |
-| Expecting `s.length()` | `length` is a property: `s.length` |
-| Expecting `if (n)` to work | The condition must be `bool` |
-| Assuming `int` is 64-bit | `int` is `int32`; use `int64` deliberately |
-| Assuming `int8 + int8` stays `int8` | Operands are widened; the result follows the wider type |
-| Writing `switch` expecting fallthrough | Exactly one arm runs |
-| Assigning `a` to `b` expecting shared state | Aggregates are values; both are independent copies |
-| Using `<` on a struct | Compile error; compare a field or sort by key |
-| Relying on `eof` after a trap | `eof` is not `finally`; a trap skips it |
+| Omitting `;` after a `struct` | `expected ';' after the struct declaration` |
+| Treating `a` as a pointer | The array is copied; pass `#a[0]` with a length |
+| `s.length()` | `length` is a property: `s.length` |
+| `if (n)` with an integer | The condition must be `bool` |
+| Assuming `int` is 64-bit | `int` is `int32`; use `int64` explicitly |
+| Assuming `int8 + int8` yields `int8` | Operands are widened; the result follows the wider type |
+| `switch` with fallthrough | Exactly one arm executes |
+| Assigning `a` to `b` expecting shared state | Aggregates are values; the copies are independent |
+| `<` on a struct | Compile error; compare a field or sort by key |
+| Depending on `eof` after a trap | `eof` is not `finally`; a trap skips it |
 | Deep recursion | No tail-call elimination; the frame stack grows |
-| Reading a variable declared without a value | Compile error, not garbage |
+| Reading an uninitialised variable | Compile error, not garbage |
 
 ## 17. Cheat sheet
 
-The sheet is a reference, not a program, so it is fenced as text.
+The sheet is a reference rather than a program, so it is fenced as text.
 
 ```text
 // program

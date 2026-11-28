@@ -1,53 +1,62 @@
 # ACVM — the Axiom compiler and virtual machine
 
-ACVM compiles the Axiom language (`.ax`) to stack-based bytecode and executes it. The
-bytecode can also be saved as a self-contained `.acvm` module that runs without the
-compiler.
+ACVM compiles the Axiom language (`.ax`) to stack-based bytecode and executes it. Bytecode
+can be emitted as a self-contained `.acvm` module that runs without the compiler.
 
 ```
-source .ax ──► Lexer ──► Parser ──► Sema ──► IRGen ──► Module ──► VM
-                                  (type check)      (bytecode)    │
-                                                       ├──► .acvm file
-                                                       └──► disassembly
+source .ax ──► Lexer ──► Parser ──► Sema ──► IRGen ──► Optimizer ──► Module ──► VM
+                                  (type check)                     (bytecode)    │
+                                                                    ├──► .acvm file
+                                                                    └──► disassembly
 ```
 
-- **C++20, zero third-party dependencies.** The only external symbol is the platform's
-  dynamic loader. A full build is `cmake -S . -B build && cmake --build build`.
-- **Hand-written front end:** lexer, recursive-descent parser with a Pratt expression
-  parser, and two-pass semantic analysis. No parser generator.
-- **Own bytecode and VM:** paged memory, exact arithmetic for every `int2`..`int128`
-  width, pointers with element-scaled arithmetic, value-semantic aggregates, region
-  (arena) allocation, single-exit functions via `eof`, and cooperative scheduling with
+## Design properties
+
+- **C++20, no third-party dependencies.** The only external symbol is the platform's dynamic
+  loader.
+- **Hand-written front end.** Lexer, recursive-descent parser with a Pratt expression parser,
+  and two-pass semantic analysis. No parser generator.
+- **Own bytecode and VM.** Paged memory, exact arithmetic at every width from `int2` to
+  `int128`, element-scaled pointer arithmetic, value-semantic aggregates, region (arena)
+  allocation, single-exit functions via `eof`, and cooperative scheduling with
   compiler-inserted safe points.
+- **Two execution tiers.** An interpreter that defines the semantics, and an optional
+  x86-64 baseline compiler (`--jit`) that is validated against it differentially.
 
-Axiom is the largest language in this repository — roughly 32,000 of its 66,000 lines,
-against 24,000 of C++. GitHub does not show that yet: its language detection knows only
-the languages in [linguist's database](https://github.com/github-linguist/linguist/blob/main/lib/linguist/languages.yml),
-and Axiom is not one of them, so `.ax` files appear under no language at all. Registering
-it needs a minimum volume of use across repositories that a new language has not reached.
-The grammar in [`editors/`](editors/) is what makes the code readable in an editor today.
+## Implementation size
 
+| Layer | Lines |
+|---|---:|
+| Compiler and VM (`src/`, `include/`) | 28,994 C++ |
+| Standard library and extra modules (`stdlib/`, `extralib/`) | 21,132 Axiom, 7,692 C |
+| Tests (`tests/`) | 10,247 Axiom, 3,192 C++ |
+| Examples (`examples/`) | 3,599 Axiom |
+| Tooling and editor support | 229 Axiom, 1,147 C/C++ |
+| **Axiom total** | **35,207** |
+| **C/C++ total** | **41,025** |
+
+Axiom is not in [linguist's language database](https://github.com/github-linguist/linguist/blob/main/lib/linguist/languages.yml),
+so GitHub reports `.ax` files under no language. The TextMate grammar in [`editors/`](editors/)
+provides syntax highlighting.
 
 ## Building
 
-Requires CMake ≥ 3.20 and any C++20 compiler. Tested with clang 23 (llvm-mingw) on
-Windows and GCC/Clang on Linux.
+Requires CMake ≥ 3.20 and a C++20 compiler. Tested with clang 23 (llvm-mingw) on Windows and
+GCC/Clang on Linux.
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ```
 
-The build copies the `acvm` binary to `~/.local/bin` (`%USERPROFILE%\.local\bin` on
-Windows). That directory is normally already on `PATH`, so afterwards you can type
-`acvm` directly. To leave `PATH` alone:
+The build installs the `acvm` binary to `~/.local/bin` (`%USERPROFILE%\.local\bin` on
+Windows), which is normally on `PATH`. To disable installation:
 
 ```bash
 cmake -S . -B build -DACVM_INSTALL_COMMAND=OFF
 ```
 
-On a machine where CMake is not on `PATH`, the full invocation used during development
-was:
+Where CMake is not on `PATH`, the full invocation is:
 
 ```bash
 "/c/Program Files/CMake/bin/cmake.exe" -S . -B build -G "MinGW Makefiles" \
@@ -55,41 +64,50 @@ was:
 "/c/Program Files/CMake/bin/cmake.exe" --build build -j 8
 ```
 
-Artifacts land in `build/bin/`.
+Artifacts are written to `build/bin/`.
 
-## Usage
+## Command line
 
-```bash
-acvm run   examples/tour.ax                    # compile and execute
-acvm run   examples/quicksort.ax               # readable quicksort
-acvm run   examples/quicksort_max.ax --stats-detail   # instruction-level counts
-acvm build examples/tour.ax                    # emit examples/tour.acvm
-acvm exec  examples/tour.acvm                  # execute the module
-acvm run   examples/quicksort_max.ax --jit     # compile hot functions to machine code
-acvm check examples/tour.ax                    # lex, parse and type-check only
-acvm ir    examples/tour.ax -O2                # disassemble after optimizing
-```
-
-Four commands inspect or scaffold a project rather than compile it:
+### Compilation and execution
 
 ```bash
-acvm size examples/tour.ax                     # bytecode size per function, largest first
-acvm doc  stdlib -o docs/api.md                # Markdown reference from `//` comments
-acvm test tests                                # run every *_check.ax in a directory
-acvm init myproject                            # a program, a test, and nothing else
+acvm run   examples/tour.ax                           # compile and execute
+acvm build examples/tour.ax                           # emit examples/tour.acvm
+acvm exec  examples/tour.acvm                         # execute a compiled module
+acvm check examples/tour.ax                           # lex, parse and type check
+acvm run   examples/quicksort_max.ax --jit            # compile functions to machine code
+acvm run   examples/quicksort_max.ax --stats-detail   # per-opcode instruction counts
+acvm ir    examples/tour.ax -O2                       # disassemble after optimizing
 ```
 
-`size` answers "why is this module big" by sorting the functions, `doc` reads the source
-rather than the syntax tree (so it works on a file that does not compile), `test` runs each
-file in its own process so one trap does not take the rest down, and `init` writes two files
-that already pass.
+### Inspection and scaffolding
 
-Optimization levels are `-O0` (none), `-O1`, `-O2` (default), `-O3`, and `-O4`.
-**O0–O3 preserve observable semantics; O4 does not** — it removes safety checks and safe
-points, so programs that depend on preemption or on an assertion firing behave
-differently. That is a deliberate contract, not a bug.
+```bash
+acvm size examples/tour.ax          # bytecode size per function, largest first
+acvm doc  stdlib -o docs/api.md     # Markdown reference from comments
+acvm test tests                     # run every *_check.ax in a directory
+acvm init myproject                 # project skeleton
+```
 
-## A quick look at the language
+`size` ranks functions by bytecode size. `doc` parses the source rather than the syntax tree,
+so it operates on files that do not compile. `test` runs each file in a separate process, so a
+trapping test does not terminate the suite. `init` writes a program and a test that pass.
+
+### Optimization levels
+
+| Level | Effect |
+|---|---|
+| `-O0` | None. The instructions IRGen emitted. |
+| `-O1` | Local peepholes, unreachable-code removal, jump threading. |
+| `-O2` | Default. Also constant propagation and folding, branch resolution. |
+| `-O3` | Also store/load forwarding and dead-store removal. |
+| `-O4` | Also removes safe points and assertions. **Not semantics-preserving.** |
+
+`-O0` through `-O3` preserve observable behaviour. `-O4` removes safety checks and scheduler
+safe points, so programs that depend on preemption or on an assertion firing behave
+differently. This is a documented contract, not a defect.
+
+## Language overview
 
 ```axiom
 struct Point {
@@ -112,8 +130,8 @@ function main():void {
     print(p.lengthSquared());        // 25
     print("\n");
 
-    int8  small = 100;               // one byte, exactly
-    int128 wide = 1;                 // full 128-bit range: -2^127 .. 2^127-1
+    int8  small = 100;               // one byte, exact
+    int128 wide = 1;                 // -2^127 .. 2^127-1
     wide = wide << 100;
 
     int values[5] = {5, 3, 1, 4, 2};
@@ -126,238 +144,200 @@ function main():void {
 }
 ```
 
-Things that surprise people coming from C:
+### Differences from C
 
-| | Axiom | C |
+| Property | Axiom | C |
 |---|---|---|
-| Integer types | `int8` / `int16` / `int32` / `int64` / `int128`, and any width from 2 to 128 | `int8_t`… |
-| Default `int` | `int32` | platform-dependent |
-| Implicit numeric conversion | **none** — but narrower operands are widened to the wider one | implicit promotions |
-| Function bodies | closed by `eof: pass;`, not by `}` | `}` |
-| Statements | require `;`; function bodies do **not** end with one | both |
-| Aggregate comparison | `==` / `!=` only; `<` on an aggregate is a compile error | n/a |
-| Struct size | field layout only — **methods take no storage** | n/a |
-| Function collisions | two imported files defining the same signature is an error; `private` is file-scoped | tentative definitions |
+| Integer types | `int8`/`int16`/`int32`/`int64`/`int128`, any width 2–128 | `int8_t`… |
+| `int` default | `int32` | platform-dependent |
+| Implicit numeric conversion | none; narrower operands are widened to the wider type | implicit promotions |
+| Function body terminator | `eof: pass;` | `}` |
+| Statement terminator | `;` required; function bodies do not end with one | both |
+| Aggregate comparison | `==`/`!=` only; `<` on an aggregate is a compile error | not applicable |
+| Struct size | field layout only; methods occupy no storage | not applicable |
+| Duplicate function definitions | error; `private` is file-scoped | tentative definitions |
 
-Details, including every deliberate deviation from the language specification, are in
-[`TUTORIAL.md`](TUTORIAL.md).
+[`TUTORIAL.md`](TUTORIAL.md) documents the complete language, including every deliberate
+deviation from the specification.
 
 ## Performance
 
-Two engines, four tiers, one algorithm. Every number below comes from
-`docs/bench/compare.py` on one machine, with process startup measured and subtracted on
-each side -- a 20 ms native binary is mostly loader, and quoting the raw wall clock made C++
-look four times slower than it is.
+All figures are produced by `docs/bench/compare.py` on one machine, with process startup
+measured and subtracted for each engine. Each value is the minimum of eleven runs.
 
-`examples/quicksort_max.ax` is a quicksort tuned down to the instruction floor: 50 000
+`examples/quicksort_max.ax` is a quicksort reduced to a low instruction count: 50,000
 integers, Hoare partitioning with median-of-three by comparison, insertion sort below 20
-elements, recursing into the smaller side. `docs/bench/qs.cpp` is the same algorithm in C++
--- same generator, same threshold, same order -- and prints the same inversion counts, which
-is what makes the columns comparable rather than merely adjacent.
+elements, recursion into the smaller side. `docs/bench/qs.cpp` implements the same algorithm
+with the same generator, threshold and ordering, and prints identical inversion counts.
 
-| engine | time | vs CPython | vs C++ `-O2` |
-| --- | ---: | ---: | ---: |
-| ACVM, interpreter | 105.1 ms | 2.3× slower | 30× slower |
-| ACVM, `--jit` | 23.8 ms | 1.9× **faster** | 6.8× slower |
-| CPython 3.13 | 46.3 ms | — | 13× slower |
-| C++ `-O0` (clang) | 4.7 ms | 9.9× faster | 1.3× slower |
-| C++ `-O2` (clang) | 3.5 ms | 13× faster | — |
+| Engine | Time | vs CPython 3.13 | vs C++ `-O2` |
+|---|---:|---:|---:|
+| ACVM interpreter | 98.6 ms | 2.1× slower | 27× slower |
+| ACVM `--jit` | 22.4 ms | 2.1× faster | 6.2× slower |
+| CPython 3.13 | 46.6 ms | — | 13× slower |
+| C++ `-O0` (clang) | 4.3 ms | 11× faster | 1.2× slower |
+| C++ `-O2` (clang) | 3.6 ms | 13× faster | — |
 
-Run-to-run variation is 2–5% on this machine; treat the ratios as two significant figures.
+Run-to-run variation is 2–5%; ratios are accurate to two significant figures.
 
-Axiom's interpreter is within 2.3× of CPython on a pointer-heavy program, and the JIT takes
-it past CPython and to 5.1× off unoptimized C++. That last gap is the price of not
-having a native compiler: no inlining, no register allocation beyond a few pinned slots, and
-a call that still goes through one C++ frame per invocation.
+The interpreter is within 2.1× of CPython on a pointer-heavy program. `--jit` places it 2.1×
+ahead of CPython and 6.2× behind unoptimized C++. The remaining gap to C++ follows from
+absent inlining, from register allocation limited to a few pinned slots, and from a call that
+traverses one C++ frame per invocation.
 
-Against CPython the comparison by benchmark, on the same run:
+Per-benchmark comparison against CPython, same run:
 
-| benchmark | interpreter | `--jit` | CPython 3.13 | `--jit` vs CPython |
-| --- | ---: | ---: | ---: | ---: |
-| empty loop | 440 ms | 101 ms | 926 ms | 9.2× faster |
-| arithmetic | 496 ms | 26 ms | 446 ms | 17.2× faster |
-| array walk | 214 ms | 28 ms | 116 ms | 4.2× faster |
-| recursion (`fib 10` × 300 000) | 2852 ms | 1051 ms | 1886 ms | 1.8× faster |
+| Benchmark | Interpreter | `--jit` | CPython 3.13 | `--jit` vs CPython |
+|---|---:|---:|---:|---:|
+| empty loop | 426.9 ms | 99.5 ms | 938.1 ms | 9.4× faster |
+| arithmetic | 483.4 ms | 24.0 ms | 441.1 ms | 18.4× faster |
+| array walk | 208.3 ms | 26.6 ms | 117.2 ms | 4.4× faster |
+| recursion (`fib 10` × 300,000) | 2792.7 ms | 1028.0 ms | 1857.5 ms | 1.8× faster |
 
-The interpreter wins the bare loop and loses the rest. That is the honest shape: fused
-instructions cut a four-instruction loop body, and everything that touches memory or calls a
-function pays for a granularity the IR does not fuse. `docs/performance.md` has the analysis,
-the per-instruction costs, and the changes that were measured and thrown away.
+The interpreter is fastest only on the bare loop. Fusion reduces that loop body to four
+instructions; memory access and function calls pay for a dispatch granularity the IR does not
+eliminate. [`docs/performance.md`](docs/performance.md) contains the analysis, the
+per-instruction costs, and the changes that were measured and reverted.
 
-Two caveats worth stating rather than burying:
+Two qualifications apply to these tables:
 
-- **The JIT is not a like-for-like comparison.** CPython 3.13 has a specializing interpreter
-  and no compilation tier. Beating it with `--jit` says little; the interpreter row is the
-  one that measures the interpreter.
-- **Only one size is measured.** Axiom has no command-line argument mechanism, so the
-  example is fixed at its tuned 50 000. An earlier revision of this table had three sizes
-  and three different measurement methods behind them, which is worse than one size done
-  one way.
+- **`--jit` is not a like-for-like comparison.** CPython 3.13 is a specializing interpreter
+  with no compilation tier. Outperforming it with `--jit` measures the compiler, not the
+  interpreter; the interpreter column is the appropriate comparison between interpreters.
+- **One input size is measured.** Axiom has no command-line argument mechanism, so the
+  example runs at its tuned 50,000 elements. A previous revision reported three sizes
+  obtained by three different methods, which is less useful than one size measured
+  consistently.
 
-Run it yourself:
+Reproduce:
 
 ```bash
 ./docs/bench/compare.py path/to/acvm          # Axiom and CPython
-./docs/bench/compare.py path/to/acvm --build  # plus C++, compiled from docs/bench/qs.cpp
+./docs/bench/compare.py path/to/acvm --build  # also C++, compiled from docs/bench/qs.cpp
 ```
 
 ## The JIT
 
-`--jit` compiles whole functions to x86-64 and runs the result. There are no tiers and no
-profiling: a function is compiled the first time it is called, or refused, and a refusal
-is permanent because the reason is a property of the code rather than of the run.
+`--jit` compiles whole functions to x86-64 and executes them. There are no tiers and no
+profiling: a function is compiled on first call or refused, and a refusal is permanent because
+the cause is a property of the code rather than of the run.
 
 ```bash
 acvm run  prog.ax   --jit
 acvm exec prog.acvm --jit
 ```
 
-The same benchmarks as the table above, same run:
+Speedup relative to the interpreter, same run as the table above:
 
-| Program | Interpreter | `--jit` | |
-|---|---:|---:|---|
-| empty loop | 440 ms | 101 ms | 4.4× |
-| arithmetic | 496 ms | 26 ms | 19× |
-| array walk | 214 ms | 28 ms | 7.8× |
-| recursion (`fib 10` × 300 000) | 2852 ms | 1051 ms | 2.7× |
-| `examples/quicksort_max.ax` | 105 ms | 24 ms | 4.4× |
+| Program | Interpreter | `--jit` | Ratio |
+|---|---:|---:|---:|
+| empty loop | 426.9 ms | 99.5 ms | 4.3× |
+| arithmetic | 483.4 ms | 24.0 ms | 20.1× |
+| array walk | 208.3 ms | 26.6 ms | 7.8× |
+| recursion (`fib 10` × 300,000) | 2792.7 ms | 1028.0 ms | 2.7× |
+| `examples/quicksort_max.ax` | 98.6 ms | 22.4 ms | 4.4× |
 
-The spread is the whole story, and it is about **which functions get compiled** and **how
-much of the loop is arithmetic rather than calls**, not about how good the arithmetic is:
+The variation across benchmarks depends on which functions are compiled and on the ratio of
+arithmetic to calls within each loop, not on code quality.
 
-* **The entry function is compiled.** The interpreter only reached compiled code through
-  CALL, so `main` used to run interpreted however much arithmetic it did — and `main` is
-  where a tutorial, a test or a small tool puts its whole program. That row above was 1.0×
-  before.
-* **A function that only *prints* at the end is still compiled.** `print` is the
-  interpreter's, so the body is compiled up to the first instruction the lowering cannot
-  emit and execution hands the frame back there. Refusing the whole function for one
-  `print` kept most real programs out.
-* **`for i in 0..n` fuses its local accesses.** IRGen emits a local's address for every
-  store and for the generic load, so a range loop is `LOCAL_ADDR; SWAP; STORE` and
-  `LOCAL_ADDR; LOAD` pairs — 216 and 112 of them across `examples/`. Each was a bridge
-  call, a memType lookup and a 32 byte `Value`; now each is a single move.
-* **`buf[i]` is one instruction, in both tiers.** `GLOBAL_ADDR; LOAD_LOCAL; CONST size;
-  MUL; ADD; LOAD` plus the two bounds checks the front end emitted made one array element
-  cost eighteen instructions. `LOAD_GLOBAL_INDEXED` carries the index slot and the element
-  type, re-checks the bounds itself, and is lowered by the JIT as well, so the interpreter
-  and the compiler agree about what an out-of-range index does instead of the compiler
-  trusting a check it did not emit.
-* **A program that declares a `process` keeps its entry function interpreted.** Compiled
-  code cannot yield, and `main` finishing ends the run — so a compiled `main` never gave
-  the scheduler a turn and a worker process never ran at all (measured: a counter of 6
-  interpreted against 0 compiled). Callees stay compiled; the entry function does not.
+### Design decisions
 
-`examples/quicksort_max.ax` compiles all five of its functions, including the recursive
-partition. A call from compiled code is one bridge rather than three — the arguments stay in
-the caller's native slots, the frame is set up from those, and the result is written back to
-the caller's slot instead of being pushed onto the interpreter's value stack and popped again.
-That took the call benchmark from slower than the interpreter to 1.8× faster than CPython.
-What remains is one C++ call per invocation, which is why recursion gains least.
+**The entry function is compiled.** The interpreter reaches compiled code only through `CALL`,
+so `main` previously ran interpreted regardless of its content, and `main` is where small
+programs place their entire workload.
 
-**Compilation stops at the first instruction the interpreter owns.** A half-compiled body
-would have to flush every live register back to memory at the unsupported instruction and
-reload afterwards, which is where a JIT stops being simple and starts producing wrong
-answers at the edges. So when the lowering meets something it cannot emit, the body stops
-*there*: the frame goes back to the interpreter at the nearest instruction that starts with
-an empty expression stack, and the rest of the function runs interpreted. An empty stack is
-the only state that needs no translation -- a compiled body keeps operands in frame slots
-with no type tags, while the interpreter reads `process.stack`.
+**Compilation halts at the first instruction the interpreter owns.** A partially compiled body
+would have to spill every live register to memory at the unsupported instruction and reload
+afterwards, which is the point at which a baseline compiler begins producing incorrect results
+at the boundaries. Instead the body ends there: the frame returns to the interpreter at the
+nearest preceding instruction that begins with an empty expression stack, and the remainder of
+the function runs interpreted. An empty stack is the only state requiring no translation, since
+a compiled body holds operands in untagged frame slots while the interpreter reads
+`process.stack`.
 
-Each of those is a property of the code rather than unfinished work. What is left is the
-list below, and it is short because everything else became a hand-off point:
+**A program declaring a `process` keeps its entry function interpreted.** Compiled code cannot
+yield, and completion of `main` terminates the run, so a compiled `main` never yields to the
+scheduler and no worker process executes. Callees remain compiled.
 
-| Refusal | Why |
+### Lowered instructions
+
+String literals and aggregate copies are compiled. A string is a 16-byte `{ptr, len}`
+descriptor rather than a register value, so `string s = "hi";` emits `LOCAL_ADDR`, `MEM_ZERO`,
+`CONST_STR` and `MEM_COPY`. All four are lowered through three VM bridges
+(`constantString`, `zeroThroughPointer`, `copyThroughPointers`), which keeps them consistent
+with the interpreter about literal placement and slot extent.
+
+This affects more than it appears to. Compilation is all-or-nothing per function, so a single
+unused string literal previously caused the entire function to be refused:
+
+| 20,000,000-iteration loop | Interpreter | `--jit` |
+|---|---:|---:|
+| without a string | 2681 ms | 170 ms |
+| with one unused `string label = "...";` | 2676 ms | 165 ms |
+
+Before string lowering, the second row measured 2865 ms — 8% slower than the interpreter,
+because the tier paid to analyse a function it then refused. `tests/jit_string_check.ax`
+covers this, including a literal passed to an interpreted callee.
+
+Recursion and ordinary calls are compiled. Two defects previously obscured this, both now
+covered by `tests/jit_call_check.ax`: `!x` was lowered as a bitwise complement, so every
+negated condition took the wrong branch; and a safe point with call arguments already pushed
+yielded, after which the interpreter resumed from a value stack that did not contain them.
+
+Calls are covered in both directions. `tests/jit_mixed_call_check.ax` exercises a compiled
+function calling a refused one, mutual recursion, and arguments beyond the fourth, where the
+x64 ABI stops passing them in registers.
+
+### Refusals
+
+| Refusal | Cause |
 |---|---|
-| a struct returned by value | the caller supplies a destination slot |
-| a return value wider than a register | `int128` has no single-register form |
+| struct returned by value | the caller supplies a destination slot |
+| return value wider than a register | `int128` has no single-register form |
 | unsigned division | no single x86-64 instruction matches the interpreter's rules |
-| a `process` body | deliberate: compiled code cannot yield, so it could not be preempted |
-| needs the interpreter at the first instruction | the hand-off point is the function's first instruction, so compiling it would be a prologue and nothing else |
-| an indirect call (`CALL_INDIRECT`) | the target is a run-time value; see `Func<...>` below |
-| a frame wider than eight pages | the frame's pages are pinned at entry and addressed through a table; 800 KB of stack arrays does not fit |
+| `process` body | deliberate: compiled code cannot yield and therefore cannot be preempted |
+| interpreter needed at the first instruction | the hand-off point would be the function's first instruction, leaving only a prologue |
+| indirect call (`CALL_INDIRECT`) | the target is a run-time value |
+| frame wider than eight pages | frame pages are pinned at entry and addressed through a table |
 
-**String literals and aggregates are compiled.** A string is not a register value: it is a
-16 byte `{ptr, len}` descriptor, so `string s = "hi";` is four instructions --
-`LOCAL_ADDR`, `MEM_ZERO`, `CONST_STR`, `MEM_COPY`. All four are lowered, through three
-bridges that call into the VM (`constantString`, `zeroThroughPointer`,
-`copyThroughPointers`), which is what makes them agree with the interpreter about where a
-literal lives and how much of a slot it fills.
-
-This mattered more than it looks. Before it, one unused string literal refused the whole
-function, and compilation is all or nothing per function, so a hot loop with a leftover
-label ran interpreted end to end:
-
-| 20 000 000 iteration loop | Interpreter | `--jit` | |
-|---|---:|---:|---|
-| with no string | 2681 ms | 170 ms | 16× |
-| with one unused `string label = "...";` | 2676 ms | 165 ms | 16× |
-
-The second row was 2865 ms before the string was lowered -- the JIT made it 8% *slower*,
-because it paid to look at a function it then refused. `tests/jit_string_check.ax` holds
-this down, including the case where the literal crosses into an interpreted callee.
-
-Recursion and ordinary calls *are* compiled. Two bugs made that look false for a while,
-both now covered by `tests/jit_call_check.ax`: `!x` was lowered as a bitwise complement
-(so every negated condition took the wrong branch, and it was already wrong for leaf
-functions), and a safe point with call arguments already pushed yielded, after which the
-interpreter resumed from a value stack that did not have them.
-
-Calls work in both directions. `tests/jit_mixed_call_check.ax` holds down the one the other
-tests could not reach — a compiled function calling one that was refused — since every
-function in `jit_call_check.ax` compiles, so the "compiled into interpreted" boundary was
-never crossed. It also covers mutual recursion and arguments past the fourth, which is where
-the x64 ABI stops passing them in registers.
-
-Lowering the string opcodes exposed a third bug, this one in the stack-depth analysis rather
-than in the encoder: a call returning an aggregate was modelled as popping its destination
-and pushing nothing, when `Ret` pushes the result whatever its type. Every `T x = f();` with
-a struct or string therefore looked like it underflowed two instructions later, so the
-refusal named `MEM_COPY` -- which was fine -- instead of the aggregate return that was
-actually unsupported. Twelve test programs reported it that way. The message now names the
-real cause, and a misleading diagnostic is worth fixing on its own: it cost more time to
-find than the fix took.
-
-`--stats` reports what happened:
+`--stats` reports the outcome:
 
 ```
 jit: 4 compiled, 0 refused                                    (quicksort_max.ax)
 jit: 4 compiled, 1 refused (first refusal: in 'printRun': unsupported opcode BUILTIN)
 ```
 
-The refusal names the function and the instruction, so a function that quietly stayed
-interpreted can be recognised from a single run.
+`ACVM_JIT_DEBUG=1` reports every compilation decision, which identifies why a specific
+function remained interpreted.
 
-Under `--jit` the instruction count in `--stats` is not comparable to an interpreted run:
-a compiled body executes as one native block, so the count only covers what still ran as
-bytecode. Compare wall clock, not instructions.
+Under `--jit` the instruction count in `--stats` is not comparable to an interpreted run: a
+compiled body executes as one native block, so the count covers only the bytecode that ran.
+Wall-clock time is the measure to compare.
 
-The backend targets x86-64 with no run-time CPU probe, because a 64-bit x86 CPU lacking
-the handful of instructions used here does not exist. On any other architecture `--jit`
-is an error rather than a silent fallback, since a silent fallback reads as "the JIT made
-no difference" instead of "this platform has no JIT". The JIT tests are skipped on those
-hosts for the same reason: the encoder test calls the bytes it emits, and the differential
-tests would fail on the flag rather than on anything the programs do.
+### Backend and validation
 
-Correctness rests on differential testing: fourteen programs are run interpreted and then
-compiled, and the two outputs must match byte for byte (`tests/compare_jit.cmake`). A
-fifteenth test covers the encoder on its own, without the VM.
+The backend targets x86-64 without a run-time CPU probe. On any other architecture `--jit` is
+an error rather than a silent fallback, because a silent fallback is indistinguishable from a
+JIT that produced no improvement. The JIT tests are skipped on those hosts for the same reason.
 
-Two properties of those tests are worth spelling out, because both were wrong at first and
-both made the suite look stronger than it was:
+Correctness rests on differential testing: fourteen programs run interpreted and compiled, with
+byte-identical output required (`tests/compare_jit.cmake`). A fifteenth test covers the encoder
+in isolation.
 
-- **Agreeing is not passing.** A program whose own checks all fail exits non-zero in *both*
-  modes, so the two runs agree perfectly and a comparison-only test passes. The harness now
-  also requires the interpreted run to exit zero, which is what lets a failing assertion
-  fail the test. `EXPECT_RC` overrides it for a program meant to fail.
-- **A minimum compiled count.** A program where every function is refused still agrees with
-  the interpreter, so the tests written to exercise compiled code assert a floor on how many
-  functions were compiled. `jit_mixed_call_check.ax` pins the exact number, since one of its
+Two properties of the harness require emphasis, as both were initially absent and both made
+the suite appear stronger than it was:
+
+- **Matching output is insufficient.** A program whose assertions all fail exits non-zero in
+  both modes, so the runs agree and a comparison-only test passes. The harness also requires
+  the interpreted run to exit zero. `EXPECT_RC` overrides this for programs intended to fail.
+- **A minimum compiled count is asserted.** A program in which every function is refused still
+  matches the interpreter, so tests intended to exercise compiled code assert a floor on the
+  number of functions compiled. `jit_mixed_call_check.ax` pins an exact count, since one of its
   functions exists only to be refused.
 
 ## Function values: `Func<...>`
 
-A function can be stored, passed and called through a value:
+A function can be stored, passed and invoked through a value:
 
 ```axiom
 function import (return:(io));
@@ -383,32 +363,31 @@ function main():void {
 }
 ```
 
-The signature is written with the type-argument syntax generics already use — the return
-type first, so `Func<int, int, int>` is "returns int, takes two ints". `Func` is an ordinary
-identifier, not a keyword.
+The signature uses the type-argument syntax already used by generics, with the return type
+first, so `Func<int, int, int>` returns `int` and accepts two `int` arguments. `Func` is an
+ordinary identifier, not a keyword.
 
-**A function value is one word.** It is the callee's index plus one, and 0 means "never
-set", so calling one traps instead of calling whatever happens to be first in the module.
-There is no environment, because Axiom has no closures to capture one (spec Q99) — that is
-what keeps it a word, and why `sizeof(Func<int, int>)` is 8.
+**A function value is one word.** It holds the callee index plus one; zero denotes "never set",
+so invoking one traps rather than calling the module's first function. There is no
+environment, since Axiom has no closures to capture one (specification Q99), which is why
+`sizeof(Func<int, int>)` is 8.
 
-**Where a function name may appear as a value** is an initialiser, an assignment, an array
-element, a struct field, or an argument to a parameter of function type -- including a
-*generic* function's parameter, so `sortBy(points, n, byX)` infers `T` from the data and
-leaves the key's signature to be resolved after instantiation. Not a call site: type arguments
-are not spelled at calls (`f<int>(x)` parses as a comparison), so the *destination* is the
-only thing that can say which overload is meant — an ambiguous signature is a compile
-error, and so is one that matches nothing.
+**Positions accepting a function name as a value:** an initialiser, an assignment, an array
+element, a struct field, or an argument to a parameter of function type — including a generic
+function's parameter, so `sortBy(points, n, byX)` infers `T` from the data and resolves the key
+signature after instantiation. Not a call site: type arguments are not written at calls
+(`f<int>(x)` parses as a comparison), so only the destination can indicate which overload is
+intended. An ambiguous signature is a compile error, as is one matching nothing.
 
-**A compiled function never contains an indirect call.** `CALL_INDIRECT` makes the function
-a hand-off point for the JIT, so the function runs interpreted from there: the call graph
-stops being static, and everything built on that — inlining, dead-code elimination, the
-debugger's frame walk — would have to grow a run-time lookup. Keeping it out of compiled
-code keeps the compiled half static. In practice this bounds the loss: `algorithm`'s
-`sortBy` compiles, and only the comparison loop that calls the key does not.
+**A compiled function never contains an indirect call.** `CALL_INDIRECT` makes the function a
+hand-off point for the JIT, so it runs interpreted from there: the call graph ceases to be
+static, and everything derived from it — inlining, dead-code elimination, the debugger's frame
+walk — would require a run-time lookup. Excluding it from compiled code keeps the compiled
+portion static. The cost is bounded: `algorithm`'s `sortBy` compiles, and only the comparison
+loop that invokes the key does not.
 
-**A function value works everywhere a `Func` type can be written**, including a global, an
-array element and a struct field:
+**A function value is permitted wherever a `Func` type can be written**, including a global, an
+array element and a struct field. The following is a fragment, not a complete program:
 
 ```axiom
 Func<int, int> table[2] = {twice, square};   // a dispatch table
@@ -419,62 +398,67 @@ Cmd cmd = {"double", twice};
 print(cmd.run(21));                           // 42 -- a field, called as a method
 ```
 
-Globals were the last gap: file-scope initialisers were not type-checked at all, so a global
-`Func` was silently zeroed and `global int x = "hello";` compiled. Both are errors or work
-now, depending on which they should be; the check runs in its own pass, after every
-declaration is in scope, because `Func<int, int> h = serve;` may name a function defined
-further down the file.
+Globals were the final gap: file-scope initialisers were not type-checked, so a global `Func`
+was silently zeroed and `global int x = "hello";` compiled. Type checking now runs in a
+dedicated pass after every declaration is in scope, because `Func<int, int> h = serve;` may
+name a function declared later in the file.
 
-## Can it do anything real?
+## Standard library
 
-Yes — the standard library and the extra modules are written in Axiom and tested:
+The standard library and the extra modules are written in Axiom and tested.
 
-| Module | Contents |
+| Directory | Contents |
 |---|---|
-| `stdlib/` | `algorithm`, `map`, `hash`, `sync`, `time`, `str`, `set`, `vec`, plus `astl`, `random`, `test` |
+| `stdlib/` | `algorithm`, `map`, `hash`, `sync`, `time`, `str`, `set`, `vec`, `astl`, `random`, `test` |
 | `extralib/` | `json`, `xml`, `yaml`, `toml`, `ini`, `csv`, `http`, `net`, `inflate`, `sha256`, `glob`, `cli`, `value` |
 
-Three of them changed shape once `Func<...>` existed, because each had a hole that only a
-function value could fill:
+Three modules changed shape once `Func<...>` existed, each having a gap that only a function
+value could close:
 
-| Module | What was impossible, and is not now |
+| Module | Previously impossible |
 |---|---|
-| `algorithm` | `sortBy(ptr T, int, Func<int, T>)` orders structs by one field, stably. `sort()` cannot: it knows only the built-in rules, so struct sorting had to be hand-written. Also `minByIndex` / `maxByIndex`, and the predicate family `findIf` / `findLastIf` / `countIf` / `anyOf` / `allOf` / `noneOf`. |
-| `test` | `testCase(name, body)` registers a case; `testRunAll()` runs the table. A test file no longer ends in a hand-maintained call list, where adding a group meant editing two places. |
-| `cli` | `cliDispatch(a, names, handlers, n, fallback)` matches `cliCommand(a)` against a name table and calls the handler. The if-chain was fine; forgetting to add a branch was not. |
+| `algorithm` | `sortBy(ptr T, int, Func<int, T>)` orders structs by one field, stably. `sort()` knows only the built-in rules, so struct sorting had to be written by hand. Also `minByIndex`/`maxByIndex` and the predicate family `findIf`/`findLastIf`/`countIf`/`anyOf`/`allOf`/`noneOf`. |
+| `test` | `testCase(name, body)` registers a case; `testRunAll()` runs the table. A test file no longer ends in a hand-maintained call list where adding a group required editing two places. |
+| `cli` | `cliDispatch(a, names, handlers, n, fallback)` matches `cliCommand(a)` against a name table and invokes the handler. |
 
-`io` gained `readWholeFile` and `readLineList`, which are not about `Func` at all: every
-parser in `extralib` takes a `string`, and the only way to get one from a file was to guess
-a buffer size -- with `readTextFile` refusing rather than truncating, which made the guess a
-limit on which files a program could open.
+`io` gained `readWholeFile` and `readLineList`, unrelated to `Func`: every parser in
+`extralib` takes a `string`, and the only way to obtain one from a file was to guess a buffer
+size. With `readTextFile` refusing rather than truncating, that guess bounded which files a
+program could open.
 
-`extralib/xml.ax` is an XML parser in pure Axiom. `extralib/inflate.ax` is a DEFLATE
-decoder. `extralib/http.ax` is an HTTP/1.1 client with chunked decoding. Each declares its
-identity and version:
+`extralib/xml.ax` is an XML parser written in Axiom, `extralib/inflate.ax` a DEFLATE decoder,
+and `extralib/http.ax` an HTTP/1.1 client with chunked decoding. Each declares its identity and
+version in a declaration that must match the file name:
 
-```axiom
+```text
 module "json" version "0.1.0";
 ```
 
-## Tests
+## Testing
 
 ```bash
 ctest --test-dir build --output-on-failure
 ```
 
-114 tests. Three kinds matter:
+128 tests. Four categories:
 
-- **`*_check.ax` programs** that assert and report pass/fail, so a failure names the
-  behaviour rather than a byte offset.
-- **Differential tests** that run each script at `-O0`, `-O3` and `-O4` and require
-  byte-identical output. Single-level tests cannot catch an optimizer that computes the
-  wrong answer only after folding — the run at `-O0` succeeds and hides it.
-- **Diagnostic tests** that require the compiler to *reject* a program with a specific
-  message, because a silently accepted program that should have been an error is the
-  failure mode that costs the most.
+- **`*_check.ax` programs** assert and report pass/fail, so a failure names a behaviour rather
+  than a byte offset.
+- **Differential tests** run each script at `-O0`, `-O3` and `-O4` and require byte-identical
+  output. Single-level tests cannot detect an optimizer that computes a wrong result only
+  after folding, because the `-O0` run succeeds and conceals it.
+- **JIT differential tests** run each program interpreted and compiled and require identical
+  output, with a floor on the compiled function count.
+- **Diagnostic tests** require the compiler to reject a program with a specific message,
+  because a silently accepted program that should have been an error is the most costly
+  failure mode.
 
-`tools/verify_tutorial.py` extracts every complete program from `TUTORIAL.md`, runs it,
-and compares the output against what the document claims.
+`tools/verify_tutorial.py` extracts every complete program from `TUTORIAL.md`, executes it, and
+compares the output against the document.
+
+```bash
+python tools/verify_tutorial.py
+```
 
 ## Repository layout
 
@@ -485,38 +469,36 @@ stdlib/       Standard library (.ax), native declarations (.axd), C sources (.c)
 extralib/     Modules built on the standard library
 tests/        Script tests, C++ unit tests, differential harnesses, fixtures
 examples/     Runnable programs
+docs/         Performance analysis and the benchmark harness
 tools/        verify_tutorial.py and the acvm wrapper
 editors/      A TextMate grammar for syntax highlighting, and sample files
-brand/        The logo as SVG, for anyone who needs it at another size
-.gitattributes  Line endings, and telling GitHub that .ax/.axd are Axiom
+brand/        The logo as SVG
 ```
 
 ## Status and known limitations
 
-The implementation follows the Axiom language specification, with a deliberate and
-documented list of deviations.
-The ones most likely to be noticed:
+The implementation follows the Axiom language specification with a documented list of
+deviations. The most significant:
 
-- `vector T` is not implemented; `vec.ax` provides an equivalent container instead.
-- `intN` is signed, so `int127` tops out at 2^126−1. `int128` is supported as an
-  extension so the specification's own example is valid. `unsigned int128` is refused:
-  its maximum does not fit the VM's signed 128-bit cell.
-- `doubleA.B` is accepted syntactically but stored as binary64.
-- Aggregate `<` is rejected. `==` / `!=` compare storage bytes.
-- The JIT (`--jit`) compiles a subset. String literals, aggregate copies, `GLOBAL_ADDR`,
-  `TRAP` and the fused array load are lowered; builtins, global *variable* access, library
-  calls and indirect calls are hand-off points, so a function is compiled up to the first of
-  them and interpreted from there. A function whose *first* instruction needs the interpreter
-  is refused instead, since compiling a prologue and handing straight back costs more than it
-  saves. The interpreter is always the fallback and always the definition of correct
-  behaviour -- which is why a new fused instruction is a change to *both* tiers: the JIT has
-  to be taught it, or a compiled loop silently loses the fusion and runs interpreted.
-- `--jit` is turned off while `--adb` is attached: compiled code has no instruction-level
-  address mapping, so a breakpoint inside it could not stop anything.
-- A program that declares a `process` keeps its *entry function* interpreted, because
-  compiled code cannot yield and `main` finishing ends the run.
+- `vector T` is not implemented; `vec.ax` provides an equivalent container.
+- `intN` is signed, so `int127` reaches 2^126−1. `int128` is supported as an extension so the
+  specification's own example is valid. `unsigned int128` is refused because its maximum does
+  not fit the VM's signed 128-bit cell.
+- `doubleA.B` parses but is stored as binary64.
+- Aggregate `<` is rejected. `==` and `!=` compare storage bytes.
+- The JIT compiles a subset. String literals, aggregate copies, `GLOBAL_ADDR`, `TRAP` and the
+  fused array load are lowered; builtins, global variable access, library calls and indirect
+  calls are hand-off points, so a function is compiled up to the first of these and interpreted
+  from there. A function whose first instruction requires the interpreter is refused. The
+  interpreter is the fallback and the definition of correct behaviour, which means a new fused
+  instruction is a change to both tiers: if the JIT is not taught it, a compiled loop silently
+  loses the fusion and runs interpreted.
+- `--jit` is disabled while `--adb` is attached: compiled code has no instruction-level address
+  mapping, so a breakpoint inside it cannot stop execution.
+- A program declaring a `process` keeps its entry function interpreted, because compiled code
+  cannot yield and completion of `main` terminates the run.
 
-Not implemented at all: tagged variants (`union` + automatic tag + `match`), operator
+Not implemented: tagged variants (`union` with an automatic tag and `match`), operator
 overloading, and constraints on generic type parameters (`T: Comparable`).
 
 ## License
