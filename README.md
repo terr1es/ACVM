@@ -187,33 +187,35 @@ traverses one C++ frame per invocation.
 
 Per-benchmark comparison against CPython, same run:
 
-| Benchmark | Interpreter | `--jit` | CPython 3.13 | Interpreter vs CPython |
+| Benchmark | Interpreter | `--jit` | CPython 3.13 | `--jit` vs CPython |
 |---|---:|---:|---:|---:|
-| empty loop | 427.2 ms | 94.3 ms | 849.0 ms | 2.0× faster |
-| integer arithmetic | 451.9 ms | 23.4 ms | 408.4 ms | 1.1× slower |
-| branch-dense | 809.8 ms | 130.8 ms | 641.1 ms | 1.3× slower |
-| array walk | 111.3 ms | 24.8 ms | 112.0 ms | 1.0× slower |
-| string search | 442.4 ms | 60.5 ms | 42.8 ms | 10.3× slower |
-| hash set | 1253.1 ms | 680.6 ms | 37.5 ms | 33× slower |
-| double accumulation | 232.2 ms | 233.5 ms | 143.4 ms | 1.6× slower |
-| recursion (`fib 10` × 300,000) | 2507.0 ms | 948.7 ms | 1733.1 ms | 1.4× slower |
+| empty loop | 397.3 ms | 98.0 ms | 890.8 ms | 9.1× faster |
+| integer arithmetic | 495.4 ms | 26.3 ms | 453.3 ms | 17.3× faster |
+| branch-dense | 890.9 ms | 140.3 ms | 735.3 ms | 5.2× faster |
+| array walk | 118.6 ms | 24.0 ms | 125.3 ms | 5.2× faster |
+| string search | 486.9 ms | 53.8 ms | 41.2 ms | 1.3× slower |
+| hash set | 102.3 ms | 101.9 ms | 36.4 ms | 2.8× slower |
+| double accumulation | 240.3 ms | 21.9 ms | 145.9 ms | 6.7× faster |
+| recursion (`fib 10` × 300,000) | 2686.0 ms | 992.1 ms | 1805.2 ms | 1.8× faster |
+| quicksort (50,000 ints) | 97.6 ms | 15.9 ms | 41.4 ms | 2.6× faster |
 
-The comparison column is the interpreter against CPython, since those are the tiers that
-correspond. `--jit` is a compilation tier and CPython has none; see the note below.
+Seven of the nine are faster than CPython under `--jit`. The two that are not are both cases
+where the work per operation is a language boundary crossing rather than arithmetic, and the
+reasons are worth separating because they are different:
 
-The shape is uneven by design of the tiers rather than by accident, and the two ends of it are
-worth naming:
+- **String search, 1.3× slower.** The search itself is compiled; what is not is the byte load
+  behind `text[i]`. `LOAD` takes its address from the stack, so the address is a run-time value,
+  and the JIT cannot inline it: the page table in a compiled frame holds only the pages pinned
+  at entry -- the function's own frame -- while a string's bytes live wherever they were
+  allocated. Inlining that walk was tried and crashed on the first program with a heap string.
+  Each character, then, is one bridge call.
+- **Hash set, 2.8× slower.** The table is C now, and the C part takes 13 ms of the 102; the
+  other 89 is three boundary crossings per operation: the Axiom wrapper's call, the `s->handle`
+  read (another `LOAD`, same reason as above), and the native call itself. Measured against a
+  bare native call in a loop, the crossings are 85% of the time.
 
-- **Fusion carries the tight loops.** `LOAD_GLOBAL_INDEXED` makes an array read one dispatch
-  instead of thirteen, which is why the array walk went from 1.8× behind CPython to parity, and
-  why `--jit` gains least there -- it was already lowering that instruction.
-- **Anything written in Axiom and called per element pays for it.** The hash containers have no
-  C half, so one lookup is about 370 bytecodes; CPython's `set` is C. `double` is the other
-  end: the JIT refuses any function whose scalars are not integers or pointers, so
-  `--jit` reports 233.5 ms against the interpreter's 232.2 ms -- not a slow path, an absent
-  one.
-
-Memory access and function calls pay for a dispatch granularity the IR does not eliminate. [`docs/performance.md`](docs/performance.md) contains the analysis, the
+Both are consequences of one design decision -- that VM memory is paged and separately
+allocated, so native code cannot walk it -- rather than of the tiers being slow. [`docs/performance.md`](docs/performance.md) contains the analysis, the
 per-instruction costs, and the changes that were measured and reverted.
 
 Two qualifications apply to these tables:
@@ -503,10 +505,13 @@ deviations. The most significant:
   not fit the VM's signed 128-bit cell.
 - `doubleA.B` parses but is stored as binary64.
 - Aggregate `<` is rejected. `==` and `!=` compare storage bytes.
-- The JIT compiles a subset. String literals, aggregate copies, `GLOBAL_ADDR`, `TRAP` and the
-  fused array load are lowered; builtins, global variable access, library calls and indirect
-  calls are hand-off points, so a function is compiled up to the first of these and interpreted
-  from there. A function whose first instruction requires the interpreter is refused. The
+- The JIT compiles a subset. String literals, aggregate copies, `GLOBAL_ADDR`, `TRAP`, the
+  fused array load and scalar `double` arithmetic are lowered; builtins, global variable
+  access, library calls and indirect calls are hand-off points, so a function is compiled up to
+  the first of these and interpreted from there. Scalar `double` covers load, store, add,
+  subtract, multiply, divide, compare and conversion in both directions -- before it existed
+  any function containing a float literal was refused outright, because the literal is usually
+  the first instruction and a refusal at the first instruction refuses the function. A function whose first instruction requires the interpreter is refused. The
   interpreter is the fallback and the definition of correct behaviour, which means a new fused
   instruction is a change to both tiers: if the JIT is not taught it, a compiled loop silently
   loses the fusion and runs interpreted.
