@@ -1201,9 +1201,16 @@ bool VM::prepare(const Module& module, std::string& error) {
 bool VM::startProcess(Process& process, const Function* entry, std::uint64_t stackBase,
                       std::uint64_t arenaBase) {
     process.frames.clear();
+    // The frame array is allocated once, at full depth, and never grows. A `std::vector` would
+    // reallocate as the stack grew, and a reallocation moves the array -- which generated code
+    // is addressing by pointer. 240 KB per process buys a call stack whose address does not
+    // move, which is the precondition for inlining a frame push.
+    if (process.frames.slots == nullptr) {
+        process.frameStorage = std::make_unique<Frame[]>(kMaxCallDepth);
+        process.frames.slots = process.frameStorage.get();
+    }
     process.stack.clear();
     process.stack.reserve(4096);
-    process.frames.reserve(256);
     process.arenaMarks.clear();
     process.stackBase = stackBase;
     process.stackTop = stackBase;

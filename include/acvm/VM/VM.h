@@ -5,7 +5,9 @@
 #include "acvm/VM/Jit.h"
 #include "acvm/VM/DebugApi.h"
 
+#include <cassert>
 #include <cstdint>
+#include <memory>
 #include <iosfwd>
 #include <string>
 #include <vector>
@@ -234,8 +236,49 @@ private:
         }
     };
 
+    /// The call stack, in a layout generated code can address.
+    ///
+    /// Two fields at fixed offsets from the start of `Process`, and nothing else: generated
+    /// code pushes and pops frames inline, which means it has to know where the array is and
+    /// how long it is without asking. Putting them in their own standard-layout struct at
+    /// offset 0 is what makes the offsets 0 and 8 rather than something that depends on the
+    /// rest of `Process`.
+    ///
+    /// **Not a `std::vector`.** A vector reallocates, and a reallocation would move the array
+    /// out from under a `Frame*` the interpreter is holding across a compiled call. The
+    /// capacity is `kMaxCallDepth` from the start -- 10 000 frames of 24 bytes is 240 KB per
+    /// process, paid once.
+    struct FrameStackView {
+        Frame* slots = nullptr;
+        std::size_t count = 0;
+
+        // The interface the rest of the VM already used, so that replacing the vector did not
+        // mean touching thirty call sites. `reserve` is the only one that does not translate:
+        // the array is allocated at full depth up front, which is the point.
+        [[nodiscard]] std::size_t size() const { return count; }
+        [[nodiscard]] bool empty() const { return count == 0; }
+        Frame& back() { return slots[count - 1]; }
+        const Frame& back() const { return slots[count - 1]; }
+        Frame& front() { return slots[0]; }
+        const Frame& front() const { return slots[0]; }
+        Frame& operator[](std::size_t index) { return slots[index]; }
+        const Frame& operator[](std::size_t index) const { return slots[index]; }
+        void pop_back() { --count; }
+        void push_back(const Frame& frame) {
+            // Every caller checks `size() >= kMaxCallDepth` first, and the array is that long;
+            // an assertion here is the backstop for a future caller that does not.
+            assert(count < kMaxCallDepth && "frame stack overflow");
+            slots[count++] = frame;
+        }
+        void clear() { count = 0; }
+    };
+
     struct Process {
-        std::vector<Frame> frames;
+        /// Offset 0, so generated code can address it: see `jitbridge::kFramesOffset`.
+        FrameStackView frames;
+        /// Owns the array `frames.slots` points at. After `frames` so the view's offsets stay
+        /// fixed whatever this is.
+        std::unique_ptr<Frame[]> frameStorage;
         std::vector<Value> stack;
         std::uint64_t stackTop = 0;
         std::uint64_t stackBase = 0;
