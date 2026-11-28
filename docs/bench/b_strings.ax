@@ -1,0 +1,32 @@
+function import (return:(io));
+
+//  Naive substring search, written as user-level code on both sides.
+//
+//  The point is to measure the language, not a library: `findFrom` in stdlib is a library
+//  implementation, and comparing an Axiom library call against CPython's `str.find` -- which
+//  is C -- would measure the standard libraries rather than the execution tiers.
+function findSub(string text, string sub, int textLen, int subLen):int {
+    for (int i = 0; i + subLen <= textLen; i++) {
+        int j = 0;
+        while (j < subLen && text[i + j] == sub[j]) {
+            j++;
+        }
+        if (j == subLen) { return i; }
+    }
+    return -1;
+    eof: pass;
+}
+
+function main():void {
+    string text = "the quick brown fox jumps over the lazy dog 0123456789 the quick brown fox jumps over the lazy dog 0123456789 the quick brown fox jumps over the lazy dog 0123456789 the quick brown fox jumps over the lazy dog 0123456789";
+    string needle = "lazy dog";
+    int textLen = text.length;
+    int subLen = needle.length;
+    int acc = 0;
+    for (int r = 0; r < 20000; r++) {
+        int at = findSub(text, needle, textLen, subLen);
+        acc = acc + at;
+    }
+    print(acc); print("\n");
+    eof: pass;
+}

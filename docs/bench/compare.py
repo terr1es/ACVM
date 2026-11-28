@@ -59,7 +59,11 @@ BENCHMARKS = [
     # name, Axiom source, CPython source
     ("empty", "b_empty.ax", "p_empty.py"),
     ("arith", "b_arith.ax", "p_arith.py"),
+    ("branch", "b_branch.ax", "p_branch.py"),
     ("array", "b_array.ax", "p_array.py"),
+    ("strings", "b_strings.ax", "p_strings.py"),
+    ("hashmap", "b_hashmap.ax", "p_hashmap.py"),
+    ("double", "b_double.ax", "p_double.py"),
     ("calls", "b_calls.ax", "p_calls.py"),
     ("quicksort", None, "qs.py"),  # None: use the real example, not a copy
 ]

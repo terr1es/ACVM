@@ -1,0 +1,12 @@
+function import (return:(io));
+
+//  Double-precision accumulation. `double` is binary64, the same format CPython's `float`
+//  uses, so the two totals must agree bit for bit rather than merely closely.
+function main():void {
+    double acc = 0.0;
+    for (int i = 0; i < 2000000; i++) {
+        acc = acc + (i as double) * 0.5 - 1.25;
+    }
+    print(acc); print("\n");
+    eof: pass;
+}

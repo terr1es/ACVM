@@ -1,0 +1,21 @@
+function import (return:(io));
+function import (return:(hash));
+
+//  Insert and look up, the operation CPython's dict is most optimised for.
+//
+//  Axiom's container is `stdlib/hash.ax` -- open addressing with linear probing, written in
+//  Axiom. CPython's `set` is written in C. That asymmetry is unavoidable and is the point of
+//  the measurement: it is the comparison a program actually faces.
+function main():void {
+    HashSetInt s = makeHashSetInt(4096);
+    for (int i = 0; i < 200000; i++) {
+        hashSetIntAdd(#s, i * 7);
+    }
+    int hits = 0;
+    for (int i = 0; i < 200000; i++) {
+        if (hashSetIntContains(#s, i * 7)) { hits++; }
+    }
+    print(hits); print("\n");
+    hashSetIntFree(#s);
+    eof: pass;
+}
