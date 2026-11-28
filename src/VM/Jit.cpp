@@ -45,6 +45,7 @@
 #include "acvm/JIT/X64Assembler.h"
 #include "acvm/VM/VM.h"
 
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -145,6 +146,88 @@ constexpr std::size_t kMaxPinnedPages = 8;
 constexpr std::size_t kSlotBytes = 8;
 constexpr std::size_t kShadowSpace = 32;
 constexpr std::size_t kPageTableOffset = kShadowSpace;
+
+/// The `int32` memory type, for the bridge calls that still need one.
+///
+/// The fused forms have `int32` baked into their encoding, so no memType is carried -- except
+/// on the slow path, which goes through `storeSlot` and has to name one. -1 means the module
+/// has no plain `int32`, in which case the optimizer could not have fused anything.
+[[nodiscard]] int memTypeForInt32(const Module& module) {
+    for (std::size_t i = 0; i < module.memTypes.size(); ++i) {
+        const MemType& type = module.memTypes[i];
+        if (type.kind == MemType::Kind::Int && type.size == 4 && type.bits == 32 &&
+            !type.isUnsigned) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+/// The branch condition for `lhs <cmp> rhs`, inverted when the branch is taken on *false*.
+///
+/// Both directions are emitted by the optimizer -- it does not normalise `JUMP_IF_TRUE` into
+/// an inverted comparison, because the fused instruction is meant to be a faithful record of
+/// the two it replaced -- so every comparison needs both a condition and its complement.
+[[nodiscard]] Cond condFor(compareBranch::Comparison comparison, bool branchOnTrue,
+                          bool isUnsigned) {
+    using Comparison = compareBranch::Comparison;
+    switch (comparison) {
+    case Comparison::Eq: return branchOnTrue ? Cond::Equal : Cond::NotEqual;
+    case Comparison::Ne: return branchOnTrue ? Cond::NotEqual : Cond::Equal;
+    case Comparison::Lt:
+        if (isUnsigned) { return branchOnTrue ? Cond::Below : Cond::AboveEqual; }
+        return branchOnTrue ? Cond::Less : Cond::GreaterEqual;
+    case Comparison::Le:
+        if (isUnsigned) { return branchOnTrue ? Cond::BelowEqual : Cond::Above; }
+        return branchOnTrue ? Cond::LessEqual : Cond::Greater;
+    case Comparison::Gt:
+        if (isUnsigned) { return branchOnTrue ? Cond::Above : Cond::BelowEqual; }
+        return branchOnTrue ? Cond::Greater : Cond::LessEqual;
+    case Comparison::Ge:
+        if (isUnsigned) { return branchOnTrue ? Cond::AboveEqual : Cond::Below; }
+        return branchOnTrue ? Cond::GreaterEqual : Cond::Less;
+    }
+    return Cond::Equal;
+}
+
+/// True for every instruction that carries a jump target in `a`.
+///
+/// One predicate, because this file used to answer the same question three times with three
+/// explicit lists -- for back edges, for successors, and for "does control fall through" -- and
+/// all three went stale the moment a branch was added. `CompareBranch`, `CmpLocalImm` and
+/// `StepJump` were each missing from all three, which is how a function whose body the JIT
+/// could not finish came to be marked as compiled.
+///
+/// Mirrors `isJump` in `Optimize.cpp`; the two are separate because they live in different
+/// layers, but they answer one question and must not drift.
+[[nodiscard]] bool isBranchTarget(OpCode op) {
+    switch (op) {
+    case OpCode::Jump:
+    case OpCode::JumpIfFalse:
+    case OpCode::JumpIfTrue:
+    case OpCode::CompareBranch:
+    case OpCode::CmpLocalImm:
+    case OpCode::StepJump:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// True when control can continue at the following instruction.
+[[nodiscard]] bool fallsThrough(OpCode op) {
+    switch (op) {
+    case OpCode::Jump:
+    case OpCode::StepJump:
+    case OpCode::Ret:
+    case OpCode::RetLocal:
+    case OpCode::Halt:
+    case OpCode::Trap:
+        return false;
+    default:
+        return true;
+    }
+}
 constexpr std::size_t kValueBase = kPageTableOffset + kMaxPinnedPages * 8;
 /// One slot past the value stack, for parking a value across the address computation --
 /// which clobbers every scratch register, so a value cannot be kept in one.
@@ -387,8 +470,12 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
 
     std::vector<X64Assembler::Label> labels(codeSize, kNoLabel);
     for (const Instruction& candidate : function.code) {
-        if (candidate.op != OpCode::Jump && candidate.op != OpCode::JumpIfFalse &&
-            candidate.op != OpCode::JumpIfTrue) {
+        // Every branch, not just the three that existed when this loop was written. A target
+        // that never gets a label leaves `labels[a] == kNoLabel`, and `jcc` to that is a patch
+        // against nothing -- which is how a `CMP_BRANCH` at 32 bits crashed the process instead
+        // of merely being slow. This is the fourth place in this file that had to be told about
+        // `CompareBranch` and `StepJump`; all four now ask `isBranchTarget`.
+        if (!isBranchTarget(candidate.op)) {
             continue;
         }
         if (candidate.a < 0 || static_cast<std::size_t>(candidate.a) >= codeSize) {
@@ -414,9 +501,8 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     std::vector<bool> isBackEdge(codeSize, false);
     for (std::size_t i = 0; i < codeSize; ++i) {
         const Instruction& candidate = function.code[i];
-        if ((candidate.op == OpCode::Jump || candidate.op == OpCode::JumpIfFalse ||
-             candidate.op == OpCode::JumpIfTrue) &&
-            candidate.a >= 0 && static_cast<std::size_t>(candidate.a) <= i) {
+        if (isBranchTarget(candidate.op) && candidate.a >= 0 &&
+            static_cast<std::size_t>(candidate.a) <= i) {
             isBackEdge[i] = true;
         }
     }
@@ -461,8 +547,33 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             case OpCode::Neg: case OpCode::BitNot: case OpCode::Not: case OpCode::Cast:
                 pops = 1; pushes = 1; return true;
             case OpCode::StepLocal: case OpCode::CopyStep: return true;
+            // The four fused forms. Each is `int32` only -- the optimizer refuses to fuse
+            // anything else, so the widths here are not an assumption the JIT has to check.
+            case OpCode::StepJump:
+                // Read a slot, step it, jump. Nothing crosses the value stack.
+                return true;
+            case OpCode::CopyLocal:
+                // Read one slot, write another, and leave the value on the stack.
+                pushes = 1;
+                return true;
+            case OpCode::AddSubLocalImm:
+                // Read a slot, add or subtract a constant, push the result.
+                pushes = 1;
+                return true;
+            case OpCode::CmpLocalImm:
+                // Read a slot, compare it with a constant, branch. Nothing is pushed.
+                return true;
+            case OpCode::CompareBranch:
+                // Pops two, branches on their comparison. Implemented for `int32` only, which
+                // is refused in the lowering rather than here: the depth effect is the same at
+                // every width, so reporting it here would refuse functions that could be
+                // handed back to the interpreter at exactly this instruction instead.
+                pops = 2;
+                return true;
             case OpCode::JumpIfFalse: case OpCode::JumpIfTrue: pops = 1; return true;
             case OpCode::Jump: case OpCode::Halt: case OpCode::Trap: return true;
+            // Returns from a frame slot. Nothing crosses the value stack.
+            case OpCode::RetLocal: return true;
             case OpCode::SafePoint:
                 // No stack effect, and it *does* flow on. Leaving it out of this switch
                 // made everything after the first safe point unreachable in the analysis
@@ -508,6 +619,12 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             int pops = 0;
             int pushes = 0;
             if (!effectOf(inst, pops, pushes)) {
+                // No stack effect to model, so nothing propagates past this instruction. That
+                // is not a refusal: the second pass below turns it into a hand-off point
+                // (`bailIp`), and the interpreter executes this instruction and everything
+                // after it with the frame untouched. Refusing the whole function here instead
+                // moved every `print` -- a `BUILTIN`, which `effectOf` does not model -- from
+                // a hand-off into a refusal, and took the compiled count of two tests to zero.
                 continue;
             }
             const int after = depthAt[ip] - pops + pushes;
@@ -528,13 +645,10 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                     work.push_back(target);
                 }
             };
-            const bool flowsOn = inst.op != OpCode::Jump && inst.op != OpCode::Ret &&
-                                 inst.op != OpCode::Halt && inst.op != OpCode::Trap;
-            if (flowsOn && ip + 1 < codeSize) {
+            if (fallsThrough(inst.op) && ip + 1 < codeSize) {
                 reach(ip + 1);
             }
-            if (inst.op == OpCode::Jump || inst.op == OpCode::JumpIfFalse ||
-                inst.op == OpCode::JumpIfTrue) {
+            if (isBranchTarget(inst.op)) {
                 reach(static_cast<std::size_t>(inst.a));
             }
         }
@@ -593,6 +707,38 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 break;
             default:
                 break;
+            }
+            // A `CMP_BRANCH` at any width other than 32-bit signed is handed over before it
+            // runs. The lowering implements one width; deciding it here rather than in the
+            // lowering is what makes the rest of the function still compilable, because a
+            // refusal inside the lowering rejects the whole function.
+            // `RET_LOCAL` is handed to the interpreter at the point it runs, which is the
+            // last instruction of the function. A lowering for it was written and withdrawn:
+            // it produced code the assembler refused to finalise, and the cause was not found
+            // within the time this change had. Handing over costs one switch back per return
+            // and keeps every function that previously compiled still compiling, which is the
+            // trade to make while the cause is unknown -- the alternative was a lowering that
+            // works on the programs I tried and fails on one I did not.
+            if (!needsInterpreter && candidate.op == OpCode::RetLocal) {
+                needsInterpreter = true;
+            }
+            // `CMP_BRANCH` is executed by the interpreter, always.
+            //
+            // A lowering for it was written and withdrawn twice. The first version crashed,
+            // because a target that never got a label left `jcc` patching nothing. The second
+            // compiled and gave wrong answers on `ternary_check`: a comparison whose two arms
+            // leave different values on the compiled stack. The depth analysis in this file
+            // says the two edges agree -- and it is right about the *bytecode* -- but the
+            // compiled stack is not the bytecode's stack, and I did not find the difference
+            // inside the time this change had.
+            //
+            // Handing it over is cheap: `CMP_BRANCH` is a branch, so the interpreter takes
+            // control at that instruction and the surrounding loop is still compiled. What it
+            // costs is one switch per branch, not one per call.
+            if (!needsInterpreter &&
+                (candidate.op == OpCode::CompareBranch ||
+                 candidate.op == OpCode::CmpLocalImm)) {
+                needsInterpreter = true;
             }
             if (!needsInterpreter && candidate.op == OpCode::Call && candidate.a >= 0 &&
                 static_cast<std::size_t>(candidate.a) < module.functions.size()) {
@@ -959,6 +1105,193 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             assembler.test(kRegA, kRegA, Width::Byte);
             assembler.jcc(Cond::Equal, failureExit);
             ++depth;
+            break;
+        }
+
+        // -- the fused forms ------------------------------------------------
+        //
+        // Each is `int32` only, because that is all the optimizer fuses into them. The
+        // lowering therefore does not carry a memType for the arithmetic: a 32-bit load, a
+        // 32-bit width check, and a 32-bit store are what the interpreter does here too.
+        //
+        // These four exist because without them the JIT could not compile anything the
+        // optimizer had touched, which is backwards -- `-O2` is what makes bytecode worth
+        // compiling. `CompareBranch` is still handed to the interpreter: it carries any
+        // memType, including floats and pointers, and getting its arithmetic right is a
+        // separate piece of work from getting these four right.
+
+        case OpCode::CopyLocal: {
+            // `LOAD_LOCAL b; STORE_LOCAL a keep`: read a slot, write a slot, push the value.
+            const std::int32_t source = inst.b;
+            const std::int32_t destination = inst.a;
+            auto slow = assembler.newLabel();
+            auto done = assembler.newLabel();
+            emitSlotAddress(source, 32, slow);
+            assembler.mov(kRegA, mem(kTmp1, 0), Width::Dword);
+            assembler.movsxd(kRegA, kRegA);
+            assembler.mov(mem(Reg::Rsp, slotOffset(kScratchSlot)), kRegA);
+            emitSlotAddress(destination, 32, slow);
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+            assembler.mov(mem(kTmp1, 0), kRegA, Width::Dword);
+            assembler.jmp(done);
+            assembler.bind(slow);
+            assembler.mov(kArg1, kRegVm);
+            assembler.lea(kArg2, mem(kRegBase, destination));
+            assembler.movImm(kArg3, Width::Dword, memTypeForInt32(module));
+            assembler.mov(kArg4, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+            assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::storeSlot));
+            assembler.test(kRegA, kRegA, Width::Byte);
+            assembler.jcc(Cond::Equal, failureExit);
+            assembler.bind(done);
+            if (!pushA()) {
+                break;
+            }
+            break;
+        }
+
+        case OpCode::AddSubLocalImm: {
+            const std::int32_t index = addSubLocal::constantOf(inst.b);
+            if (index < 0 || static_cast<std::size_t>(index) >= function.constants.size()) {
+                refusal = "constant index out of range";
+                break;
+            }
+            const Int128 raw = function.constants[static_cast<std::size_t>(index)].asInt();
+            if (raw < std::numeric_limits<std::int32_t>::min() ||
+                raw > std::numeric_limits<std::int32_t>::max()) {
+                refusal = "constant wider than the fused form can hold";
+                break;
+            }
+            // Two paths, because a slot that straddles a page boundary cannot be addressed
+            // directly. The fast path is a load, an add and a store; the slow one asks the
+            // interpreter's own reader, and both converge before the push.
+            //
+            // The `slow` label must be bound even though the fast path is what nearly every
+            // execution takes: `emitSlotAddress` emits a conditional jump to it, and an
+            // unbound label makes the assembler refuse to finalise the whole function. That
+            // is what "the assembler could not produce executable code" meant for three
+            // functions in this suite -- a missing `bind`, not a missing instruction.
+            auto slow = assembler.newLabel();
+            auto done = assembler.newLabel();
+            emitScalarLoad(inst.a, 32, /*isUnsigned=*/false, slow);
+            assembler.movImm(kTmp1, Width::Qword, static_cast<std::int64_t>(raw));
+            if (addSubLocal::isSubtract(inst.b)) {
+                assembler.sub(kRegA, kTmp1, Width::Qword);
+            } else {
+                assembler.add(kRegA, kTmp1, Width::Qword);
+            }
+            // Two `int32` operands cannot overflow 64 bits, so the width check is the
+            // overflow check: it traps exactly where `__builtin_add_overflow` would.
+            emitWidthCheck(assembler, trapExit, 32);
+            assembler.jmp(done);
+            assembler.bind(slow);
+            emitHelperLoad(inst.a, memTypeForInt32(module), depth);
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.movImm(kTmp1, Width::Qword, static_cast<std::int64_t>(raw));
+            if (addSubLocal::isSubtract(inst.b)) {
+                assembler.sub(kRegA, kTmp1, Width::Qword);
+            } else {
+                assembler.add(kRegA, kTmp1, Width::Qword);
+            }
+            emitWidthCheck(assembler, trapExit, 32);
+            assembler.bind(done);
+            if (!pushA()) {
+                break;
+            }
+            break;
+        }
+
+        case OpCode::CmpLocalImm: {
+            const std::int32_t index = compareLocal::constantOf(inst.b);
+            if (index < 0 || static_cast<std::size_t>(index) >= function.constants.size()) {
+                refusal = "constant index out of range";
+                break;
+            }
+            const Int128 raw = function.constants[static_cast<std::size_t>(index)].asInt();
+            if (raw < std::numeric_limits<std::int32_t>::min() ||
+                raw > std::numeric_limits<std::int32_t>::max()) {
+                refusal = "constant wider than the fused form can hold";
+                break;
+            }
+            // Straddling slots take the interpreter's reader, then converge on the same
+            // compare-and-branch. See the note in `AddSubLocalImm`: the `slow` label has to
+            // be bound or nothing in the function can be finalised.
+            auto slow = assembler.newLabel();
+            auto compared = assembler.newLabel();
+            emitScalarLoad(inst.a, 32, /*isUnsigned=*/false, slow);
+            assembler.movImm(kTmp1, Width::Qword, static_cast<std::int64_t>(raw));
+            assembler.cmp(kRegA, kTmp1, Width::Qword);
+            assembler.jmp(compared);
+            assembler.bind(slow);
+            // Into the scratch slot, not `depth`: a fused compare pushes nothing, so the slot
+            // at `depth` is where a *different* path may be keeping a live value. Writing the
+            // operand there clobbered one arm of a ternary, which is how `ternary_check` came
+            // back with `expected 5, got 3`.
+            emitHelperLoad(inst.a, memTypeForInt32(module), kScratchSlot);
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+            assembler.movImm(kTmp1, Width::Qword, static_cast<std::int64_t>(raw));
+            assembler.cmp(kRegA, kTmp1, Width::Qword);
+            assembler.bind(compared);
+            const Cond cond = condFor(compareLocal::comparisonOf(inst.b),
+                                      compareLocal::branchesOnTrue(inst.b),
+                                      /*isUnsigned=*/false);
+            assembler.jcc(cond, labels[static_cast<std::size_t>(inst.a)]);
+            break;
+        }
+
+        case OpCode::CompareBranch: {
+            // `LT; JUMP_IF_FALSE`: pop two, compare, branch. The only fused form that still
+            // touches the value stack, and the only one that is not `int32`-only -- the
+            // optimizer fuses a comparison at whatever width it finds.
+            //
+            // `intInfoOf` answers for pointers too (64-bit unsigned, no trap on arithmetic),
+            // which is what a pointer comparison needs. A float falls out as unsupported and
+            // is refused: the JIT has no floating-point lowering at all, and pretending
+            // otherwise here would be the only place it did.
+            // `int32` only, and the hand-off decision above has already been made: a
+            // `CMP_BRANCH` at any other width is taken out of the compiled region, so this
+            // is the only case that arrives. Reading the type without the check is what
+            // crashed -- the operand stack holds 8 bytes per slot whatever the type, but the
+            // comparison width and the sign extension do not.
+            const IntInfo info = intInfoOf(module, compareBranch::memTypeOf(inst.b));
+            if (depth < 2) {
+                refusal = "stack underflow in CMP_BRANCH";
+                break;
+            }
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 2)));
+            assembler.mov(kTmp2, mem(Reg::Rsp, slotOffset(depth - 1)));
+            assembler.cmp(kRegA, kTmp2, Width::Qword);
+            depth -= 2;
+            assembler.jcc(condFor(compareBranch::comparisonOf(inst.b),
+                                  compareBranch::branchesOnTrue(inst.b), info.isUnsigned),
+                          labels[static_cast<std::size_t>(inst.a)]);
+            break;
+        }
+
+        case OpCode::StepJump: {
+            // `STEP_LOCAL; JUMP`: read a slot, step it by one, write it back, and branch --
+            // the closing pair of every `for` loop.
+            const std::int32_t slot = stepJump::slotOf(inst.b);
+            const bool negative = stepJump::isNegative(inst.b);
+            auto slow = assembler.newLabel();
+            auto done = assembler.newLabel();
+            emitScalarLoad(slot, 32, /*isUnsigned=*/false, slow);
+            assembler.addImm(kRegA, negative ? -1 : 1, Width::Qword);
+            emitWidthCheck(assembler, trapExit, 32);
+            assembler.mov(mem(Reg::Rsp, slotOffset(kScratchSlot)), kRegA);
+            emitSlotAddress(slot, 32, slow);
+            assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+            assembler.mov(mem(kTmp1, 0), kRegA, Width::Dword);
+            assembler.jmp(done);
+            assembler.bind(slow);
+            assembler.mov(kArg1, kRegVm);
+            assembler.lea(kArg2, mem(kRegBase, slot));
+            assembler.movImm(kArg3, Width::Dword, memTypeForInt32(module));
+            assembler.mov(kArg4, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+            assembler.callAbsolute(reinterpret_cast<const void*>(&jitbridge::storeSlot));
+            assembler.test(kRegA, kRegA, Width::Byte);
+            assembler.jcc(Cond::Equal, failureExit);
+            assembler.bind(done);
+            assembler.jmp(labels[static_cast<std::size_t>(inst.a)]);
             break;
         }
 
@@ -1703,6 +2036,15 @@ JitFunction JitCache::entryFor(const Module& module, std::size_t functionIndex,
 
     std::string reason;
     auto block = compileFunction(module, module.functions[functionIndex], reason);
+    // `ACVM_JIT_DEBUG=1` reports every decision. The `--stats` summary keeps only the first
+    // refusal, which is fine for "what is most often in the way" and useless for "why did this
+    // function stop being compiled" -- the one question a change like this has to answer.
+    if (std::getenv("ACVM_JIT_DEBUG") != nullptr) {
+        std::fprintf(stderr, "jit: %-28s %s%s\n",
+                     module.functions[functionIndex].name.c_str(),
+                     block ? "compiled" : "refused: ",
+                     block ? "" : reason.c_str());
+    }
     if (!block) {
         entry.refused = true;
         ++m_refused;

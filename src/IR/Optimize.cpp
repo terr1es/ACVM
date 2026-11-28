@@ -57,7 +57,8 @@ bool isJump(OpCode op) {
 /// True when control does not fall through to the next instruction. `Trap`
 /// counts: the VM never returns from it.
 bool endsBlock(OpCode op) {
-    return op == OpCode::Jump || op == OpCode::Ret || op == OpCode::Halt || op == OpCode::Trap;
+    return op == OpCode::Jump || op == OpCode::Ret || op == OpCode::RetLocal ||
+           op == OpCode::Halt || op == OpCode::Trap;
 }
 
 /// Instructions that can observe or change machine state beyond the value stack.
@@ -289,15 +290,14 @@ int forwardReturnSlot(Function& fn) {
         }
 
         // The fall-through predecessor.
-        const auto isPlainStoreToZero = [&fn](const Instruction& ins) {
+        const auto isPlainStoreToZero = [](const Instruction& ins) {
             return ins.op == OpCode::StoreLocal && ins.a == 0 && (ins.b & 0x100) == 0;
         };
         if (!isPlainStoreToZero(fn.code[i - 1])) {
             continue;
         }
 
-        // Every jump that lands on the load, each with a store right before it.
-        std::vector<std::size_t> stores{i - 1};
+        // Every jump that lands on the load must arrive from a store to the same slot.
         bool everyEdgeStores = true;
         for (std::size_t j = 0; j < n && everyEdgeStores; ++j) {
             if (!isJump(fn.code[j].op) || fn.code[j].a < 0 ||
@@ -308,19 +308,20 @@ int forwardReturnSlot(Function& fn) {
                 everyEdgeStores = false;
                 break;
             }
-            stores.push_back(j - 1);
         }
         if (!everyEdgeStores) {
             continue;
         }
 
-        for (const std::size_t store : stores) {
-            fn.code[store].b |= 0x100;
-        }
+        // The epilogue becomes one instruction that reads the slot and returns. The stores
+        // are left exactly as they were: no keep bit, nothing on the value stack, no second
+        // meaning for the JIT to reconstruct.
+        fn.code[i] = Instruction{OpCode::RetLocal, 0, 0};
+        drop[i + 1] = 1;
         if (const char* dbg = std::getenv("ACVM_DEBUG_RET")) {
             (void)dbg;
-            std::fprintf(stderr, "forwardReturnSlot: %s epilogue at %zu, %zu store(s)\n",
-                         fn.name.c_str(), i, stores.size());
+            std::fprintf(stderr, "forwardReturnSlot: %s epilogue at %zu\n",
+                         fn.name.c_str(), i);
             for (std::size_t j = 0; j < n; ++j) {
                 if (isJump(fn.code[j].op) && fn.code[j].a >= 0 &&
                     static_cast<std::size_t>(fn.code[j].a) == i) {
@@ -329,11 +330,17 @@ int forwardReturnSlot(Function& fn) {
                 }
             }
         }
-        drop[i] = 1;
         changes += 1;
     }
 
-    return changes > 0 ? compact(fn, drop) : 0;
+    const std::size_t before = fn.code.size();
+    const int removed = changes > 0 ? compact(fn, drop) : 0;
+    if (std::getenv("ACVM_DEBUG_RET")) {
+        std::fprintf(stderr, "  compact: %zu -> %zu (removed %d), last op %d\n", before,
+                     fn.code.size(), removed,
+                     fn.code.empty() ? -1 : static_cast<int>(fn.code.back().op));
+    }
+    return removed;
 }
 
 int removeUnreachable(Function& fn) {
@@ -1590,7 +1597,7 @@ void optimizeFunction(Function& fn, const Module& module, OptLevel level, Optimi
         }
 
         int forwarded = 0;
-        const int returned = 0;  // disabled: see the note on the function
+        const int returned = forwardReturnSlot(fn);
         stats.peepholes += returned;
         changes += returned;
 

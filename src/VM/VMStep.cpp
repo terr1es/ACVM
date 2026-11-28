@@ -1272,6 +1272,25 @@ VM::Step VM::step(Process& process, std::string& error) {
                 break;
             }
 
+            case OpCode::RetLocal: {
+                // `LOAD_LOCAL slot; RET` in one. The value comes out of the frame, so nothing
+                // has to be on the value stack when the epilogue is reached.
+                Value result;
+                if (!loadScalar(baseAddress + static_cast<std::uint64_t>(inst.a),
+                                function.returnMemType, result)) {
+                    return fail(TrapKind::Unreachable, "invalid return slot");
+                }
+                const std::uint64_t callerBase = frame.base;
+                process.frames.pop_back();
+                process.stackTop = callerBase;
+                process.stack.push_back(result);
+                if (process.frames.empty()) {
+                    return Step::Finished;
+                }
+                reload = true;
+                break;
+            }
+
             case OpCode::Ret: {
                 const bool hasResult = function.returnsValue;
                 // The result is already on top of the value stack, because the callee's last

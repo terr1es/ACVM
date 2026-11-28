@@ -156,6 +156,9 @@ void formatInstruction(const Module& module, const Function& function, std::size
             << inst.a;
         break;
     }
+    case OpCode::RetLocal:
+        out << "frame+" << inst.a;
+        break;
     case OpCode::StepJump:
         out << "frame+" << stepJump::slotOf(inst.b) << ' '
             << memTypeText(module, stepJump::memTypeOf(inst.b)) << ' '

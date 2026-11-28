@@ -186,6 +186,23 @@ enum class OpCode : std::uint8_t {
     /// second instruction. A separate `AddLocalImm` would cost a jump-table slot to save a
     /// shift.
     AddSubLocalImm,
+
+    /// `LOAD_LOCAL slot; RET` -- return the value in a frame slot.
+    ///
+    /// Every function that returns a scalar ends by storing into the return slot, jumping to
+    /// one shared epilogue, and having that epilogue load the slot back so `RET` can take the
+    /// value off the value stack. The load exists only because `RET` reads the stack; the
+    /// epilogue is shared, so the value has to get back there somehow.
+    ///
+    /// The first attempt at removing it set the store's *keep* bit instead, which is
+    /// equivalent in the interpreter and ambiguous to the JIT: the compiled code models the
+    /// value stack separately, and a store that both writes a slot and leaves a value behind
+    /// is one thing to the interpreter and two to a translator. This is the same optimisation
+    /// without that ambiguity -- one instruction, one meaning, and nothing left on the stack.
+    ///
+    /// `a` is the frame offset. Appended at the end of the enum for the reason given above
+    /// `Pow`.
+    RetLocal,
 };
 
 enum class TrapKind : std::int32_t {
