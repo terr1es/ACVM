@@ -306,15 +306,14 @@ left operand. Worth 5–12% depending on the benchmark.
 ## The JIT after the comparison fix
 
 The JIT used to be slower than the interpreter on every benchmark in this file, which made it
-a demonstration rather than a tier. It is not any more: it beats the interpreter everywhere
-except `array`, where the loop reads a global and is handed back to the interpreter.
+a demonstration rather than a tier. It now beats CPython 3.13 on all four.
 
 | benchmark | interpreter | `--jit` | vs CPython 3.13 |
 |---|---|---|---|
-| `empty` | 0.457 s | 0.122 s | 10.7× faster |
-| `arith` | 0.501 s | 0.042 s | 19.1× faster |
-| `array` | 0.312 s | 0.314 s | unchanged (1.5× faster than CPython either way) |
-| `calls` | 3.251 s | 2.702 s | 1.22× slower |
+| `empty` | 0.410 s | 0.109 s | 10.4× faster |
+| `arith` | 0.461 s | 0.037 s | 18.1× faster |
+| `array` | 0.281 s | 0.041 s | 9.5× faster |
+| `calls` | 2.940 s | 1.893 s | 1.04× faster |
 
 Three causes, and only one of them was a missing lowering.
 
