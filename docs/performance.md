@@ -33,7 +33,7 @@ interpreters with no compilation tier:
 |---|---|---|---|
 | `empty` | 0.443 s | 0.941 s | 2.12× **faster** |
 | `arith` | 0.524 s | 0.473 s | 1.11× slower |
-| `array` | 0.298 s | 0.115 s | 2.59× slower |
+| `array` | 0.277 s | 0.117 s | 2.41× slower |
 | `calls` | 2.602 s | 1.784 s | 1.46× slower |
 | `quicksort` | 0.095 s | 0.036 s | 2.64× slower |
 
@@ -45,11 +45,11 @@ With the JIT on, which is not a like-for-like comparison and should not be read 
 
 | benchmark | interpreter | `--jit` | vs CPython |
 |---|---|---|---|
-| `empty` | 0.443 s | 0.099 s | 9.50× faster |
-| `arith` | 0.524 s | 0.026 s | 18.24× faster |
-| `array` | 0.298 s | 0.030 s | 3.88× faster |
-| `calls` | 2.602 s | 1.007 s | 1.77× faster |
-| `quicksort` | 0.095 s | 0.019 s | 1.94× faster |
+| `empty` | 0.397 s | 0.096 s | 8.94× faster |
+| `arith` | 0.461 s | 0.023 s | 18.51× faster |
+| `array` | 0.277 s | 0.031 s | 3.82× faster |
+| `calls` | 2.615 s | 0.973 s | 1.84× faster |
+| `quicksort` | 0.095 s | 0.023 s | 1.84× faster |
 
 The two columns describe different things. CPython 3.13 has a specializing interpreter and no
 JIT; Axiom has an ordinary interpreter and an optional compiler. Beating CPython with
@@ -59,6 +59,66 @@ the first table.
 `quicksort` is the one benchmark here that is a program rather than a loop -- 50 000 integers
 through an insertion-sorted, median-of-three Hoare quicksort. It is worth reading as the answer
 to "how much faster in practice": 1.94× with the JIT, not the 9-18× the tight loops show.
+
+### Why `array` loses by the most
+
+2.41× behind CPython on the interpreter, and the largest deficit in the suite. It is not one slow
+instruction -- `LOAD_LOCAL` has a resident-page fast path, `CMP_LOCAL_IMM` is four instructions,
+`GLOBAL_ADDR` is a bounds check and an add. It is the instruction count per element.
+
+One `buf[i]` read is 18 bytecode instructions:
+
+    STORE_LOCAL   idx, i64       ; stage the index in a 64-bit slot
+    CONST_INT     0              ; lower bound
+    CMP_BRANCH    i64 <          ; bounds check
+    TRAP
+    LOAD_LOCAL    idx
+    CONST_INT     1000           ; upper bound
+    CMP_BRANCH    i64 >=         ; bounds check
+    TRAP
+    GLOBAL_ADDR   buf
+    LOAD_LOCAL    idx
+    CONST_INT     4              ; element size
+    MUL           i64
+    ADD           ptr
+    LOAD          i32
+
+Twelve of those eighteen are address computation and bounds checking; four are the two constant
+loads alone. CPython executes the same expression as one `BINARY_OP` with the list, its length
+and its element pointer already in registers.
+
+So the gap is not implementation quality, it is granularity: on a bare loop Axiom's fused forms
+get the body down to four instructions and it wins 2.1×; on array access the IR has no fused form
+and the machine is being asked to do in twelve instructions what CPython does in one.
+
+Measured per-instruction cost in this suite, which is what says the interpreter core is not the
+problem:
+
+| benchmark | instructions | ns per instruction |
+|---|---|---|
+| `empty` | 100 000 006 | 4.17 |
+| `arith` | 70 000 010 | 6.79 |
+| `array` | 36 026 013 | 8.00 |
+
+The array loop's instructions cost twice the empty loop's, and the difference is `LOAD`, which
+still goes through the general `loadScalar` -- a switch over width and kind, a `memcpy`, a mask, a
+sign extension -- plus a 32-byte `Value` push. The empty loop touches none of that.
+
+Two things were tried here:
+
+  * **Loading straight into the stack slot** instead of into a local that is then copied in.
+    32-byte move saved per read. Worth 3.5%. Kept. The first version appended the slot before the
+    load and returned on failure, which left a value on the stack that the bytecode did not
+    account for -- the array benchmark trapped with "stack underflow in an arithmetic
+    instruction". A failed instruction must not have already changed the stack.
+  * **Fusing `GLOBAL_ADDR; LOAD_LOCAL; CONST; MUL; ADD` into an indexed load.** Not done. It is
+    the change that would matter -- it is what CPython has and what Axiom's `CMP_LOCAL_IMM`
+    already is for comparisons -- and it is a new IR instruction plus a bounds-check elision,
+    which is a piece of work rather than a tweak.
+
+`--jit` is 3.8× ahead on the same benchmark, because compiled code does the address arithmetic in
+registers and the bounds checks are already hoisted. That gap between 2.41× behind and 3.8× ahead
+is the clearest statement of where the interpreter's ceiling is.
 
 ### A correction
 

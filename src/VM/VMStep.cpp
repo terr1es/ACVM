@@ -825,11 +825,20 @@ VM::Step VM::step(Process& process, std::string& error) {
                 if (address.asPtr() == 0) {
                     return fail(TrapKind::NullPointer, "load through a null pointer");
                 }
+                // Loaded straight into the stack slot it belongs in, rather than into a local
+                // that is then copied in -- a second 32 byte move per array read, for a value
+                // that is usually four bytes wide.
+                //
+                // The slot is appended *after* the load succeeds. Appending it first and
+                // returning on failure leaves a default-constructed value on the stack, and a
+                // trap that resumes sees a stack one deeper than the bytecode says: that is
+                // what produced "stack underflow in an arithmetic instruction" on the array
+                // benchmark when this was written the other way round.
                 Value value;
                 if (!loadScalar(address.asPtr(), inst.a, value)) {
                     return fail(TrapKind::Unreachable, "invalid memory type in LOAD");
                 }
-                pushValue(value);
+                pushValue(std::move(value));
                 continue;
             }
 
