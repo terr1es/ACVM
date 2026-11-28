@@ -1,0 +1,144 @@
+//  string_index_check.ax — `s[i]` is a byte, and character access is a named call.
+//
+//  What this pins down is the end of a bug that was silent in three directions at once.
+//  `s[i]` used to stride two bytes (UTF-16 code units) over storage that is UTF-8, while
+//  the bounds check compared against the string's byte length -- so `"1+1+1"[0]` was
+//  0x2B31, which is '+' stacked on '1' and printed as `⬱`; `"1+1+1"[4]` read three bytes
+//  past the end of the allocation; and `s[0] = 'X'` wrote two bytes over one, zeroing the
+//  following character and turning "ABCDE" into "X CDE".
+//
+//  So there are three separate claims here:
+//
+//    * a byte index returns that byte, value 0..255, never a 16-bit window;
+//    * a byte >= 0x80 comes back as a positive number, not sign extended;
+//    * `s[i] == 'a'` works, which is the reason `s[i]` returns `char` at all.
+//
+//  Assignment through `s[i]` is rejected at compile time; that is a diagnostic test, in
+//  `check_string_index_assign.cmake`, because a program that does not compile cannot
+//  assert anything about itself.
+//
+//  `charAt` and `codePointAt` are here too: they are the character-level half of the same
+//  decision, and their contract -- decode, or say why you cannot -- is what makes the
+//  byte/character split honest instead of a gap.
+
+function import (return:(str));
+function import (return:(strbyte));
+function import (return:(test));
+
+// ─── bytes ────────────────────────────────────────────────────────────────
+
+function private checkAsciiBytes():void {
+    testGroup("ascii bytes");
+
+    string e = "1+1+1";
+    checkInt(e.length, 5, "five bytes");
+    checkInt(e[0] as int, 49, "byte 0 is '1'");
+    checkInt(e[1] as int, 43, "byte 1 is '+'");
+    checkInt(e[2] as int, 49, "byte 2 is '1'");
+    checkInt(e[3] as int, 43, "byte 3 is '+'");
+    checkInt(e[4] as int, 49, "byte 4 is '1'");
+
+    // The comparison that the whole `char` return type exists for. Before the fix this
+    // compiled and was false, because `e[1]` was 0x2B31 rather than '+'.
+    check(e[0] == '1', "byte compares equal to a char literal");
+    check(e[1] == '+', "the operator byte compares equal to '+'");
+    check(!(e[1] == '-'), "and is not the other operator");
+
+    // Every byte agrees with the explicit byte view, which is what makes `s[i]` a
+    // shorthand for `strByteAt` rather than a second, subtly different thing.
+    bool agree = true;
+    for (int i = 0; i < e.length; i++) {
+        if ((e[i] as int) != strByteAt(e, i)) {
+            agree = false;
+        }
+    }
+    check(agree, "s[i] matches strByteAt for every index");
+    eof: pass;
+}
+
+function private checkMultibyteBytes():void {
+    testGroup("utf-8 bytes");
+
+    // "中文" is E4 B8 AD E6 96 87. A byte index reports those bytes; it does not try to
+    // report characters, which is the whole point of keeping the two apart.
+    string z = "中文";
+    checkInt(z.length, 6, "six bytes for two characters");
+    checkInt(z[0] as int, 0xE4, "first lead byte");
+    checkInt(z[1] as int, 0xB8, "first continuation byte");
+    checkInt(z[2] as int, 0xAD, "last byte of the first character");
+    checkInt(z[3] as int, 0xE6, "second lead byte");
+    checkInt(z[4] as int, 0x96, "continuation");
+    checkInt(z[5] as int, 0x87, "last byte");
+
+    // 0xE4 is 228 unsigned. If the load ever sign extended, this would be -28, and a
+    // reader comparing bytes against lead-byte patterns would classify the character
+    // wrong without anything looking broken.
+    check(z[0] as int > 0, "a byte above 0x7F is not sign extended");
+    checkInt(z[0] as int, 228, "0xE4 reads as 228");
+
+    // A four byte character: F0 9F 98 80.
+    string grin = "😀";
+    checkInt(grin.length, 4, "four bytes for one emoji");
+    checkInt(grin[0] as int, 0xF0, "emoji lead byte");
+    checkInt(grin[3] as int, 0x80, "emoji last byte");
+    eof: pass;
+}
+
+function private checkEmptyAndSingle():void {
+    testGroup("edges");
+
+    string one = "a";
+    checkInt(one.length, 1, "one byte");
+    checkInt(one[0] as int, 97, "the only byte");
+
+    string empty = "";
+    checkInt(empty.length, 0, "empty string has no bytes");
+    eof: pass;
+}
+
+// ─── characters ───────────────────────────────────────────────────────────
+
+function private checkCodePoints():void {
+    testGroup("code points");
+
+    checkInt(codePointAt("a", 0), 97, "ascii");
+    checkInt(codePointAt("中", 0), 0x4E2D, "two byte character");
+    checkInt(codePointAt("😀", 0), 0x1F600, "four byte character, outside the BMP");
+
+    // Character indices, not byte offsets: "a中b" is three characters and five bytes.
+    string mixed = "a中b";
+    checkInt(mixed.length, 5, "five bytes");
+    checkInt(codePointAt(mixed, 0), 97, "char 0 of a mixed string");
+    checkInt(codePointAt(mixed, 1), 0x4E2D, "char 1, past a one byte character");
+    checkInt(codePointAt(mixed, 2), 98, "char 2, past a three byte character");
+
+    // Out of range is -1 rather than a trap, so a caller can probe without dying.
+    checkInt(codePointAt(mixed, 3), -1, "one past the last character");
+    checkInt(codePointAt(mixed, 99), -1, "far out of range");
+    checkInt(codePointAt(mixed, -1), -1, "negative index");
+    checkInt(codePointAt("", 0), -1, "empty string");
+    eof: pass;
+}
+
+function private checkCharAt():void {
+    testGroup("charAt");
+
+    check(charAt("hello", 0) == 'h', "first character");
+    check(charAt("hello", 4) == 'o', "last character");
+    check(charAt("中", 0) == '\u4E2D', "character past its byte encoding");
+    check(charAt("a中b", 1) == '\u4E2D', "character index, not byte offset");
+
+    // charAt and codePointAt must agree whenever the character fits in a char.
+    checkInt(charAt("中文", 1) as int, codePointAt("中文", 1), "the two agree on a BMP char");
+    eof: pass;
+}
+
+function main():void {
+    checkAsciiBytes();
+    checkMultibyteBytes();
+    checkEmptyAndSingle();
+    checkCodePoints();
+    checkCharAt();
+    testFinish();
+    eof: pass;
+}

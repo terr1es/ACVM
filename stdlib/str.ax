@@ -24,9 +24,11 @@
 //  1. **`length` counts bytes; `substring` slices bytes.** `"a中b".length` is 5, not 3, so
 //     character work goes through `Utf8*`, which finds boundaries by UTF-8 leading byte.
 //
-//  2. **`s[i]` does not work.** It indexes UTF-16 code units while the storage is UTF-8
-//     bytes, so `"hello"[0]` gives mojibake. This module never uses
-//     it: everything goes through `substring` / `indexOf` and the byte view in `strbyte`.
+//  2. **`s[i]` is a byte, not a character.** It gives the byte at offset `i` as a `char`
+//     in 0..255, and it cannot be assigned to. So `"hello"[0]` is `'h'`, but `"中"[0]`
+//     is `0xE4` -- the first byte of that character's UTF-8 encoding, not the character.
+//     Character access is `charAt` / `codePointAt` below. This module's own text work
+//     goes through `substring` / `indexOf` and the byte view in `strbyte`.
 //
 //  ── arena ────────────────────────────────────────────────────────────────
 //
@@ -413,6 +415,80 @@ function utf8ByteOffset(string s, int charIndex):int {
         }
     }
     return s.length;
+    eof: pass;
+}
+
+//  The Unicode code point of the `charIndex`-th character, or -1 when the index is out
+//  of range or the bytes there are not a well formed UTF-8 sequence.
+//
+//  Unlike `utf8CharCount`, this decodes: `codePointAt("中", 0)` is `0x4E2D`, and
+//  `codePointAt("😀", 0)` is `0x1F600` -- a value `char` cannot hold, which is why this
+//  returns `int` and `charAt` refuses it rather than truncating.
+//
+//  O(n) in the byte offset, because UTF-8 is variable width: a character cannot be
+//  located without walking the ones in front of it. That cost is why this is a named
+//  call and not what `s[i]` does.
+function codePointAt(string s, int charIndex):int {
+    if (charIndex < 0) {
+        return -1;
+    }
+    int at = utf8ByteOffset(s, charIndex);
+    if (at >= s.length) {
+        return -1;
+    }
+    int lead = strByteAt(s, at);
+    if (lead < 0x80) {
+        return lead;
+    }
+    //  How many continuation bytes the leading byte announces, and the low bits it
+    //  already carries.
+    int extra = 0;
+    int code = 0;
+    if ((lead & 0xE0) == 0xC0) {
+        extra = 1;
+        code = lead & 0x1F;
+    } else if ((lead & 0xF0) == 0xE0) {
+        extra = 2;
+        code = lead & 0x0F;
+    } else if ((lead & 0xF8) == 0xF0) {
+        extra = 3;
+        code = lead & 0x07;
+    } else {
+        return -1;   // a continuation byte where a lead belongs, or 0xF8..0xFF
+    }
+    if (at + extra >= s.length) {
+        return -1;   // the sequence is cut off by the end of the string
+    }
+    for (int k = 1; k <= extra; k++) {
+        int cont = strByteAt(s, at + k);
+        if ((cont & 0xC0) != 0x80) {
+            return -1;   // a lead where a continuation belongs
+        }
+        code = (code << 6) | (cont & 0x3F);
+    }
+    return code;
+    eof: pass;
+}
+
+//  The `charIndex`-th character as a `char`.
+//
+//  A `char` is one UTF-16 code unit, so a character outside the BMP -- an emoji, most of
+//  the CJK extension planes -- does not fit. This traps instead of truncating: a
+//  truncated code point is a *different valid character*, and nothing downstream could
+//  tell that it was not the one in the source. Use `codePointAt` for text that may
+//  contain them.
+function charAt(string s, int charIndex):char {
+    int code = codePointAt(s, charIndex);
+    if (code < 0) {
+        eprint("charAt: no character at index " + itoa(charIndex, 10) + "\n");
+        trap();
+    }
+    if (code > 0xFFFF) {
+        eprint("charAt: U+" + itoa(code, 16) + " is outside the BMP and does not fit in a "
+               + "char (one UTF-16 code unit); use codePointAt\n");
+        trap();
+    }
+    return code as char;
     eof: pass;
 }
 

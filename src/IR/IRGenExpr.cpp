@@ -259,10 +259,13 @@ void IRGen::emitAddress(Expr& expr) {
             m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(baseSlot));
             m_fn->emit(OpCode::Load, ptrMemType());
             m_fn->emit(OpCode::Load, ptrMemType());
+            // Stride 1, because a string is UTF-8 and `length` counts bytes. The stride
+            // used to be 2 -- UTF-16 code units -- while the bounds check above and the
+            // stored length were both in bytes, so index 0 read the first two bytes, the
+            // check let `s[4]` through on a five byte string, and the whole thing drifted
+            // one byte per index until it ran off the allocation.
             m_fn->emit(OpCode::LocalAddr, static_cast<std::int32_t>(indexSlot));
             m_fn->emit(OpCode::Load, int64MemType());
-            emitConstInt(2);
-            m_fn->emit(OpCode::Mul, int64MemType());
             m_fn->emit(OpCode::Add, ptrMemType());
             return;
         }
@@ -782,6 +785,25 @@ void IRGen::emitExpr(Expr& expr) {
             m_fn->emit(OpCode::Shr, int64MemType());
             emitConstInt((static_cast<Int128>(1) << baseType->elem->bits) - 1);
             m_fn->emit(OpCode::And, int64MemType());
+            return;
+        }
+        if (baseType != nullptr && baseType->kind == TypeKind::String) {
+            // One byte, zero extended into the `char` the expression has for a type.
+            // Reading it with `emitLoadValue` would use the type's own width -- two bytes
+            // -- and hand back the byte under `i` welded to the byte under `i+1`. That is
+            // where `⬱` came from: "1+1+1"[0] was 0x2B31, '+' above '1'.
+            //
+            // Unsigned rather than signed so a byte >= 0x80 does not come back negative;
+            // a UTF-8 fragment is a byte value, not a small integer.
+            MemType byteType;
+            byteType.kind = MemType::Kind::Int;
+            byteType.size = 1;
+            byteType.bits = 8;
+            byteType.isUnsigned = true;
+            const int byteMemType = m_module->internMemoryType(byteType);
+
+            emitAddress(expr);
+            m_fn->emit(OpCode::Load, byteMemType);
             return;
         }
         emitAddress(expr);

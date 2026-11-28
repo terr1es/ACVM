@@ -603,8 +603,18 @@ const Type* Sema::checkIndex(Expr& expr, Scope& scope, Flow& flow) {
         return expr.type;
 
     case TypeKind::String:
-        // `s[i]` yields a writable char (spec §2.4.5.0).
-        expr.isLValue = true;
+        // `s[i]` yields the **byte** at offset `i`, as a `char` holding 0..255.
+        //
+        // It is not an lvalue, and that is the point. A string is UTF-8, so an element
+        // is one byte; a `char` is two. Storing through `s[i]` would have to write two
+        // bytes over one, which is what silently destroyed the next character:
+        // `s[0] = 'X'` on "ABCDE" produced "X CDE", the high byte of 'X' zeroing the B.
+        // A read-modify-write cannot be expressed either, because the type of `s[i]` is
+        // `char` and the store would not know it owns only half.
+        //
+        // Byte access stays on `s[i]`; character access is `str.charAt`, which has to
+        // decode UTF-8 and is therefore O(n) and visible about it.
+        expr.isLValue = false;
         expr.type = m_types.charType();
         return expr.type;
 

@@ -1089,9 +1089,22 @@ const Type* Sema::checkAssign(Expr& expr, Scope& scope, Flow& flow) {
     }
 
     if (!target.isLValue) {
-        m_diagnostics.error(target.range,
-                            "the left side of an assignment must be a variable, a member or an "
-                            "element");
+        // A string element reads as a byte and cannot be stored through: the byte is one
+        // wide and `char` is two, so the store would either clobber the neighbouring
+        // character or need a read-modify-write the type system cannot describe. Naming
+        // the alternative is the difference between "you cannot do that" and "here is
+        // what you wanted".
+        if (target.kind == ExprKind::Index && target.kids[0] != nullptr &&
+            target.kids[0]->type != nullptr &&
+            target.kids[0]->type->kind == TypeKind::String) {
+            m_diagnostics.error(target.range,
+                                "'s[i]' reads a byte of a string and cannot be assigned to; "
+                                "build a new string with str.replace or a StrBuilder instead");
+        } else {
+            m_diagnostics.error(target.range,
+                                "the left side of an assignment must be a variable, a member or "
+                                "an element");
+        }
     } else if (Symbol* root = lvalueRoot(target); root != nullptr && !root->isMutable) {
         m_diagnostics.error(target.range,
                             "cannot assign to const " +

@@ -169,22 +169,22 @@ without a cast. This is deliberate — in C, `'a' + 1` quietly produces a number
 A `string` is an immutable byte string: a pointer plus a length. `length` is a property,
 not a method, and concatenation with `+` allocates.
 
-**Indexing yields a 2-byte `char`, not a byte.** `s[0]` reads two bytes and builds one
-`char` from them, which is rarely what you want for ASCII text. Use `strByteAt` from the
-`strbyte` module to read individual bytes.
+**Indexing yields the byte at that offset, as a `char`.** `s[0]` is `'a'` for ASCII text,
+and the first byte of the encoding for anything else — `"中"[0] as int` is `0xE4`, not the
+character. Elements are read-only: a string is a byte buffer, a `char` is two bytes wide,
+so storing through `s[i]` would overwrite the neighbouring byte. Character access is
+`str.charAt(s, i)`, and `str.codePointAt(s, i)` when the text may contain an emoji.
 
 ```axiom
-function import (return:(strbyte));
-
 function main():void {
     string s = "axiom";
     print(s.length);            // 5, in bytes
     print(" ");
-    print(strByteAt(s, 0));     // 97, the byte 'a'
+    print(s[0] as int);         // 97, the byte 'a'
+    print(" ");
+    print(s[1] == 'x');         // true -- s[i] compares against a char literal
     print(" ");
     print(s + "!");             // axiom!
-    print(" ");
-    print(s == "axiom");        // true, compared by content
     print("\n");
     eof: pass;
 }
@@ -192,7 +192,7 @@ function main():void {
 
 ```
 ── output ──
-5 97 axiom! true
+5 97 true axiom!
 ```
 
 Comparing strings with `==` compares contents, not pointers. `String` values are

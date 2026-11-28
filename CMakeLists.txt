@@ -604,9 +604,32 @@ if(ACVM_BUILD_TESTS)
                             generic_struct_check address_assign_check
                             ternary_check int128_check methods_check
                             compare_branch_check scalar_fastpath_check
-                            shared_library_names_check ${ACVM_EXTRALIB_CHECKS})
+                            shared_library_names_check global_index_check
+                            string_index_check
+                            ${ACVM_EXTRALIB_CHECKS})
         acvm_add_script_check(${check_name})
     endforeach()
+
+    # The two ways of misusing a string index, neither of which a program can assert about
+    # itself: assigning through `s[i]` is a compile error, and indexing past the end stops
+    # the process. Both used to pass silently -- the store corrupted the next character and
+    # the read returned bytes from past the allocation -- so the check reads what the
+    # compiler and the VM actually said rather than what a program prints.
+    add_test(NAME string_index_reject_check
+             COMMAND ${CMAKE_COMMAND}
+                     -DACVM=$<TARGET_FILE:acvm>
+                     -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_string_index.cmake)
+
+    # The fused array load is the only bounds check standing between an out-of-range index and
+    # a read of whatever follows the array, so it is tested by trapping rather than by printing
+    # the right numbers: a run that reads past the end produces a plausible value, which no
+    # value comparison would catch.
+    add_test(NAME global_index_trap_check
+             COMMAND $<TARGET_FILE:acvm> run
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/global_index_trap_check.ax)
+    set_tests_properties(global_index_trap_check PROPERTIES
+        PASS_REGULAR_EXPRESSION "index out of bounds")
 
     # The one check that needs real arguments. Every other script check is registered with
     # none, which is why `cliParseArgvWith` could lose the first argument without any test

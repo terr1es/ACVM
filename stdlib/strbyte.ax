@@ -10,8 +10,12 @@
 //
 //  Axiom has two sharp facts about strings:
 //
-//  1. **`s[i]` does not work**. It indexes UTF-16 code units, but a string is
-//     UTF-8, so `"hello"[0]` gives mojibake (U+6568), not `'h'`.
+//  1. **`s[i]` is a byte, not a character.** It gives the byte at offset `i` as a
+//     `char` in 0..255: `"hello"[0]` is `'h'` and `"中"[0]` is `0xE4`, the first byte
+//     of that character's encoding. It cannot be assigned to. Character access is
+//     `str.charAt` / `str.codePointAt`. (It used to stride UTF-16 code units over
+//     UTF-8 storage, which made `"hello"[0]` mojibake -- U+6568 -- and read past the
+//     end of the allocation on the last two indices.)
 //  2. **`<` used to be unreliable** (fixed in compiler, see below). `==` compared
 //     by content, but `<` `<=` `>` `>=` took the numeric path and compared string
 //     descriptors as integers: measured, `"zzz" < "aaa"` and `"aaa" < "zzz"` were
@@ -19,6 +23,14 @@
 //
 //  Together those two meant ordered string sets and string hashing were both out of
 //  reach -- unless the bytes were reachable, which is what this module provides.
+//
+//  ── why this module still exists ──────────────────────────────────────────
+//
+//  `s[i]` now returns the same byte `strByteAt` does, so a loop over
+//  `for i in 0..s.length` no longer needs either. What is left is the **typed view**:
+//  `strBytesOf` hands back a `ptr int8` that can be passed to a C function, walked
+//  with pointer arithmetic, or given to `strCompare` / `strHashOf`, none of which
+//  `s[i]` can do because it yields a value rather than an address.
 //
 //  ── how to get at the bytes ───────────────────────────────────────────────
 //
