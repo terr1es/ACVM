@@ -306,16 +306,17 @@ left operand. Worth 5–12% depending on the benchmark.
 ## The JIT after the comparison fix
 
 The JIT used to be slower than the interpreter on every benchmark in this file, which made it
-a demonstration rather than a tier. It is not any more, on everything except calls.
+a demonstration rather than a tier. It is not any more: it beats the interpreter everywhere
+except `array`, where the loop reads a global and is handed back to the interpreter.
 
-| benchmark | interpreter | `--jit` | |
+| benchmark | interpreter | `--jit` | vs CPython 3.13 |
 |---|---|---|---|
-| `empty` | 0.406 s | 0.119 s | **3.4× faster** |
-| `arith` | 0.518 s | 0.042 s | **12.2× faster** |
-| `array` | 0.311 s | 0.315 s | unchanged |
-| `calls` | 3.305 s | 4.805 s | **0.69× — slower** |
+| `empty` | 0.457 s | 0.122 s | 10.7× faster |
+| `arith` | 0.501 s | 0.042 s | 19.1× faster |
+| `array` | 0.312 s | 0.314 s | unchanged (1.5× faster than CPython either way) |
+| `calls` | 3.251 s | 2.702 s | 1.22× slower |
 
-Two causes, and only one of them was a missing lowering.
+Three causes, and only one of them was a missing lowering.
 
 `CMP_LOCAL_IMM` read its frame slot from `a`. But `a` is the jump target -- this instruction is
 a branch, like every other branch in this set -- and the slot is packed into `b` with the
@@ -328,11 +329,24 @@ wrong; the disassembly showed `frame+4` and the lowering was reading `frame+12`.
 With the slot correct, the loop header compiles, and that is where the 3–12× comes from. `array`
 is unchanged because it walks a global array (`LOAD_GLOBAL`), which is still a hand-off point.
 
-`calls` is slower for a different reason: **every `CALL` in compiled code goes through a C++
-bridge.** Arguments are pushed onto the interpreter's value stack, `callFunction` pops them,
-looks the callee up, zeroes its frame and calls its entry. That is about 29 ns per call, and at
-53.1M calls it more than wipes out what the compiled body saves. A direct call path is the next
-piece of work; see the list above.
+`calls` was *slower* than the interpreter at first -- 4.805 s against 3.305 s -- because every
+`CALL` in compiled code went through three C++ bridges: `pushValue` per argument, then
+`callFunction`, then `popResult`. Two changes took it to 2.702 s, which is 1.22× behind CPython
+instead of 1.78× behind the interpreter:
+
+  * **`callFunction` allocated a `std::vector<Value>` for the arguments on every call.** The
+    same heap allocation that was removed from the interpreter's `CALL` two rounds ago had been
+    left in the bridge -- the fix was written once and not applied to the second copy of the
+    code. Removing it alone: 4.805 s to 2.802 s.
+  * **One bridge instead of three.** `callFromSlots` takes a pointer to the caller's native
+    argument slots and a bit mask of which ones hold addresses, sets up the frame from those,
+    and writes the result into the slot the first argument came from. The arguments never touch
+    the interpreter's value stack, and no 32-byte `Value` is constructed per argument.
+    2.802 s to 2.702 s.
+
+Compiled recursion still costs a C++ call per invocation -- there is no inlining and no direct
+jump to the callee's entry -- which is the whole of what is left between 2.702 s and CPython's
+2.209 s.
 
 ## What did not work, this round
 
@@ -355,14 +369,12 @@ in the transfer, not the setup.
 
 In the order I would do them, and with the reason each is not already done.
 
-**1. Give compiled code a direct call path.** Every `CALL` in compiled code marshals its
-arguments onto the interpreter's value stack and goes through `jitbridge::callFunction`, which
-looks the callee up and sets up its frame. That is roughly 29 ns of overhead per call, and it is
-why compiled `fib` is *slower* than interpreted `fib` (4.81 s against 3.31 s for 53.1M calls)
-once the JIT can compile it at all. Inlining the frame setup and jumping straight to the
-callee's entry would fix it; it is also the largest remaining piece of work in the JIT, because
-the callee's prologue, the frame zeroing and the argument copy all have to agree with what
-`callFunction` does today.
+**1. A direct call, without the C++ round trip.** `callFromSlots` is one bridge per call rather
+than three, but it is still a bridge: a `call` into C++, a module lookup, a frame setup, and a
+call back into generated code. Emitting the callee's frame setup inline and jumping straight to
+its entry is what would close the remaining 1.22× on `calls`. It is also the change that makes
+compiled recursion reachable for real programs, where a call is the unit of work rather than an
+occasional event.
 
 **2. `CMP_BRANCH` in the JIT.** Still handed to the interpreter, for the reason recorded below
 under "what did not work". `CMP_LOCAL_IMM` was in the same state until its operand bug was found,
