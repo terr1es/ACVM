@@ -203,6 +203,27 @@ enum class OpCode : std::uint8_t {
     /// `a` is the frame offset. Appended at the end of the enum for the reason given above
     /// `Pow`.
     RetLocal,
+
+    /// `global[index]` where `index` is an `int32` frame slot, bounds checked and scaled.
+    ///
+    /// The generic form is six instructions -- `GLOBAL_ADDR; LOAD_LOCAL; CONST size; MUL; ADD;
+    /// LOAD` -- and with the two bounds checks the front end emits around it, one array element
+    /// costs eighteen. This is that whole sequence in one instruction, and it is what CPython
+    /// has: `BINARY_OP` with the list, its length and its element pointer already to hand.
+    ///
+    /// `a` is the global index; `b` packs the frame slot and the element's memory type:
+    ///
+    ///     bits 0-15    frame slot holding the index
+    ///     bits 16-21   memType of one element
+    ///
+    /// The bounds check is kept, not elided. It is a compare and a branch against a length
+    /// loaded once from the global's descriptor, which is what the two `CMP_BRANCH` pairs the
+    /// front end emits were doing anyway -- and eliding it is a separate question about what a
+    /// well-formed loop can be assumed to guarantee.
+    ///
+    /// Negative indices trap rather than wrapping: an index is signed, and a negative one is a
+    /// bug in the program, not a request for the last element.
+    LoadGlobalIndexed,
 };
 
 enum class TrapKind : std::int32_t {
@@ -387,6 +408,49 @@ inline constexpr std::int32_t kMaxConstant = (1 << kConstantBits) - 1;
 }
 
 } // namespace compareLocal
+
+//===--- LoadGlobalIndexed operand packing -------------------------------===//
+//
+// `a` is the global index, as it is for `GLOBAL_ADDR`. `b` carries the rest:
+//
+//     bits 0-15    frame slot holding the index  (frames up to 64 KB)
+//     bits 16-21   memType of one element        (64 types, the module's limit)
+//     bit  22      the index slot is 64-bit
+//
+// The width bit is not a convenience. Pointer arithmetic is done in 64 bits, so the front end
+// stages the index into an `i64` slot before the multiply -- the sequence this fuses reads
+// `LOAD_LOCAL frame+32 i64`, not the `i32` variable the index came from. Reading four bytes of
+// that slot would take the low half of a 64-bit value and be right for small indices, which is
+// the worst kind of wrong. So the width is carried, and the load reads what the slot holds.
+//
+// Anything that does not fit is not fused, and the generic six-instruction form is emitted
+// instead. Same rule as the other fusions: refuse rather than mask.
+namespace loadGlobalIndexed {
+
+inline constexpr int kSlotBits = 16;
+inline constexpr std::int32_t kSlotMask = (1 << kSlotBits) - 1;
+inline constexpr int kMemTypeShift = kSlotBits;
+inline constexpr std::int32_t kMemTypeMask = 0x3F << kMemTypeShift;
+inline constexpr std::int32_t kWideIndexBit = 1 << 22;
+
+/// True when this access can be expressed in one instruction.
+[[nodiscard]] inline bool encodable(std::int32_t slot, int memType) {
+    return slot >= 0 && slot <= kSlotMask && memType >= 0 && memType <= 0x3F;
+}
+
+[[nodiscard]] inline std::int32_t pack(std::int32_t slot, int memType, bool wideIndex) {
+    return (slot & kSlotMask) | ((memType << kMemTypeShift) & kMemTypeMask) |
+           (wideIndex ? kWideIndexBit : 0);
+}
+[[nodiscard]] inline std::int32_t slotOf(std::int32_t b) { return b & kSlotMask; }
+[[nodiscard]] inline int memTypeOf(std::int32_t b) {
+    return (b & kMemTypeMask) >> kMemTypeShift;
+}
+[[nodiscard]] inline bool isWideIndex(std::int32_t b) {
+    return (b & kWideIndexBit) != 0;
+}
+
+} // namespace loadGlobalIndexed
 
 //===--- AddSubLocalImm operand packing ----------------------------------===//
 //

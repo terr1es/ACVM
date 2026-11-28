@@ -179,6 +179,22 @@ constexpr std::size_t kPageTableOffset = kShadowSpace;
     return -1;
 }
 
+/// The `int64` memory type, for the wide-index slow path of `LOAD_GLOBAL_INDEXED`.
+///
+/// Same shape as `memTypeForInt32` and for the same reason: the slow path names a type because
+/// it goes through the generic helper. -1 means the module has no plain `int64`, in which case
+/// no wide-index fusion exists and the call is unreachable.
+[[nodiscard]] int memTypeForInt64(const Module& module) {
+    for (std::size_t i = 0; i < module.memTypes.size(); ++i) {
+        const MemType& type = module.memTypes[i];
+        if (type.kind == MemType::Kind::Int && type.size == 8 && type.bits == 64 &&
+            !type.isUnsigned) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
 /// The branch condition for `lhs <cmp> rhs`, inverted when the branch is taken on *false*.
 ///
 /// Both directions are emitted by the optimizer -- it does not normalise `JUMP_IF_TRUE` into
@@ -284,6 +300,7 @@ std::int32_t slotOffset(std::size_t index) {
 constexpr const char kOverflowMessage[] = "integer overflow in compiled code";
 constexpr const char kNullPointerMessage[] = "null pointer in compiled code";
 constexpr const char kDivideByZeroMessage[] = "division by zero in compiled code";
+constexpr const char kBoundsMessage[] = "index out of bounds in compiled code";
 constexpr const char kBudgetMessage[] =
     "instruction budget exhausted (possible infinite loop)";
 
@@ -479,6 +496,7 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     X64Assembler assembler;
     X64Assembler::Label trapExit = assembler.newLabel();
     X64Assembler::Label nullExit = assembler.newLabel();
+    X64Assembler::Label boundsExit = assembler.newLabel();
     X64Assembler::Label divZeroExit = assembler.newLabel();
     X64Assembler::Label failureExit = assembler.newLabel();
     X64Assembler::Label budgetExit = assembler.newLabel();
@@ -713,6 +731,10 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 return true;
             case OpCode::CmpLocalImm:
                 // Read a slot, compare it with a constant, branch. Nothing is pushed.
+                return true;
+            case OpCode::LoadGlobalIndexed:
+                // Read an index from a slot, load an element, push it.
+                pushes = 1;
                 return true;
             case OpCode::CompareBranch:
                 // Pops two, branches on their comparison. Implemented for `int32` only, which
@@ -1889,6 +1911,94 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             break;
         }
 
+        case OpCode::LoadGlobalIndexed: {
+            // `global[slot]`, bounds checked and scaled, in one instruction -- the shape the
+            // interpreter got when this was fused. Compiled code does the same work but in
+            // registers, and the check is two compares rather than the pair of `CMP_BRANCH`
+            // instructions the front end used to emit.
+            if (inst.a < 0 || static_cast<std::size_t>(inst.a) >= module.globals.size()) {
+                refusal = "invalid global index";
+                break;
+            }
+            const std::int32_t indexSlot = loadGlobalIndexed::slotOf(inst.b);
+            const int elementType = loadGlobalIndexed::memTypeOf(inst.b);
+            if (elementType < 0 ||
+                static_cast<std::size_t>(elementType) >= module.memTypes.size()) {
+                refusal = "invalid element type in LOAD_GLOBAL_INDEXED";
+                break;
+            }
+            const MemType& element = module.memTypes[static_cast<std::size_t>(elementType)];
+            if (element.size == 0 || element.size > 8) {
+                refusal = "element size the JIT does not inline";
+                break;
+            }
+            const GlobalSlot& global = module.globals[static_cast<std::size_t>(inst.a)];
+            if (global.size < element.size) {
+                refusal = "global smaller than its element";
+                break;
+            }
+            if (depth >= kMaxValueSlots) {
+                refusal = "expression stack deeper than the JIT supports";
+                break;
+            }
+            const std::uint64_t count = global.size / element.size;
+
+            // The index, at the width the slot holds. Reading four bytes of an eight-byte
+            // slot is right for small values and wrong for large ones, which is the failure
+            // mode this width bit exists to avoid in the interpreter; here it decides the
+            // width of the load.
+            auto slowIndex = assembler.newLabel();
+            auto indexReady = assembler.newLabel();
+            const bool wide = loadGlobalIndexed::isWideIndex(inst.b);
+            emitScalarLoad(indexSlot, wide ? 64u : 32u, /*isUnsigned=*/false, slowIndex);
+            assembler.mov(kTmp2, kRegA);
+            assembler.jmp(indexReady);
+            assembler.bind(slowIndex);
+            emitHelperLoad(indexSlot, wide ? memTypeForInt64(module) : memTypeForInt32(module),
+                           kScratchSlot);
+            assembler.mov(kTmp2, mem(Reg::Rsp, slotOffset(kScratchSlot)));
+            assembler.bind(indexReady);
+
+            // Signed on both ends: a negative index is a bug, not a request for the last
+            // element. `cmp` against zero then `Count` treats the operand as unsigned, so a
+            // negative value fails the upper test too -- the zero test is what keeps the
+            // failure message honest rather than incidental.
+            assembler.test(kTmp2, kTmp2, Width::Qword);
+            assembler.jcc(Cond::Sign, boundsExit);
+            assembler.movImm(kTmp1, Width::Qword, static_cast<std::int64_t>(count));
+            assembler.cmp(kTmp2, kTmp1, Width::Qword);
+            assembler.jcc(Cond::AboveEqual, boundsExit);
+
+            // base + index * elementSize. A power-of-two element is an `lea` with a scale; the
+            // odd sizes a struct can have are multiplied.
+            const std::int64_t base =
+                static_cast<std::int64_t>(VM::kGlobalBase + global.offset);
+            const std::int64_t size = static_cast<std::int64_t>(element.size);
+            if (size == 1 || size == 2 || size == 4 || size == 8) {
+                assembler.movImm(kTmp1, Width::Qword, base);
+                assembler.lea(kTmp1, memIndex(kTmp1, kTmp2, static_cast<int>(size), 0));
+            } else {
+                assembler.movImm(kTmp1, Width::Qword, size);
+                assembler.imul(kTmp2, kTmp1, Width::Qword);
+                assembler.movImm(kTmp1, Width::Qword, base);
+                assembler.add(kTmp1, kTmp2, Width::Qword);
+            }
+            assembler.mov(mem(Reg::Rsp, slotOffset(depth)), kTmp1);
+
+            // The load itself, through the same pointer path `LOAD` uses -- which creates the
+            // page on first touch exactly as the interpreter does.
+            assembler.mov(kArg1, kRegVm);
+            assembler.mov(kArg2, kTmp1);
+            assembler.movImm(kArg3, Width::Dword, elementType);
+            assembler.lea(kArg4, mem(Reg::Rsp, slotOffset(depth)));
+            assembler.callAbsolute(
+                reinterpret_cast<const void*>(&jitbridge::loadThroughPointer));
+            assembler.test(kRegA, kRegA, Width::Byte);
+            assembler.jcc(Cond::Equal, failureExit);
+            ++depth;
+            break;
+        }
+
         case OpCode::Load: {
             const IntInfo info = intInfoOf(module, inst.a);
             if (!info.supported) {
@@ -2221,6 +2331,7 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
     emitTrapBlock(trapExit, kOverflowMessage);
     emitTrapBlock(divZeroExit, kDivideByZeroMessage);
     emitTrapBlock(nullExit, kNullPointerMessage);
+    emitTrapBlock(boundsExit, kBoundsMessage);
 
     assembler.bind(failureExit);
     assembler.addImm(Reg::Rsp, static_cast<std::int32_t>(kFrameBytes));

@@ -713,6 +713,91 @@ int peephole(Function& fn, const Module& module, int& forwardedOut) {
                 }
             }
 
+            // `GLOBAL_ADDR g; LOAD_LOCAL s; CONST n; MUL; ADD ptr; LOAD t` -> `LOAD_GLOBAL_INDEXED`.
+            //
+            // One array element, and by instruction count the worst sequence in the language:
+            // eighteen instructions once the front end's two bounds checks are counted. The
+            // fused form does the same work -- re-checking the bounds itself, because a
+            // fused instruction has to be safe on its own -- in one dispatch.
+            //
+            // The guards, and why each one refuses rather than adjusts:
+            //
+            //   * the constant has to be the element size, a positive integer that fits 32
+            //     bits. It is what the compiler emitted as `CONST sizeof(T)`, and anything else
+            //     means this is not the pattern;
+            //   * the index has to be a plain integer slot. The fused instruction reads four
+            //     bytes, so an `i64` slot -- which is what pointer arithmetic normally uses --
+            //     is refused: `LOAD_LOCAL frame+32 i64` appears in this very sequence, and
+            //     treating its slot as an `i32` would read the low half of a 64-bit index and
+            //     give a plausible, wrong answer;
+            //   * the element type has to be one the fused load can produce.
+            // no index into a bounds check that the front end already emitted, and no
+            // assumption that a well-formed loop is in range.
+            if (i + 5 < n && !drop[i + 1] && !drop[i + 2] && !drop[i + 3] && !drop[i + 4] &&
+                !targets[i + 1] && !targets[i + 2] && !targets[i + 3] && !targets[i + 4] &&
+                first.op == OpCode::GlobalAddr && fn.code[i + 1].op == OpCode::LoadLocal &&
+                fn.code[i + 2].op == OpCode::ConstInt && fn.code[i + 3].op == OpCode::Mul &&
+                fn.code[i + 4].op == OpCode::Add && fn.code[i + 5].op == OpCode::Load) {
+                const Instruction& global = first;
+                const Instruction& index = fn.code[i + 1];
+                const Instruction& sizeConstant = fn.code[i + 2];
+                const Instruction& multiply = fn.code[i + 3];
+                const Instruction& add = fn.code[i + 4];
+                const Instruction& load = fn.code[i + 5];
+
+                const int indexType = index.b & 0xFF;
+                const int elementType = load.a;
+                // Either width is usable, but which one it is has to be carried: the fused load
+                // reads what the slot holds, and `i64` is the normal case here because pointer
+                // arithmetic is 64-bit and the front end stages the index accordingly.
+                bool indexIsInteger = false;
+                bool indexIsWide = false;
+                if (indexType >= 0 &&
+                    static_cast<std::size_t>(indexType) < module.memTypes.size()) {
+                    const MemType& type = module.memTypes[static_cast<std::size_t>(indexType)];
+                    indexIsInteger = type.kind == MemType::Kind::Int &&
+                                     (type.size == 4 || type.size == 8);
+                    indexIsWide = indexIsInteger && type.size == 8;
+                }
+                const int sizeType = multiply.a;
+                const bool multiplyIsInt64 =
+                    sizeType >= 0 && static_cast<std::size_t>(sizeType) < module.memTypes.size() &&
+                    module.memTypes[static_cast<std::size_t>(sizeType)].kind == MemType::Kind::Int;
+
+                // The size has to match what the memory type says an element is, because the
+                // fused instruction computes the stride from the type -- a fusion that used a
+                // different number would read a different element.
+                bool sizeMatches = false;
+                if (sizeConstant.a >= 0 &&
+                    static_cast<std::size_t>(sizeConstant.a) < fn.constants.size() &&
+                    elementType >= 0 &&
+                    static_cast<std::size_t>(elementType) < module.memTypes.size()) {
+                    const Value& value = fn.constants[static_cast<std::size_t>(sizeConstant.a)];
+                    const std::uint32_t declared =
+                        module.memTypes[static_cast<std::size_t>(elementType)].size;
+                    if (value.isInt()) {
+                        const Int128 wide = value.asInt();
+                        sizeMatches = wide > 0 && wide <= INT32_MAX &&
+                                      static_cast<std::uint64_t>(wide) == declared;
+                    }
+                }
+
+                if (indexIsInteger && multiplyIsInt64 && sizeMatches &&
+                    global.a >= 0 &&
+                    static_cast<std::size_t>(global.a) < module.globals.size() &&
+                    loadGlobalIndexed::encodable(index.a, elementType)) {
+                    fn.code[i] = Instruction{
+                        OpCode::LoadGlobalIndexed, global.a,
+                        loadGlobalIndexed::pack(index.a, elementType, indexIsWide)};
+                    for (int k = 1; k <= 5; ++k) {
+                        drop[i + static_cast<std::size_t>(k)] = 1;
+                    }
+                    changes += 1;
+                    i += 6;
+                    continue;
+                }
+            }
+
             // `STEP_LOCAL; JUMP` -> `STEP_JUMP`.
             //
             // The closing pair of a `for` loop. Fusing it is what takes a loop iteration from

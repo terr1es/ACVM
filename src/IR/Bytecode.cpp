@@ -68,6 +68,7 @@ std::string_view opCodeName(OpCode op) {
     case OpCode::StepJump: return "STEP_JUMP";
     case OpCode::RetLocal: return "RET_LOCAL";
     case OpCode::CmpLocalImm: return "CMP_LOCAL_IMM";
+    case OpCode::LoadGlobalIndexed: return "LOAD_GLOBAL_INDEXED";
     case OpCode::CopyLocal: return "COPY_LOCAL";
     case OpCode::AddSubLocalImm: return "ADD_SUB_LOCAL_IMM";
     }

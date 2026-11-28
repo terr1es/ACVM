@@ -156,6 +156,16 @@ void formatInstruction(const Module& module, const Function& function, std::size
             << inst.a;
         break;
     }
+    case OpCode::LoadGlobalIndexed: {
+        const std::int32_t indexSlot = loadGlobalIndexed::slotOf(inst.b);
+        const int elementType = loadGlobalIndexed::memTypeOf(inst.b);
+        out << (inst.a >= 0 && static_cast<std::size_t>(inst.a) < module.globals.size()
+                    ? module.globals[static_cast<std::size_t>(inst.a)].name
+                    : std::string("?global"))
+            << "[frame+" << indexSlot << "] "
+            << memTypeText(module, elementType);
+        break;
+    }
     case OpCode::RetLocal:
         out << "frame+" << inst.a;
         break;

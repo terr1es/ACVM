@@ -1495,6 +1495,59 @@ VM::Step VM::step(Process& process, std::string& error) {
                 continue;
             }
 
+            case OpCode::LoadGlobalIndexed: {
+                // `global[slot]` with the bounds check and the scaling folded in: the whole of
+                // `GLOBAL_ADDR; LOAD_LOCAL; CONST size; MUL; ADD; LOAD` plus the two checks the
+                // front end emits around it, which together cost eighteen instructions per
+                // array element.
+                if (inst.a < 0 || static_cast<std::size_t>(inst.a) >= m_module->globals.size()) {
+                    return fail(TrapKind::Unreachable, "invalid global index");
+                }
+                const std::int32_t indexSlot = loadGlobalIndexed::slotOf(inst.b);
+                const int elementType = loadGlobalIndexed::memTypeOf(inst.b);
+                const MemType& element = memType(elementType);
+                if (element.size == 0) {
+                    return fail(TrapKind::Unreachable, "zero-sized element type in LOAD_GLOBAL_INDEXED");
+                }
+                const GlobalSlot& global = m_module->globals[static_cast<std::size_t>(inst.a)];
+                const std::uint64_t count = global.size / element.size;
+
+                const std::uint64_t slotAddress =
+                    baseAddress + static_cast<std::uint64_t>(indexSlot);
+                // The slot's width is carried in the instruction, because the front end stages
+                // an index into an `i64` slot for pointer arithmetic and reading four bytes of
+                // that would take the low half of a 64-bit value.
+                std::int64_t index = 0;
+                if (loadGlobalIndexed::isWideIndex(inst.b)) {
+                    if (!readBytes(slotAddress, &index, sizeof(index))) {
+                        return fail(TrapKind::Unreachable,
+                                    "cannot read the index of LOAD_GLOBAL_INDEXED");
+                    }
+                } else {
+                    std::int32_t narrow = 0;
+                    if (const std::int32_t* cell = residentInt32(slotAddress)) {
+                        narrow = *cell;
+                    } else if (!readBytes(slotAddress, &narrow, sizeof(narrow))) {
+                        return fail(TrapKind::Unreachable,
+                                    "cannot read the index of LOAD_GLOBAL_INDEXED");
+                    }
+                    index = narrow;
+                }
+                // Signed, and checked on both ends: a negative index is a bug in the program,
+                // not a request for the last element.
+                if (index < 0 || static_cast<std::uint64_t>(index) >= count) {
+                    return fail(TrapKind::IndexOutOfBounds, "index out of bounds");
+                }
+                Value value;
+                if (!loadScalar(kGlobalBase + global.offset +
+                                    static_cast<std::uint64_t>(index) * element.size,
+                                elementType, value)) {
+                    return fail(TrapKind::Unreachable, "invalid memory type in LOAD_GLOBAL_INDEXED");
+                }
+                pushValue(value);
+                continue;
+            }
+
             case OpCode::LoadGlobal: {
                 if (inst.a < 0 || static_cast<std::size_t>(inst.a) >= m_module->globals.size()) {
                     return fail(TrapKind::Unreachable, "invalid global index");
