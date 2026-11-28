@@ -199,6 +199,9 @@ function checkLargeTransfer():void {
     // smaller) and that the receiving side needs many `recv` calls, small enough
     // that the loopback's kernel buffering is not what makes it pass.
     int size = 262144;
+    //  The largest single read this test allows. Small enough that 256 KB cannot arrive
+    //  in one call whatever the platform's socket buffer is set to.
+    int kRecvCap = 8192;
 
     // One byte per element: the allocation, the count and the offsets are all in
     // the same unit.
@@ -227,7 +230,17 @@ function checkLargeTransfer():void {
         // Advance by `total`: every round writes further into the buffer, or the
         // first chunk would be overwritten each time and the totals would still
         // look right.
-        int n = tcpRecv(gServer, chunk + total, size - total);
+        //  Ask for at most `kRecvCap` bytes per call. The point of this test is that the
+        //  loop copes with a partial read, and leaving the request open means the kernel
+        //  decides whether there is one: macOS hands over all 256 KB of a loopback write
+        //  in a single `recv`, so `rounds` was 1 there and the assertion below failed on
+        //  a platform where nothing was wrong. Capping the request makes several rounds
+        //  certain instead of letting the socket buffer decide.
+        int want = size - total;
+        if (want > kRecvCap) {
+            want = kRecvCap;
+        }
+        int n = tcpRecv(gServer, chunk + total, want);
         if (n <= 0) {
             break;
         }

@@ -75,7 +75,12 @@ jobs:
           cmake --install build --prefix stage
           printf 'function main():void { print("ok\\n"); eof: pass; }\n' > hello.ax
           ./stage/bin/acvm run hello.ax
-          ./stage/bin/acvm run hello.ax --jit
+          # `--jit` only where the backend supports it. It emits Microsoft ABI code, so on
+          # Linux and macOS the flag is a usage error by design -- running it here made
+          # this step fail with exit code 2 on Linux while every test passed.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./stage/bin/acvm run hello.ax --jit
+          fi
 
   macos:
     runs-on: macos-latest
@@ -122,7 +127,12 @@ jobs:
           cmake --install build --prefix stage
           printf 'function main():void { print("ok\\n"); eof: pass; }\n' > hello.ax
           ./stage/bin/acvm run hello.ax
-          ./stage/bin/acvm run hello.ax --jit
+          # `--jit` only where the backend supports it. It emits Microsoft ABI code, so on
+          # Linux and macOS the flag is a usage error by design -- running it here made
+          # this step fail with exit code 2 on Linux while every test passed.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./stage/bin/acvm run hello.ax --jit
+          fi
 
   windows:
     runs-on: windows-latest
@@ -184,4 +194,9 @@ jobs:
           cmake --install build --prefix stage
           printf 'function main():void { print("ok\\n"); eof: pass; }\n' > hello.ax
           ./stage/bin/acvm run hello.ax
-          ./stage/bin/acvm run hello.ax --jit
+          # `--jit` only where the backend supports it. It emits Microsoft ABI code, so on
+          # Linux and macOS the flag is a usage error by design -- running it here made
+          # this step fail with exit code 2 on Linux while every test passed.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./stage/bin/acvm run hello.ax --jit
+          fi

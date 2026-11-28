@@ -150,7 +150,20 @@ function private checkWorkingDirectory():void {
         string scratch = scratchDir();
         checkInt(setCurrentDir(scratch), 0, "chdir to scratch");
         checkString(pathBase(cwd()), "axiom_os_check", "cwd follows chdir");
-        checkString(killSeparators(cwd()), killSeparators(scratch), "cwd matches apart from separators");
+        //  The two paths are not compared as strings. `cwd()` reports the physical
+        //  path, and on macOS the temporary directory is reached through a symlink --
+        //  `/var/folders/...` is really `/private/var/folders/...` -- so the two differ
+        //  by a prefix while naming one directory. Resolving that would need a `realpath`
+        //  the standard library does not expose, so the identity is checked by behaviour:
+        //  a file written through a relative path has to appear in the directory the
+        //  path names. That is also the stronger claim, since it is what the rest of a
+        //  program actually depends on.
+        string probe = "cwd_probe_axiom.txt";
+        //  `writeTextFile` returns the byte count, not a status: one byte here, and -1
+        //  on any failure.
+        check(writeTextFile(probe, "x") >= 0, "write a probe file through the cwd");
+        check(fileExists(pathJoin(scratch, probe)), "cwd() names the directory we chdir'd to");
+        removeFile(probe);
         checkInt(setCurrentDir(start), 0, "chdir back");
         checkString(cwd(), start, "cwd restored exactly");
     } else {
