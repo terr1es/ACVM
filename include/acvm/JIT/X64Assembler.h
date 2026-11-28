@@ -17,6 +17,18 @@ enum class Reg : std::uint8_t {
     R8 = 8, R9 = 9, R10 = 10, R11 = 11, R12 = 12, R13 = 13, R14 = 14, R15 = 15,
 };
 
+/// SSE registers, numbered 0-15 like `Reg` and for the same reason.
+///
+/// A separate type rather than a reuse of `Reg`: `xmm0` and `rax` are both number 0,
+/// and they are different register files. Passing one where the other is meant would
+/// encode a valid instruction that reads or writes the wrong register, which is the
+/// kind of mistake that shows up as a wrong number rather than as a crash.
+enum class Xmm : std::uint8_t {
+    Xmm0 = 0, Xmm1 = 1, Xmm2 = 2, Xmm3 = 3, Xmm4 = 4, Xmm5 = 5, Xmm6 = 6, Xmm7 = 7,
+    Xmm8 = 8, Xmm9 = 9, Xmm10 = 10, Xmm11 = 11, Xmm12 = 12, Xmm13 = 13, Xmm14 = 14,
+    Xmm15 = 15,
+};
+
 /// Condition codes, in the encoding order of the `Jcc` / `SETcc` opcodes.
 enum class Cond : std::uint8_t {
     Overflow = 0,        //  jo
@@ -94,6 +106,11 @@ public:
     void movzx(Reg dst, Reg src, Width srcWidth);
     void movsx(Reg dst, const Mem& src, Width srcWidth);
     void movsx(Reg dst, Reg src, Width srcWidth);
+    /// The indexed forms, for a byte in a page reached through the page table: the
+    /// address is `page + offset`, and computing it into a register first would cost
+    /// an instruction per load.
+    void movzx(Reg dst, const MemIndex& src, Width srcWidth);
+    void movsx(Reg dst, const MemIndex& src, Width srcWidth);
     void movsxd(Reg dst, Reg src);
     void movsxd(Reg dst, const Mem& src);
 
@@ -132,6 +149,44 @@ public:
     void cqo();
     void cdq();
     void idiv(Reg divisor, Width width = Width::Qword);
+
+    // -- scalar double (SSE2) ---------------------------------------------
+    //
+    // Scalar `double` only: the language's `double` is binary64 and `float` is
+    // promoted before arithmetic, so a packed form would be unused. `movsd` and
+    // friends move 8 bytes and the upper half of the destination is left alone,
+    // which is why every one of them is preceded by nothing that depends on it.
+
+    /// 8 byte move between an XMM register and memory, or between two registers.
+    void movsd(Xmm dst, const Mem& src);
+    void movsd(const Mem& dst, Xmm src);
+    void movsd(Xmm dst, Xmm src);
+
+    /// Arithmetic. `dst` is also the left operand, as in the integer forms.
+    void addsd(Xmm dst, Xmm src);
+    void subsd(Xmm dst, Xmm src);
+    void mulsd(Xmm dst, Xmm src);
+    void divsd(Xmm dst, Xmm src);
+    void sqrtsd(Xmm dst, Xmm src);
+
+    /// Ordered compare, setting ZF/PF/CF for the `setcc` sequence that follows.
+    /// `ucomisd` raises the invalid exception on a NaN operand where `comisd`
+    /// would; neither traps here, since the MXCSR mask is not touched, but the
+    /// flags differ on unordered input and a comparison has to read them from
+    /// `ucomisd` to treat NaN as unordered rather than as greater.
+    void ucomisd(Xmm lhs, Xmm rhs);
+
+    /// Integer <-> double conversion. The integer side is always 64 bit: Axiom's
+    /// narrower widths are held sign- or zero-extended in a 64 bit register, so
+    /// one form covers every source width.
+    void cvtsi2sd(Xmm dst, Reg src);
+    void cvttsd2si(Reg dst, Xmm src);
+
+    /// Bit pattern transfer, no conversion. A `double` in a general register is
+    /// the only way to store one as an immediate or to move one through the value
+    /// stack, which holds eight raw bytes per slot.
+    void movq(Xmm dst, Reg src);
+    void movq(Reg dst, Xmm src);
 
     // -- condition and branching -----------------------------------------
 
@@ -191,6 +246,10 @@ private:
     /// `[base + index*scale + disp]`. Always uses mod=10 with a SIB byte, so the base's
     /// low bits never change the meaning of the mod field.
     void emitModRmSib(std::size_t regField, const MemIndex& operand);
+
+    /// `F2 REX 0F <opcode> /r`, both operands in the XMM file. The scalar-double
+    /// arithmetic instructions differ only in that opcode byte.
+    void emitSseRegReg(std::uint8_t opcode, Xmm dst, Xmm src);
 
     struct Patch {
         std::size_t offset;   ///< where the rel32 begins

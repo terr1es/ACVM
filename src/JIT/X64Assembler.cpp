@@ -5,6 +5,14 @@
 
 namespace acvm::jit {
 
+//  SSE legacy prefixes. `F2` makes the arithmetic scalar-double rather than packed
+//  or single precision, and `66` selects the integer-adjacent forms (compare, and
+//  the bit-pattern moves). Both sit before REX, unlike the integer prefixes in this
+//  file, which is the one encoding detail that differs between the two families.
+constexpr std::uint8_t kPrefixSse2 = 0xF2;
+constexpr std::uint8_t kPrefixSse2Int = 0x66;
+
+
 namespace {
 
 constexpr std::uint8_t kRexBase = 0x40;
@@ -242,6 +250,34 @@ void X64Assembler::movsx(Reg dst, Reg src, Width srcWidth) {
     emitModRm(static_cast<std::size_t>(regNumber(dst)), src, false, 0);
 }
 
+void X64Assembler::movzx(Reg dst, const MemIndex& src, Width srcWidth) {
+    if (srcWidth == Width::Dword) {
+        emitRex(false, regNumber(dst), regNumber(src.index), regNumber(src.base));
+        emitByte(0x8B);
+        emitModRmSib(static_cast<std::size_t>(regNumber(dst)), src);
+        return;
+    }
+    emitOperandSize(srcWidth);
+    emitRex(true, regNumber(dst), regNumber(src.index), regNumber(src.base));
+    emitByte(0x0F);
+    emitByte(srcWidth == Width::Byte ? 0xB6 : 0xB7);
+    emitModRmSib(static_cast<std::size_t>(regNumber(dst)), src);
+}
+
+void X64Assembler::movsx(Reg dst, const MemIndex& src, Width srcWidth) {
+    if (srcWidth == Width::Dword) {
+        emitRex(true, regNumber(dst), regNumber(src.index), regNumber(src.base));
+        emitByte(0x63);
+        emitModRmSib(static_cast<std::size_t>(regNumber(dst)), src);
+        return;
+    }
+    emitOperandSize(srcWidth);
+    emitRex(true, regNumber(dst), regNumber(src.index), regNumber(src.base));
+    emitByte(0x0F);
+    emitByte(srcWidth == Width::Byte ? 0xBE : 0xBF);
+    emitModRmSib(static_cast<std::size_t>(regNumber(dst)), src);
+}
+
 void X64Assembler::movsxd(Reg dst, Reg src) {
     emitRex(true, regNumber(dst), 0, regNumber(src));
     emitByte(0x63);
@@ -415,6 +451,108 @@ void X64Assembler::setcc(Cond cond, Reg dst) {
     emitByte(0x0F);
     emitByte(static_cast<std::uint8_t>(0x90 + static_cast<int>(cond)));
     emitModRm(0, dst, false, 0);
+}
+
+//===--- scalar double ----------------------------------------------------===//
+//
+// SSE2 encoding: a mandatory legacy prefix, then REX, then `0F`, then the opcode.
+// The prefix is what makes the instruction scalar-double rather than the packed or
+// single-precision form with the same opcode -- `addsd` and `addps` differ only in
+// `F2` against none, so a wrong prefix is a valid instruction doing the wrong thing.
+//
+// The REX byte sits *after* the legacy prefix, not before it. This is the one place
+// SSE encoding differs from the integer forms in this file, and getting it backwards
+// produces bytes the CPU rejects rather than a wrong result.
+
+/// The four arithmetic forms share this: `F2 REX 0F <opcode> /r` with both operands
+/// in the XMM file.
+void X64Assembler::emitSseRegReg(std::uint8_t opcode, Xmm dst, Xmm src) {
+    emitByte(kPrefixSse2);
+    emitRex(false, static_cast<int>(dst), 0, static_cast<int>(src));
+    emitByte(0x0F);
+    emitByte(opcode);
+    emitModRm(static_cast<std::size_t>(dst),
+              static_cast<Reg>(static_cast<int>(src)), false, 0);
+}
+
+void X64Assembler::movsd(Xmm dst, const Mem& src) {
+    emitByte(kPrefixSse2);
+    emitRex(false, static_cast<int>(dst), 0, regNumber(src.base));
+    emitByte(0x0F);
+    emitByte(0x10);
+    emitModRm(static_cast<std::size_t>(dst), src.base, true, src.disp);
+}
+
+void X64Assembler::movsd(const Mem& dst, Xmm src) {
+    emitByte(kPrefixSse2);
+    emitRex(false, static_cast<int>(src), 0, regNumber(dst.base));
+    emitByte(0x0F);
+    emitByte(0x11);
+    emitModRm(static_cast<std::size_t>(src), dst.base, true, dst.disp);
+}
+
+void X64Assembler::movsd(Xmm dst, Xmm src) {
+    emitByte(kPrefixSse2);
+    emitRex(false, static_cast<int>(dst), 0, static_cast<int>(src));
+    emitByte(0x0F);
+    emitByte(0x10);
+    emitModRm(static_cast<std::size_t>(dst),
+              static_cast<Reg>(static_cast<int>(src)), false, 0);
+}
+
+void X64Assembler::addsd(Xmm dst, Xmm src) { emitSseRegReg(0x58, dst, src); }
+void X64Assembler::subsd(Xmm dst, Xmm src) { emitSseRegReg(0x5C, dst, src); }
+void X64Assembler::mulsd(Xmm dst, Xmm src) { emitSseRegReg(0x59, dst, src); }
+void X64Assembler::divsd(Xmm dst, Xmm src) { emitSseRegReg(0x5E, dst, src); }
+void X64Assembler::sqrtsd(Xmm dst, Xmm src) { emitSseRegReg(0x51, dst, src); }
+
+void X64Assembler::ucomisd(Xmm lhs, Xmm rhs) {
+    emitByte(kPrefixSse2Int);
+    emitRex(false, static_cast<int>(lhs), 0, static_cast<int>(rhs));
+    emitByte(0x0F);
+    emitByte(0x2E);
+    emitModRm(static_cast<std::size_t>(lhs),
+              static_cast<Reg>(static_cast<int>(rhs)), false, 0);
+}
+
+void X64Assembler::cvtsi2sd(Xmm dst, Reg src) {
+    // W=1 selects the 64 bit source. Without it the instruction reads the low 32
+    // bits, which converts a sign-extended value of any width correctly for
+    // non-negative inputs and silently truncates large ones.
+    emitByte(kPrefixSse2);
+    emitRex(true, static_cast<int>(dst), 0, regNumber(src));
+    emitByte(0x0F);
+    emitByte(0x2A);
+    emitModRm(static_cast<std::size_t>(dst), src, false, 0);
+}
+
+void X64Assembler::cvttsd2si(Reg dst, Xmm src) {
+    // The `tt` is truncation toward zero, which is what a C cast does and what the
+    // interpreter does. `cvtsd2si` would round to nearest even instead, and the two
+    // differ on every input with a fractional part.
+    emitByte(kPrefixSse2);
+    emitRex(true, regNumber(dst), 0, static_cast<int>(src));
+    emitByte(0x0F);
+    emitByte(0x2C);
+    emitModRm(static_cast<std::size_t>(regNumber(dst)),
+              static_cast<Reg>(static_cast<int>(src)), false, 0);
+}
+
+void X64Assembler::movq(Xmm dst, Reg src) {
+    emitByte(kPrefixSse2Int);
+    emitRex(true, static_cast<int>(dst), 0, regNumber(src));
+    emitByte(0x0F);
+    emitByte(0x6E);
+    emitModRm(static_cast<std::size_t>(dst), src, false, 0);
+}
+
+void X64Assembler::movq(Reg dst, Xmm src) {
+    emitByte(kPrefixSse2Int);
+    emitRex(true, regNumber(dst), 0, static_cast<int>(src));
+    emitByte(0x0F);
+    emitByte(0x7E);
+    emitModRm(static_cast<std::size_t>(regNumber(dst)),
+              static_cast<Reg>(static_cast<int>(src)), false, 0);
 }
 
 void X64Assembler::cmovcc(Cond cond, Reg dst, Reg src) {

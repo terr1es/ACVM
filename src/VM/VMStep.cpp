@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -475,10 +476,74 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
         return reject(TrapKind::ExternalCallFailed, reason);
     }
 
+    // A call whose arguments are all scalars needs none of the machinery below.
+    //
+    // The general path sizes a staging buffer, walks the marshalling plan twice and
+    // fills a six entry argument vector, because an array parameter has to be copied
+    // through `m_nativeBuffer` in both directions. A scalar has nothing to copy: it
+    // already is a 64 bit value on the interpreter's stack, and the call is that value
+    // in a register.
+    //
+    // Counted rather than assumed: `externalParams.size() == argc` is exactly the case
+    // with no array pairs, because an array consumes two Axiom values (pointer, count)
+    // and yields one entry, while every other parameter is one for one. Strings are one
+    // for one too but still need the buffer, so they are excluded by the loop.
+    {
+        bool scalarsOnly = function.externalParams.size() == argc;
+        for (const ExternalParam& param : function.externalParams) {
+            if (param.isString || param.isArray) {
+                scalarsOnly = false;
+                break;
+            }
+        }
+        if (scalarsOnly) {
+            std::array<std::int64_t, kMaxExternalArgs> args{};
+            for (std::size_t i = argc; i-- > 0;) {
+                if (process.stack.empty()) {
+                    return reject(TrapKind::Unreachable, "stack underflow in external call");
+                }
+                const Value value = process.stack.back();
+                process.stack.pop_back();
+                if (value.tag() == Value::Tag::Float) {
+                    return reject(TrapKind::Unreachable,
+                                  "'" + function.name +
+                                      "': a scalar 'double' cannot cross the dynamic boundary "
+                                      "(pass 'ptr double' instead)");
+                }
+                args[i] = value.tag() == Value::Tag::Ptr
+                              ? static_cast<std::int64_t>(value.asPtr())
+                              : static_cast<std::int64_t>(value.asInt());
+            }
+            const auto direct = reinterpret_cast<ExternalFn>(symbol);
+            const std::int64_t answer =
+                direct(args[0], args[1], args[2], args[3], args[4], args[5]);
+            if (function.externalReturnKind == 1) {
+                process.stack.push_back(Value::fromInt(static_cast<Int128>(answer)));
+            } else if (function.externalReturnKind == 2) {
+                double number = 0.0;
+                std::memcpy(&number, &answer, sizeof(number));
+                process.stack.push_back(Value::fromFloat(number));
+            }
+            return ExternalOutcome::Called;
+        }
+    }
+
     // Pop the Axiom arguments first, newest first, then walk the marshalling
     // plan in source order: an array pair is (pointer, count), so the two pop
     // in reverse.
-    std::vector<Value> raw(argc);
+    // Fixed-size storage on the stack, not a vector.
+    //
+    // Every one of these is at most `kMaxExternalArgs` entries and the function is
+    // called from the dispatch loop, so a heap allocation per call was a per-call
+    // cost with no upper bound in the profile: the hash containers make two calls per
+    // operation and the allocation showed up as a third of the time spent in the
+    // boundary rather than in the table.
+    std::array<Value, kMaxExternalArgs> raw{};
+    if (argc > kMaxExternalArgs) {
+        return reject(TrapKind::Unreachable,
+                      "'" + function.name + "' takes more arguments than the dynamic "
+                      "boundary supports");
+    }
     for (std::size_t i = argc; i-- > 0;) {
         if (!process.stack.empty()) {
             raw[i] = process.stack.back();
@@ -508,12 +573,13 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
     // buffer, so the C side wrote its answer into reclaimed memory and the
     // caller saw the array unchanged. One `resize` up front, then record offsets
     // (not pointers) and fill them in afterwards.
-    std::vector<Buffered> buffers;
+    std::array<Buffered, kMaxExternalArgs> buffers{};
+    std::size_t bufferCount = 0;
     std::size_t totalBytes = 0;
     std::size_t cursor = 0;
     for (const ExternalParam& param : function.externalParams) {
         if (!param.isArray && !param.isString) {
-            if (cursor >= raw.size()) {
+            if (cursor >= argc) {
                 return reject(TrapKind::Unreachable, "internal error: missing argument");
             }
             ++cursor;
@@ -523,7 +589,7 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
             // A string argument is one Axiom value: the descriptor address. Its
             // data pointer and length are read here so the size is known before
             // the single resize below.
-            if (cursor >= raw.size()) {
+            if (cursor >= argc) {
                 return reject(TrapKind::Unreachable, "internal error: missing argument");
             }
             const std::uint64_t descriptor = raw[cursor++].asPtr();
@@ -547,10 +613,15 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
             buffer.pad = 1;
             buffer.offset = totalBytes;
             totalBytes += buffer.bytes + buffer.pad;
-            buffers.push_back(buffer);
+            if (bufferCount >= kMaxExternalArgs) {
+            return reject(TrapKind::Unreachable,
+                          "'" + function.name + "' has more array parameters than the "
+                          "dynamic boundary supports");
+        }
+        buffers[bufferCount++] = buffer;
             continue;
         }
-        if (cursor + 1 >= raw.size()) {
+        if (cursor + 1 >= argc) {
             return reject(TrapKind::Unreachable, "internal error: array parameter is unpaired");
         }
         const std::uint64_t address = raw[cursor].asPtr();
@@ -570,9 +641,14 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
         buffer.bytes = static_cast<std::size_t>(count) * param.elemSize;
         buffer.offset = totalBytes;
         totalBytes += buffer.bytes;
-        buffers.push_back(buffer);
+        if (bufferCount >= kMaxExternalArgs) {
+            return reject(TrapKind::Unreachable,
+                          "'" + function.name + "' has more array parameters than the "
+                          "dynamic boundary supports");
+        }
+        buffers[bufferCount++] = buffer;
     }
-    if (cursor != raw.size()) {
+    if (cursor != argc) {
         return reject(TrapKind::Unreachable,
                       "internal error: argument count mismatch in '" + function.name + "'");
     }
@@ -587,19 +663,20 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
     // one-off call costs the same; the saving is on the repeat calls, which is
     // exactly the case that matters.
     m_nativeBuffer.resize(totalBytes);
-    for (const Buffered& buffer : buffers) {
+    for (std::size_t b = 0; b < bufferCount; ++b) {
+        const Buffered& buffer = buffers[b];
         if (buffer.pad > 0) {
             std::memset(m_nativeBuffer.data() + buffer.offset + buffer.bytes, 0, buffer.pad);
         }
     }
 
     // Pass two: copy each array in and build the C argument list.
-    std::vector<std::int64_t> cArgs;
-    cArgs.reserve(kMaxExternalArgs);
+    std::array<std::int64_t, kMaxExternalArgs> cArgs{};
+    std::size_t cArgCount = 0;
     std::size_t bufferIndex = 0;
     cursor = 0;
     for (const ExternalParam& param : function.externalParams) {
-        if (cArgs.size() >= kMaxExternalArgs) {
+        if (cArgCount >= kMaxExternalArgs) {
             return reject(TrapKind::Unreachable,
                           "'" + function.name + "' needs more than " +
                               std::to_string(kMaxExternalArgs) +
@@ -613,17 +690,17 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
                 return reject(TrapKind::InvalidPointer,
                               "'" + function.name + "': array is not readable");
             }
-            cArgs.push_back(static_cast<std::int64_t>(
-                reinterpret_cast<std::uintptr_t>(m_nativeBuffer.data() + buffer.offset)));
+            cArgs[cArgCount++] = static_cast<std::int64_t>(
+                reinterpret_cast<std::uintptr_t>(m_nativeBuffer.data() + buffer.offset));
             if (param.isString) {
                 // One Axiom value, and `cursor` must advance by one exactly as it
                 // did in the sizing pass. Forgetting that here put every later
                 // argument one slot off: a string descriptor was handed to C as if
                 // it were the next array pointer.
-                cArgs.push_back(static_cast<std::int64_t>(buffer.bytes));
+                cArgs[cArgCount++] = static_cast<std::int64_t>(buffer.bytes);
                 ++cursor;
             } else {
-                cArgs.push_back(static_cast<std::int64_t>(raw[cursor + 1].asInt()));
+                cArgs[cArgCount++] = static_cast<std::int64_t>(raw[cursor + 1].asInt());
                 cursor += 2;
             }
         } else {
@@ -634,14 +711,12 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
                                   "': a scalar 'double' cannot cross the dynamic boundary "
                                   "(pass 'ptr double' instead)");
             }
-            cArgs.push_back(value.tag() == Value::Tag::Ptr
-                                ? static_cast<std::int64_t>(value.asPtr())
-                                : static_cast<std::int64_t>(value.asInt()));
+            cArgs[cArgCount++] = value.tag() == Value::Tag::Ptr
+                                     ? static_cast<std::int64_t>(value.asPtr())
+                                     : static_cast<std::int64_t>(value.asInt());
         }
     }
-    while (cArgs.size() < kMaxExternalArgs) {
-        cArgs.push_back(0);
-    }
+    // The tail stays zero from the initialiser.
 
     const auto target = reinterpret_cast<ExternalFn>(symbol);
     const std::int64_t result =
@@ -649,7 +724,8 @@ VM::ExternalOutcome VM::callExternal(Process& process, const Function& function,
 
     // Copy every array back: a native function may have written to it in place,
     // which is the contract for in-place algorithms like sort.
-    for (const Buffered& buffer : buffers) {
+    for (std::size_t b = 0; b < bufferCount; ++b) {
+        const Buffered& buffer = buffers[b];
         if (!buffer.readOnly && buffer.bytes > 0 &&
             !writeBytes(buffer.address, m_nativeBuffer.data() + buffer.offset, buffer.bytes)) {
             return reject(TrapKind::InvalidPointer,

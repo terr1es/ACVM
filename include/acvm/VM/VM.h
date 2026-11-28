@@ -184,8 +184,15 @@ public:
                                        std::int64_t& out);
         static bool storeThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
                                         std::int64_t value);
+        /// Ends a compiled function's frame from the general exit, pushing the result
+        /// onto the interpreter's stack for a caller that is interpreting.
+        ///
+        /// `kind` says how the eight bytes are tagged: 0 integer, 1 pointer, 2 double.
+        /// A double has to arrive tagged as one -- `Value::fromInt` on the bit pattern
+        /// makes `asFloat()` convert a number that was never a number, so a compiled
+        /// method returning 4.0 left its interpreted caller holding 4.616e18.
         static void returnToCaller(void* process, bool hasResult, std::int64_t result,
-                                   bool resultIsPtr = false);
+                                   int kind);
         static bool readRaw64(VM& vm, std::uint64_t address, std::int64_t& out);
         static bool constantString(VM& vm, int index, std::int64_t& out);
         static void zeroThroughPointer(VM& vm, std::uint64_t address, std::uint64_t size);

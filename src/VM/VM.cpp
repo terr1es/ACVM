@@ -1503,13 +1503,74 @@ bool VM::JitBridge::loadThroughPointer(VM& vm, std::uint64_t address, int typeIn
     if (address == 0) {
         return false;
     }
+    const MemType& type = vm.memType(typeIndex);
+    if (type.isFloat() && type.bits == 64) {
+        // The eight bytes of the value, not a number derived from it.
+        //
+        // This used to return false for every float -- a refusal, which the generated
+        // code turns into a failure exit and the interpreter then re-runs from the
+        // start of the function. Reading one `double` member therefore executed the
+        // enclosing function twice, and the second run's output was appended to the
+        // first: `union_check` printed 27 passes, then started over and printed 30.
+        //
+        // Copying matches `storeThroughPointer` and `callFromSlots`: a slot is eight
+        // bytes and `bits == size * 8` means the bytes are the value.
+        std::uint64_t raw = 0;
+        if (!vm.readBytes(address, &raw, sizeof(raw))) {
+            return false;
+        }
+        out = static_cast<std::int64_t>(raw);
+        return true;
+    }
+    // The bytes, widened here rather than through `loadScalar`.
+    //
+    // `loadScalar` builds a `Value` -- a tag, a union and a branch on the tag -- then
+    // this reads it back out. For a scalar of a known width that round trip is most of
+    // the call: a byte load is a `readBytes` and a sign extension, and the `Value` in
+    // between never carried anything else. The generated code calls this for every
+    // string index and every struct field reached through a pointer.
+    const unsigned bytes = type.size;
+    if (bytes == 8) {
+        std::uint64_t raw = 0;
+        if (!vm.readBytes(address, &raw, sizeof(raw))) {
+            return false;
+        }
+        out = static_cast<std::int64_t>(raw);
+        return true;
+    }
+    if (bytes == 4) {
+        std::uint32_t raw = 0;
+        if (!vm.readBytes(address, &raw, sizeof(raw))) {
+            return false;
+        }
+        out = type.isUnsigned ? static_cast<std::int64_t>(raw)
+                              : static_cast<std::int64_t>(static_cast<std::int32_t>(raw));
+        return true;
+    }
+    if (bytes == 2) {
+        std::uint16_t raw = 0;
+        if (!vm.readBytes(address, &raw, sizeof(raw))) {
+            return false;
+        }
+        out = type.isUnsigned ? static_cast<std::int64_t>(raw)
+                              : static_cast<std::int64_t>(static_cast<std::int16_t>(raw));
+        return true;
+    }
+    if (bytes == 1) {
+        std::uint8_t raw = 0;
+        if (!vm.readBytes(address, &raw, sizeof(raw))) {
+            return false;
+        }
+        out = type.isUnsigned ? static_cast<std::int64_t>(raw)
+                              : static_cast<std::int64_t>(static_cast<std::int8_t>(raw));
+        return true;
+    }
     Value value;
-    if (!vm.loadScalar(address, typeIndex, value) || value.tag() == Value::Tag::Float) {
+    if (!vm.loadScalar(address, typeIndex, value)) {
         return false;
     }
-    out = vm.memType(typeIndex).isPtr()
-              ? static_cast<std::int64_t>(value.asPtr())
-              : static_cast<std::int64_t>(value.asInt());
+    out = type.isPtr() ? static_cast<std::int64_t>(value.asPtr())
+                       : static_cast<std::int64_t>(value.asInt());
     return true;
 }
 
@@ -1518,10 +1579,37 @@ bool VM::JitBridge::storeThroughPointer(VM& vm, std::uint64_t address, int typeI
     if (address == 0) {
         return false;
     }
+    const MemType& type = vm.memType(typeIndex);
+    if (type.isFloat() && type.bits == 64) {
+        // The caller passes the eight bytes of the value, not a number to convert.
+        //
+        // `storeScalar` reads a `Value` and calls `asFloat()`, which for an integer-tagged
+        // value converts -- so routing a double through that path stores the *pattern read
+        // as an integer* as a double. Assigning 1.0 to a union's double member then read
+        // back as 4.6e18, which is the bit pattern of 1.0 reinterpreted.
+        //
+        // Writing the bytes directly is also what makes `bits == size * 8` and `isFloat`
+        // interchangeable here: the two tiers agree because both copy, and neither
+        // converts.
+        return vm.writeBytes(address, &value, sizeof(value));
+    }
+    // Likewise the store: a scalar of a known width is its low `size` bytes, and
+    // `storeScalar` would build a `Value` to decide that.
+    if (type.isPtr() || type.isInteger()) {
+        switch (type.size) {
+        case 1: { const std::uint8_t v = static_cast<std::uint8_t>(value);
+                  return vm.writeBytes(address, &v, sizeof(v)); }
+        case 2: { const std::uint16_t v = static_cast<std::uint16_t>(value);
+                  return vm.writeBytes(address, &v, sizeof(v)); }
+        case 4: { const std::uint32_t v = static_cast<std::uint32_t>(value);
+                  return vm.writeBytes(address, &v, sizeof(v)); }
+        case 8: { return vm.writeBytes(address, &value, sizeof(value)); }
+        default: break;
+        }
+    }
     return vm.storeScalar(address, typeIndex,
-                          vm.memType(typeIndex).isPtr()
-                              ? Value::fromPtr(static_cast<std::uint64_t>(value))
-                              : Value::fromInt(static_cast<Int128>(value)));
+                          type.isPtr() ? Value::fromPtr(static_cast<std::uint64_t>(value))
+                                       : Value::fromInt(static_cast<Int128>(value)));
 }
 
 bool VM::JitBridge::readRaw64(VM& vm, std::uint64_t address, std::int64_t& out) {
@@ -1703,9 +1791,16 @@ bool VM::JitBridge::callFromSlots(VM& vm, void* process, int functionIndex, int 
             const MemType& type = vm.memType(param.memType);
             const std::uint8_t* source = reinterpret_cast<const std::uint8_t*>(&raw);
             std::uint8_t* destination = framePointer() + param.offset;
+            // A float is plain too, and has to be listed: the generated code hands
+            // over the eight bytes of the value, while `storeScalar` converts
+            // through `Value::asFloat()`. Omitting it here sent a `double` through
+            // the converting path as if its bit pattern were an integer -- `maxOf` on
+            // two doubles returned 4.886e18 for an input of 2.5, which is exactly the
+            // pattern 2.5 reads as. Any `bits == size * 8` type is a byte copy.
             const bool plain = (type.kind == MemType::Kind::Int ||
                                 type.kind == MemType::Kind::Bool ||
-                                type.kind == MemType::Kind::Char) &&
+                                type.kind == MemType::Kind::Char ||
+                                type.kind == MemType::Kind::Float) &&
                                (type.size == 1 || type.size == 2 || type.size == 4 ||
                                 type.size == 8) &&
                                type.bits == type.size * 8;
@@ -1851,7 +1946,7 @@ bool VM::JitBridge::consumeBudget(VM& vm, std::uint64_t amount) {
 
 
 void VM::JitBridge::returnToCaller(void* process, bool hasResult, std::int64_t result,
-                                   bool resultIsPtr) {
+                                   int kind) {
     auto& p = *static_cast<Process*>(process);
     if (p.frames.empty()) {
         return;
@@ -1860,9 +1955,18 @@ void VM::JitBridge::returnToCaller(void* process, bool hasResult, std::int64_t r
     p.frames.pop_back();
     p.stackTop = callerBase;
     if (hasResult) {
-        p.stack.push_back(resultIsPtr
-                              ? Value::fromPtr(static_cast<std::uint64_t>(result))
-                              : Value::fromInt(static_cast<Int128>(result)));
+        // Tagged by what the value is, not by how it is stored. An untagged double is
+        // indistinguishable from an integer here, and a caller that reads it as one
+        // converts the bit pattern into a number.
+        if (kind == 2) {
+            double number = 0.0;
+            std::memcpy(&number, &result, sizeof(number));
+            p.stack.push_back(Value::fromFloat(number));
+        } else if (kind == 1) {
+            p.stack.push_back(Value::fromPtr(static_cast<std::uint64_t>(result)));
+        } else {
+            p.stack.push_back(Value::fromInt(static_cast<Int128>(result)));
+        }
     }
 }
 

@@ -293,7 +293,7 @@ function private checkHashInt():void {
     }
     print("HashSetInt bulk count="); print(hashSetIntCount(#s));
     print(" missing="); print(missing);
-    print(" slots="); print(s.table.states.count);
+    print(" slots="); print(hashSetIntSlots(#s));
     print("\n");
 
     // remove half, then look up the other half: a tombstone must not cut a probe
@@ -367,7 +367,7 @@ function private checkHashStr():void {
     }
     print("HashSetStr bulk count="); print(hashSetStrCount(#s));
     print(" missing="); print(missing);
-    print(" slots="); print(s.table.states.count);
+    print(" slots="); print(hashSetStrSlots(#s));
     print("\n");
     hashSetStrFree(#s);
 

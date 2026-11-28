@@ -258,6 +258,7 @@ target_compile_definitions(acvm_driver PRIVATE
 set(ACVM_STDLIB_MODULES
     stdlib      # acvm.exe's own primitives, declared by stddec.axd
     algorithm   # sort / search / fold over plain arrays
+    hash        # open-addressed hash sets and maps, integer and string keys
     random      # seeded PRNG
     io          # files, and the only way to read until EOF
     time        # four clock reads; everything else is pure Axiom
@@ -285,6 +286,12 @@ function(acvm_add_native_module module directory)
     set_target_properties(acvm_${module} PROPERTIES
         OUTPUT_NAME "${module}"
         PREFIX ""
+        # A module whose functions have no Axiom body has nothing to fall back on, so
+        # the library has to export what it defines. Without this a Windows build emits
+        # a DLL with an empty export table and every call fails with "does not export"
+        # -- which only goes unnoticed while every module also exists as Axiom or is
+        # compiled into the executable.
+        WINDOWS_EXPORT_ALL_SYMBOLS ON
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     if(ACVM_STDLIB_OUTPUT_DIR)

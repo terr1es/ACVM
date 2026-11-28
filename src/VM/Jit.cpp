@@ -46,6 +46,7 @@
 #include "acvm/VM/VM.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <string>
@@ -80,9 +81,11 @@ bool storeThroughPointer(VM& vm, std::uint64_t address, int typeIndex,
     return VM::JitBridge::storeThroughPointer(vm, address, typeIndex, value);
 }
 
-void returnToCaller(void* process, bool hasResult, std::int64_t result,
-                    bool resultIsPtr) {
-    VM::JitBridge::returnToCaller(process, hasResult, result, resultIsPtr);
+/// The address the generated code calls. A free function rather than the member
+/// itself so that `reinterpret_cast` has one candidate to resolve: `JitBridge::
+/// returnToCaller` is an overload set once the wrapper shares its name.
+void pushReturnValue(void* process, bool hasResult, std::int64_t result, int kind) {
+    VM::JitBridge::returnToCaller(process, hasResult, result, kind);
 }
 
 bool readRaw64(VM& vm, std::uint64_t address, std::int64_t& out) {
@@ -155,6 +158,7 @@ using jit::mem;
 using jit::memIndex;
 using jit::Reg;
 using jit::Width;
+using jit::Xmm;
 using jit::X64Assembler;
 
 constexpr std::size_t kMaxValueSlots = 48;
@@ -308,6 +312,14 @@ constexpr const char kBudgetMessage[] =
 struct IntInfo {
     bool supported = false;
     bool isUnsigned = false;
+    /// A scalar `float`/`double`, held in the same eight byte slot as an integer.
+    ///
+    /// `bits` is still 64 and `isUnsigned` is set, so every load, store and stack
+    /// move goes through the integer path unchanged -- the bit pattern is what
+    /// crosses a slot, and an eight byte copy does not care what it encodes. Only
+    /// arithmetic, comparison and conversion read this flag, because those are the
+    /// operations where the same bytes mean something different.
+    bool isFloat = false;
     unsigned bits = 0;
 };
 
@@ -324,6 +336,16 @@ IntInfo intInfoOf(const Module& module, int typeIndex) {
         info.bits = 64;
         info.isUnsigned = true;
         info.supported = true;
+        return info;
+    }
+    if (type.isFloat()) {
+        // `float` is promoted to `double` before any arithmetic in this language, and
+        // a `double` slot is eight bytes, so both widths lower identically: one
+        // scalar-double form covers them.
+        info.bits = 64;
+        info.isUnsigned = true;
+        info.isFloat = true;
+        info.supported = type.size == 8;
         return info;
     }
     if (!type.isInteger()) {
@@ -869,7 +891,6 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             // This list has to stay in step with the lowering's switch. A new opcode that
             // `effectOf` models but the lowering does not emit belongs here, and the
             // symptom of forgetting is a refusal naming it rather than anything subtler.
-            case OpCode::ConstFloat:
             case OpCode::ArenaMark:
             case OpCode::CopyStep:
             case OpCode::LoadGlobal:
@@ -1018,10 +1039,24 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         }
         assembler.mov(kArg1, kRegProcess);
         assembler.movImm(kArg2, Width::Dword, hasResult ? 1 : 0);
-        assembler.movImm(kArg4, Width::Dword,
-                         isPointerType(module, function.returnMemType) ? 1 : 0);
+        {
+            // 0 integer, 1 pointer, 2 double. The last one is what keeps an interpreted
+            // caller from reading a compiled method's `double` result as its bit pattern.
+            int kind = 0;
+            if (function.returnMemType >= 0 &&
+                static_cast<std::size_t>(function.returnMemType) < module.memTypes.size()) {
+                const MemType& returned =
+                    module.memTypes[static_cast<std::size_t>(function.returnMemType)];
+                if (returned.isFloat()) {
+                    kind = 2;
+                } else if (returned.isPtr()) {
+                    kind = 1;
+                }
+            }
+            assembler.movImm(kArg4, Width::Dword, kind);
+        }
         assembler.callAbsolute(
-            reinterpret_cast<const void*>(&jitbridge::returnToCaller));
+            reinterpret_cast<const void*>(&jitbridge::pushReturnValue));
         assembler.movImm(kRegA, Width::Qword, 1);
         assembler.jmp(failureExit);
     };
@@ -1118,6 +1153,37 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             }
             assembler.movImm(kRegA, Width::Qword, static_cast<std::int64_t>(raw));
             pushA();
+            break;
+        }
+
+        case OpCode::ConstFloat: {
+            // A floating point constant, pushed as its bit pattern.
+            //
+            // The push is the same as `CONST_INT` at the same width: a slot is eight
+            // bytes and an `f64` fills it exactly, so the double goes in as the integer
+            // its bits spell. Copying rather than converting is what makes the tiers
+            // agree -- converting to a narrower type and back would round, and a program
+            // that prints a constant would then differ between interpreting and compiling.
+            //
+            // This was a hand-off point, which meant any function containing a float
+            // literal ran interpreted from its first instruction. Since a literal is
+            // usually the first thing a float loop touches, the whole function was
+            // refused: the double benchmark measured 231 ms interpreted against 235 ms
+            // compiled, which is not a slow path but an absent one.
+            if (inst.a < 0 ||
+                static_cast<std::size_t>(inst.a) >= function.constants.size()) {
+                refusal = "constant index out of range";
+                break;
+            }
+            const Value& value = function.constants[static_cast<std::size_t>(inst.a)];
+            const double numeric = value.asFloat();
+            std::uint64_t bits = 0;
+            static_assert(sizeof(bits) == sizeof(numeric), "a value slot is eight bytes");
+            std::memcpy(&bits, &numeric, sizeof(bits));
+            assembler.movImm(kRegA, Width::Qword, static_cast<std::int64_t>(bits));
+            if (!pushA()) {
+                break;
+            }
             break;
         }
 
@@ -1589,6 +1655,35 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 refusal = "arithmetic on a type the JIT does not inline";
                 break;
             }
+            if (info.isFloat) {
+                // Scalar double. One SSE instruction replaces what the interpreter does
+                // through a helper: the two operands are already in stack slots as raw
+                // bits, so they load into XMM registers, combine and store back.
+                //
+                // No width check follows. Every `double` is 64 bits and the arithmetic is
+                // IEEE-754, so there is no range to enforce and no overflow to trap --
+                // which is also why the result needs no truncation step.
+                if (inst.op != OpCode::Add && inst.op != OpCode::Sub &&
+                    inst.op != OpCode::Mul && inst.op != OpCode::Div) {
+                    refusal = "floating point operation the JIT does not inline";
+                    break;
+                }
+                if (depth < 2) {
+                    refusal = "stack underflow in arithmetic";
+                    break;
+                }
+                assembler.movsd(Xmm::Xmm0, mem(Reg::Rsp, slotOffset(depth - 2)));
+                assembler.movsd(Xmm::Xmm1, mem(Reg::Rsp, slotOffset(depth - 1)));
+                switch (inst.op) {
+                case OpCode::Add: assembler.addsd(Xmm::Xmm0, Xmm::Xmm1); break;
+                case OpCode::Sub: assembler.subsd(Xmm::Xmm0, Xmm::Xmm1); break;
+                case OpCode::Mul: assembler.mulsd(Xmm::Xmm0, Xmm::Xmm1); break;
+                default: assembler.divsd(Xmm::Xmm0, Xmm::Xmm1); break;
+                }
+                --depth;
+                assembler.movsd(mem(Reg::Rsp, slotOffset(depth - 1)), Xmm::Xmm0);
+                break;
+            }
             if (depth == 0) {
                 refusal = "stack underflow in arithmetic";
                 break;
@@ -1679,6 +1774,25 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
         case OpCode::Div:
         case OpCode::Mod: {
             const IntInfo info = intInfoOf(module, inst.a);
+            if (info.supported && info.isFloat) {
+                // Floating point division. `mod` has no counterpart: the language does not
+                // define `%` on a double, so an interpreter that reached one would have
+                // rejected the program at type check.
+                if (inst.op == OpCode::Mod) {
+                    refusal = "floating point remainder is not defined";
+                    break;
+                }
+                if (depth < 2) {
+                    refusal = "stack underflow in division";
+                    break;
+                }
+                assembler.movsd(Xmm::Xmm0, mem(Reg::Rsp, slotOffset(depth - 2)));
+                assembler.movsd(Xmm::Xmm1, mem(Reg::Rsp, slotOffset(depth - 1)));
+                assembler.divsd(Xmm::Xmm0, Xmm::Xmm1);
+                --depth;
+                assembler.movsd(mem(Reg::Rsp, slotOffset(depth - 1)), Xmm::Xmm0);
+                break;
+            }
             if (!info.supported) {
                 refusal = "division on a type the JIT does not inline";
                 break;
@@ -1754,6 +1868,41 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 refusal = "stack underflow in a comparison";
                 break;
             }
+            if (info.isFloat) {
+                // Scalar double comparison, with the interpreter's semantics: every
+                // ordered test is false when either operand is NaN, and `!=` is true.
+                //
+                // `ucomisd` sets CF/ZF/PF, and the ordered conditions are not simply
+                // `setcc` -- `CF=1` alone means "below *or* unordered", so `setb` on a
+                // NaN would report `NaN < x` as true. Every ordered form therefore also
+                // requires `PF=0`, taken with a second `setcc` and combined with `and`.
+                // Equality needs no such guard: `sete` already fails on NaN, since
+                // `ucomisd` clears ZF for an unordered pair.
+                assembler.movsd(Xmm::Xmm0, mem(Reg::Rsp, slotOffset(depth - 2)));
+                assembler.movsd(Xmm::Xmm1, mem(Reg::Rsp, slotOffset(depth - 1)));
+                assembler.ucomisd(Xmm::Xmm0, Xmm::Xmm1);
+                Cond cond = Cond::Equal;
+                bool ordered = true;
+                switch (inst.op) {
+                case OpCode::Eq: cond = Cond::Equal; ordered = false; break;
+                case OpCode::Ne: cond = Cond::NotEqual; ordered = false; break;
+                case OpCode::Lt: cond = Cond::Below; break;
+                case OpCode::Le: cond = Cond::BelowEqual; break;
+                case OpCode::Gt: cond = Cond::Above; break;
+                case OpCode::Ge: cond = Cond::AboveEqual; break;
+                default: break;
+                }
+                assembler.setcc(cond, kRegA);
+                assembler.movzx(kRegA, kRegA, Width::Byte);
+                if (ordered) {
+                    assembler.setcc(Cond::NoOverflow, kTmp2);   // sets on PF=0
+                    assembler.movzx(kTmp2, kTmp2, Width::Byte);
+                    assembler.and_(kRegA, kTmp2, Width::Qword);
+                }
+                --depth;
+                assembler.mov(mem(Reg::Rsp, slotOffset(depth - 1)), kRegA);
+                break;
+            }
             assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 2)));
             assembler.mov(kTmp2, mem(Reg::Rsp, slotOffset(depth - 1)));
             assembler.cmp(kRegA, kTmp2, Width::Qword);
@@ -1784,6 +1933,39 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
             }
             if (depth == 0) {
                 refusal = "stack underflow in CAST";
+                break;
+            }
+            if (from.isFloat != to.isFloat) {
+                // Across the two representations. Both directions have exactly one
+                // instruction, and both are the truncating form where a choice exists:
+                // a C cast toward an integer discards the fraction rather than rounding,
+                // and `cvttsd2si` is the encoding that does that.
+                assembler.movsd(Xmm::Xmm0, mem(Reg::Rsp, slotOffset(depth - 1)));
+                if (to.isFloat) {
+                    // Integer to double. The integer is already held sign- or
+                    // zero-extended in the register, so one 64 bit form covers every
+                    // source width.
+                    assembler.mov(kRegA, mem(Reg::Rsp, slotOffset(depth - 1)));
+                    assembler.cvtsi2sd(Xmm::Xmm0, kRegA);
+                    assembler.movsd(mem(Reg::Rsp, slotOffset(depth - 1)), Xmm::Xmm0);
+                } else {
+                    // Double to integer, then the declared width has to be enforced:
+                    // `cvttsd2si` produces a 64 bit result, and storing that into an
+                    // `int32` slot without masking leaves bits the interpreter would
+                    // have dropped.
+                    assembler.cvttsd2si(kRegA, Xmm::Xmm0);
+                    if (to.isUnsigned) {
+                        if (to.bits < 64) {
+                            assembler.movImm(kTmp1, Width::Qword,
+                                             static_cast<std::int64_t>(
+                                                 (static_cast<std::uint64_t>(1) << to.bits) - 1));
+                            assembler.and_(kRegA, kTmp1, Width::Qword);
+                        }
+                    } else if (to.bits < 64) {
+                        emitTruncateToWidth(assembler, to.bits, false);
+                    }
+                    assembler.mov(mem(Reg::Rsp, slotOffset(depth - 1)), kRegA);
+                }
                 break;
             }
             // Widening is a no-op on a value already sign- or zero-extended into 64 bits;
@@ -2009,6 +2191,13 @@ std::unique_ptr<jit::ExecutableBlock> compileFunction(const Module& module,
                 refusal = "stack underflow in LOAD";
                 break;
             }
+            // The bridge, not an inlined walk.
+            //
+            // The page table in this frame holds only the pages pinned at entry -- the
+            // function's own frame. A `LOAD` address can point anywhere in the arena, so
+            // walking that table for it reads an entry that was never filled. Tried and it
+            // crashed on the first program with a heap string: the pinned table is an
+            // optimisation for frame slots, not a map of memory.
             assembler.mov(kTmp1, mem(Reg::Rsp, slotOffset(depth - 1)));
             assembler.test(kTmp1, kTmp1);
             assembler.jcc(Cond::Equal, nullExit);

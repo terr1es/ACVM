@@ -18,353 +18,107 @@
 //  | min/max, range scans, in-order walk | ordered |
 //  | fewer than a few hundred elements | ordered (faster: no hash cost, cache friendly) |
 //
-//  ── one table serves four integer containers ──────────────────────────────
+//  ── implemented in C, reached through a handle ────────────────────────────
 //
-//  Generics work, yet only one probe routine remains, for a different
-//  reason: **keys are stored as `int64`**, so one table serves 32- and 64-bit keys (`int` is
-//  a subset of `int64`), and diff, probe and grow were one body anyway; generics would not
-//  shorten it. A 32-bit key wastes half a slot (8 + 4 + 4 = 16 bytes); the code halves.
+//  The slot arrays, the probe, the growth policy and the rehash all live in
+//  stdlib/hash.c. What each container struct holds is one `int64` handle.
 //
-//  String keys need their own table: hash and equality work on **content**, while `int64`
-//  works on value. (Merging fails for the same reason: `ptr HashSetInt` and `ptr HashSetStr`
-//  are different types, and one function for both needs generic structs -- not there yet.)
+//  The reason is measured rather than stylistic. With the containers written in
+//  Axiom, one `hashSetIntAdd` plus one `hashSetIntContains` cost about 370
+//  bytecodes: the profile was LOAD_LOCAL 21%, CONST_INT 18%, STORE_LOCAL 11%,
+//  which is the cost of dispatching a container in the language it is meant to
+//  speed up. Moving only the probe loop got 2.6x and left 33x to CPython, whose
+//  `set` is C.
+//
+//  A handle rather than a `ptr` because the two address spaces do not mix. The
+//  VM's memory is separately allocated 64 KB pages, so a pointer into it is
+//  meaningless to native code -- the compiler refuses `ptr` parameters with no
+//  element count for exactly that reason. Memory hash.c allocates with `malloc`
+//  is a different matter: it is in the process address space, and the `int64`
+//  says "opaque number, only the C side knows what it points at".
+//
+//  Every function treats handle 0 as an unusable table and reports failure
+//  rather than trapping, so a set whose allocation failed is useless, not fatal.
+//
+//  ── string keys are copied, and that fixes a lifetime bug ─────────────────
+//
+//  The previous implementation stored descriptor copies and documented that a key
+//  declared inside an `arena_scope` dangled once the scope ended (AX01-M02). The
+//  C table owns a byte copy of each key instead, so that restriction is gone: a
+//  key may come from any temporary, and `hashSetStrFree` releases the copies.
 //
 //  ── open addressing + linear probing ──────────────────────────────────────
 //
-//  No per-node allocation: every slot lives in one contiguous array, and probing is index +1
-//  modulo capacity. Delete uses a tombstone instead of clearing, or the probe chain would be
-//  cut and a key that is present would not be found. Tombstones are cleared on rehash.
+//  No per-node allocation: every slot lives in one contiguous array, and probing
+//  is index +1 with a power-of-two mask. Delete uses a tombstone instead of
+//  clearing, or the probe chain would be cut and a key that is present would not
+//  be found. Tombstones are cleared on rehash.
 //
-//  Load factor ceiling is 0.75 counting tombstones; past that, grow and reinsert live keys.
+//  Load factor ceiling is 0.75 counting tombstones; past that, grow and reinsert
+//  the live keys.
 
 module "hash" version "0.1.0";
 
-function import (return:(vec));
-function import (return:(strbyte));
-
-comptime int HASH_EMPTY = 0;
-comptime int HASH_USED = 1;
-comptime int HASH_TOMB = 2;
-comptime int HASH_MIN_SLOTS = 8;
-
-//  Mixes a 64 bit key into a non-negative 32 bit slot index.
+//  Unpacks a `hashIntTake` / `hashStrTake` result.
 //
-//  SplitMix64's finalizer: three xor-shift rounds and two multiplications. It
-//  replaces an eight round FNV-1a byte walk, which cost about eighty bytecodes
-//  per lookup -- one variable shift, one mask, two casts and a multiply per
-//  byte -- and this costs about ten. Distribution is at least as good: FNV over
-//  eight bytes spreads the low bits, while the finalizer avalanches both halves,
-//  which is what a power-of-two mask actually needs.
-//
-//  `unsigned` throughout, so the multiplications wrap. A signed `int64` would
-//  trap on the first one: Axiom's integer arithmetic is exact at every width and
-//  reports overflow rather than wrapping, which is the wrong behaviour inside a
-//  hash.
-//
-//  The result is returned unmasked: `hashTableIntLocate` folds it with
-//  `& (slots - 1)`, which is the modulo only because every slot count this table
-//  ever holds is a power of two (`hashSlotsFor` rounds up to one, and nothing else
-//  constructs a table). That replaces a division per lookup -- a division in this
-//  VM is a helper call, not an instruction -- and it is also the stronger mask:
-//  the finalizer's low bits are already well mixed, so taking them all is better
-//  than reducing to 31 bits first and then taking a remainder.
-function private hashOfInt64(int64 key):unsigned int64 {
-    unsigned int64 mixed = key as unsigned int64;
-    mixed = mixed ^ (mixed >> 33);
-    mixed = mixed * 18397679294719823053u64;
-    mixed = mixed ^ (mixed >> 33);
-    mixed = mixed * 14181476777654086739u64;
-    mixed = mixed ^ (mixed >> 33);
-    return mixed;
-    eof: pass;
-}
-
-//  Rounds a requested slot count up to a power of two, so indexing can mask
-//  instead of divide. Returns 0 for a non-positive request.
-function private hashSlotsFor(int requested):int {
-    if (requested <= 0) {
-        return 0;
-    }
-    int slots = HASH_MIN_SLOTS;
-    while (slots < requested) {
-        slots = slots * 2;
-    }
-    return slots;
-    eof: pass;
-}
-
-// ─── hash table for integer keys ───────────────────────────────────────────
-
-struct HashTableInt {
-    Vec keys;       // int64, slot array
-    Vec values;     // int, slot array; all 0 when used as a set
-    Vec states;     // int, slot array (EMPTY / USED / TOMB)
-    int used;       // live key count
-    int filled;     // used + tombstones; decides when to grow
-};
-
-//  Creates a table with its own storage. Returns a table with `keys.data == null`
-//  on failure; every operation tolerates that.
-function private makeHashTableInt(int requestedSlots):HashTableInt {
-    HashTableInt t = {makeVecHeap(1, sizeof(int64)), makeVecHeap(1, sizeof(int)),
-        makeVecHeap(1, sizeof(int)), 0, 0};
-    const int slots = hashSlotsFor(requestedSlots);
-    if (slots <= 0) {
-        return t;
-    }
-    vecFree(#t.keys);
-    vecFree(#t.values);
-    vecFree(#t.states);
-    // Zeroed: an uninitialised state slot reads as garbage, and a garbage state
-    // of USED makes probing dereference a garbage key.
-    t.keys = makeVecHeapZero(slots, sizeof(int64));
-    t.values = makeVecHeapZero(slots, sizeof(int));
-    t.states = makeVecHeapZero(slots, sizeof(int));
-    if (t.keys.data == 0 as ptr int8) {
-        return t;
-    }
-    // The slot arrays are fixed length: count is set to the slot count so `vecAt`
-    // accepts every index without pretending elements were pushed.
-    t.keys.count = slots;
-    t.values.count = slots;
-    t.states.count = slots;
-    return t;
-    eof: pass;
-}
-
-function private hashTableIntFree(ptr HashTableInt t):void {
-    vecFree(#t->keys);
-    vecFree(#t->values);
-    vecFree(#t->states);
-    t->used = 0;
-    t->filled = 0;
-    eof: pass;
-}
-
-function private hashTableIntSlots(ptr HashTableInt t):int {
-    return t->states.count;
-    eof: pass;
-}
-
-//  Finds `key`, returning its slot index, or -1 when absent. The **insertion
-//  point** is written to `insertAt` when provided: the first tombstone met on the
-//  probe path, or the empty slot that ended the search.
-function private hashTableIntLocate(ptr HashTableInt t, int64 key, ptr int insertAt):int {
-    //  The probe runs once per slot visited, so everything that is constant
-    //  across the loop is hoisted: the slot count, both array bases. Neither
-    //  array moves during a probe -- `locate` allocates nothing -- so the bases
-    //  stay valid.
-    //
-    //  `states` used to be read through `vecGetInt`, which is three calls deep
-    //  (`vecGetInt` -> `vecAt` -> a bounds check) on every slot while `keys` next
-    //  to it was already a plain dereference. The asymmetry was an oversight and
-    //  it dominated the loop.
-    const int slots = t->states.count;
-    if (slots <= 0) {
-        if (insertAt != 0 as ptr int) {
-            @insertAt = -1;
-        }
-        return -1;
-    }
-    ptr int64 keyBase = t->keys.data as ptr int64;
-    ptr int stateBase = t->states.data as ptr int;
-
-    // `slots` is a power of two, so the mask is the modulo. `slots - 1` keeps the
-    // index inside the array by construction, which is why no separate
-    // non-negative step is needed.
-    int index = (hashOfInt64(key) & (slots as unsigned int64 - 1u64)) as int;
-
-    int firstTomb = -1;
-    for (int step = 0; step < slots; step++) {
-        const int state = @(stateBase + index);
-        if (state == HASH_EMPTY) {
-            if (insertAt != 0 as ptr int) {
-                @insertAt = firstTomb >= 0 ? firstTomb : index;
-            }
-            return -1;
-        }
-        if (state == HASH_TOMB) {
-            if (firstTomb < 0) {
-                firstTomb = index;
-            }
-        } else {
-            if (@(keyBase + index) == key) {
-                if (insertAt != 0 as ptr int) {
-                    @insertAt = index;
-                }
-                return index;
-            }
-        }
-        index = index + 1;
-        if (index >= slots) {
-            index = 0;
-        }
-    }
-    // Every slot was probed without meeting an empty one: the table is all
-    // tombstones. Reuse the first tombstone; the caller's insert path replaces it.
-    if (insertAt != 0 as ptr int) {
-        @insertAt = firstTomb;
-    }
-    return -1;
-    eof: pass;
-}
-
-function private hashTableIntGrow(ptr HashTableInt t, int minSlots):bool {
-    const int target = hashSlotsFor(minSlots);
-    if (target <= t->states.count) {
-        return true;
-    }
-    HashTableInt fresh = makeHashTableInt(target);
-    if (fresh.keys.data == 0 as ptr int8) {
-        return false;
-    }
-    // Re-insert the live keys only; tombstones simply disappear.
-    //
-    // Every array is touched by index in a loop that runs once per slot, so the
-    // bases are hoisted and the state is read and written through pointers
-    // rather than through `vecGetInt` / `vecSetInt`, both of which are three
-    // calls deep. Growth happens once per doubling, which means the total work
-    // here is about twice the final table size -- the same order as the inserts
-    // that caused it, so this loop is not a corner case.
-    const int slots = t->states.count;
-    ptr int oldStates = t->states.data as ptr int;
-    ptr int64 oldKeys = t->keys.data as ptr int64;
-    ptr int oldValues = t->values.data as ptr int;
-    ptr int64 newKeys = fresh.keys.data as ptr int64;
-    ptr int newValues = fresh.values.data as ptr int;
-    ptr int newStates = fresh.states.data as ptr int;
-    for (int i = 0; i < slots; i++) {
-        if (@(oldStates + i) != HASH_USED) {
-            continue;
-        }
-        int64 key = @(oldKeys + i);
-        int value = @(oldValues + i);
-        int at = -1;
-        hashTableIntLocate(#fresh, key, #at);
-        if (at < 0) {
-            hashTableIntFree(#fresh);
-            return false;
-        }
-        @(newKeys + at) = key;
-        @(newValues + at) = value;
-        @(newStates + at) = HASH_USED;
-        fresh.used = fresh.used + 1;
-        fresh.filled = fresh.filled + 1;
-    }
-    hashTableIntFree(t);
-    @t = fresh;
-    return true;
-    eof: pass;
-}
-
-//  Inserts or overwrites. Returns false only on allocation failure.
-function private hashTableIntPut(ptr HashTableInt t, int64 key, int value):bool {
-    // `t->states.count` directly: `hashTableIntSlots` is a call whose only job is
-    // to read that field, and this runs once per insert.
-    const int slots = t->states.count;
-    if (slots <= 0) {
-        return false;
-    }
-    // Keep the probe chains short: grow at 75% occupancy, counting tombstones
-    // because they still lengthen searches.
-    if ((t->filled + 1) * 4 >= slots * 3) {
-        if (!hashTableIntGrow(t, slots * 2)) {
-            return false;
-        }
-    }
-    int at = -1;
-    const int found = hashTableIntLocate(t, key, #at);
-    if (found >= 0) {
-        @(t->values.data as ptr int + found) = value;
-        return true;
-    }
-    if (at < 0) {
-        return false;   // no usable slot
-    }
-    // Raw pointer access rather than `vecGetInt` / `vecSetInt`, which each go
-    // through `vecAt` and a bounds check. `hashTableIntLocate` already proved `at`
-    // is inside the array -- it returned it -- so the check is redundant here.
-    ptr int stateBase = t->states.data as ptr int;
-    const int state = @(stateBase + at);
-    @(t->keys.data as ptr int64 + at) = key;
-    @(t->values.data as ptr int + at) = value;
-    @(stateBase + at) = HASH_USED;
-    t->used = t->used + 1;
-    if (state != HASH_TOMB) {
-        t->filled = t->filled + 1;
-    }
-    return true;
-    eof: pass;
-}
-
-function private hashTableIntGet(ptr HashTableInt t, int64 key, ptr int out):bool {
-    const int found = hashTableIntLocate(t, key, 0 as ptr int);
-    if (found < 0) {
+//  Bit 32 carries the found flag; the low 32 bits are the value's bit pattern.
+//  The widening happens inside `int64` on purpose: `(packed & 0xFFFFFFFF) as int`
+//  would be a checked conversion from a value above 2^31 and would trap on every
+//  negative stored value, which is not a rare case.
+function private takeValueOf(int64 packed, ptr int out):bool {
+    if ((packed >> 32i64) == 0i64) {
         return false;
     }
     if (out != 0 as ptr int) {
-        @out = @(t->values.data as ptr int + found);
+        int64 raw = packed & 4294967295i64;
+        if (raw >= 2147483648i64) {
+            raw = raw - 4294967296i64;
+        }
+        @out = raw as int;
     }
     return true;
     eof: pass;
 }
 
-//  Marks the slot as a tombstone. The key stays in place so a later probe that
-//  passes over this slot still has something to compare against -- clearing it
-//  outright would break the probe chain.
-function private hashTableIntRemove(ptr HashTableInt t, int64 key):bool {
-    const int found = hashTableIntLocate(t, key, 0 as ptr int);
-    if (found < 0) {
-        return false;
-    }
-    @(t->states.data as ptr int + found) = HASH_TOMB;
-    t->used = t->used - 1;
-    return true;
-    eof: pass;
-}
-
-// ─── HashSetInt / HashSetInt64 ────────────────────────────────────────────
+// ─── HashSetInt ───────────────────────────────────────────────────────────
 
 struct HashSetInt {
-    HashTableInt table;
+    int64 handle;
 };
 
-//  Creates a set sized for `requestedSlots` entries (rounded up to a power of
-//  two, minimum 8). Returns a set with `table.keys.data == null` on failure.
 //  Creates an empty `int`-keyed hash set.
 //
-//  `requestedSlots` is a capacity hint in slots, rounded up to a power of two with
-//  a floor of 8. `requestedSlots <= 0` yields zero slots, and then every add and
-//  lookup fails -- a valid but useless set.
+//  `requestedSlots` is a capacity hint in slots, rounded up to a power of two
+//  with a floor of 8. `requestedSlots <= 0` yields an unusable set, and then every
+//  add and lookup reports failure.
+//
 //  Grows automatically at 75% occupancy, counting tombstones as occupied.
 function makeHashSetInt(int requestedSlots):HashSetInt {
-    HashSetInt s = {makeHashTableInt(requestedSlots)};
+    HashSetInt s = {hashIntCreate(requestedSlots)};
     return s;
     eof: pass;
 }
 
-//  Releases the slot arrays. The keys are plain values, so there is nothing else
-//  to free. Safe to call twice.
+//  Releases the slot arrays. Safe to call twice.
 function hashSetIntFree(ptr HashSetInt s):void {
-    hashTableIntFree(#s->table);
+    hashIntDestroy(s->handle);
+    s->handle = 0;
     eof: pass;
 }
 
-//  Inserts `value`, or reports it as already present (the stored value is
-//  overwritten with 0, which for a set is unobservable).
+//  Inserts `value`, or overwrites it if present (unobservable for a set).
 //
-//  Returns true when the value is a member afterwards; false when the table has
-//  no slots or could not grow.
+//  Returns true when the value is a member afterwards; false when the set is
+//  unusable or allocation failed.
 //  Amortised O(1); the table doubles once occupancy reaches 75%.
 function hashSetIntAdd(ptr HashSetInt s, int value):bool {
-    return hashTableIntPut(#s->table, value as int64, 0);
+    return hashIntPut(s->handle, value as int64, 0) != 0;
     eof: pass;
 }
 
 //  True when `value` is a member. Amortised O(1).
-//  Reads only, so it is safe to interleave with adds.
 function hashSetIntContains(ptr HashSetInt s, int value):bool {
-    return hashTableIntGet(#s->table, value as int64, 0 as ptr int);
+    return hashIntContains(s->handle, value as int64) != 0;
     eof: pass;
 }
 
@@ -374,87 +128,94 @@ function hashSetIntContains(ptr HashSetInt s, int value):bool {
 //  chain, so repeated add/remove cycles keep growing the table even when the
 //  element count stays flat.
 function hashSetIntRemove(ptr HashSetInt s, int value):bool {
-    return hashTableIntRemove(#s->table, value as int64);
+    return hashIntRemove(s->handle, value as int64) != 0;
     eof: pass;
 }
 
 //  Number of live members. O(1); tombstones are not counted.
 function hashSetIntCount(ptr HashSetInt s):int {
-    return s->table.used;
+    return hashIntCount(s->handle);
     eof: pass;
 }
 
+//  Slot capacity, never below the live count. Diagnostic: a set that keeps
+//  growing while its count stays flat has accumulated tombstones.
+function hashSetIntSlots(ptr HashSetInt s):int {
+    return hashIntSlots(s->handle);
+    eof: pass;
+}
+
+// ─── HashSetInt64 ─────────────────────────────────────────────────────────
+
 struct HashSetInt64 {
-    HashTableInt table;
+    int64 handle;
 };
 
-//  Creates an empty `int64`-keyed hash set. Same `requestedSlots` rules as
-//  `makeHashSetInt` (hint, rounded up to a power of two, `<= 0` gives an
-//  unusable set).
+//  Creates an empty `int64`-keyed hash set. Same capacity rules as
+//  `makeHashSetInt`.
 function makeHashSetInt64(int requestedSlots):HashSetInt64 {
-    HashSetInt64 s = {makeHashTableInt(requestedSlots)};
+    HashSetInt64 s = {hashIntCreate(requestedSlots)};
     return s;
     eof: pass;
 }
 
 //  Releases the slot arrays. Safe to call twice.
 function hashSetInt64Free(ptr HashSetInt64 s):void {
-    hashTableIntFree(#s->table);
+    hashIntDestroy(s->handle);
+    s->handle = 0;
     eof: pass;
 }
 
-//  Inserts `value`. Returns true when it is a member afterwards, false on
-//  allocation failure or a zero-slot table. Amortised O(1).
+//  Inserts `value`. Returns true when it is a member afterwards.
 function hashSetInt64Add(ptr HashSetInt64 s, int64 value):bool {
-    return hashTableIntPut(#s->table, value, 0);
+    return hashIntPut(s->handle, value, 0) != 0;
     eof: pass;
 }
 
 //  True when `value` is a member. Amortised O(1).
 function hashSetInt64Contains(ptr HashSetInt64 s, int64 value):bool {
-    return hashTableIntGet(#s->table, value, 0 as ptr int);
+    return hashIntContains(s->handle, value) != 0;
     eof: pass;
 }
 
 //  Removes `value`. Returns false when it was not present.
-//  Leaves a tombstone, like `hashSetIntRemove`.
 function hashSetInt64Remove(ptr HashSetInt64 s, int64 value):bool {
-    return hashTableIntRemove(#s->table, value);
+    return hashIntRemove(s->handle, value) != 0;
     eof: pass;
 }
 
 //  Number of live members. O(1).
 function hashSetInt64Count(ptr HashSetInt64 s):int {
-    return s->table.used;
+    return hashIntCount(s->handle);
     eof: pass;
 }
 
-// ─── HashMapInt ────────────────────────────────────────────────────────────
+// ─── HashMapInt ───────────────────────────────────────────────────────────
 
 struct HashMapInt {
-    HashTableInt table;
+    int64 handle;
 };
 
-//  Creates an empty `int -> int` hash map. Same `requestedSlots` rules as
+//  Creates an empty `int -> int` hash map. Same capacity rules as
 //  `makeHashSetInt`.
 function makeHashMapInt(int requestedSlots):HashMapInt {
-    HashMapInt m = {makeHashTableInt(requestedSlots)};
+    HashMapInt m = {hashIntCreateMap(requestedSlots)};
     return m;
     eof: pass;
 }
 
-//  Releases the slot arrays. Keys and values are plain ints; nothing else to
-//  free. Safe to call twice.
+//  Releases the slot arrays. Safe to call twice.
 function hashMapIntFree(ptr HashMapInt m):void {
-    hashTableIntFree(#m->table);
+    hashIntDestroy(m->handle);
+    m->handle = 0;
     eof: pass;
 }
 
-//  Inserts or overwrites `key`. Returns true on success, false when the table has
-//  no slots or could not grow.
+//  Inserts or overwrites `key`. Returns true on success, false when the map is
+//  unusable or allocation failed.
 //  Amortised O(1); overwriting an existing key does not grow the table.
 function hashMapIntPut(ptr HashMapInt m, int key, int value):bool {
-    return hashTableIntPut(#m->table, key as int64, value);
+    return hashIntPut(m->handle, key as int64, value) != 0;
     eof: pass;
 }
 
@@ -463,247 +224,50 @@ function hashMapIntPut(ptr HashMapInt m, int key, int value):bool {
 //  on the previous contents of `out`. Pass a null `out` to test membership
 //  without reading the value.
 function hashMapIntGet(ptr HashMapInt m, int key, ptr int out):bool {
-    return hashTableIntGet(#m->table, key as int64, out);
+    return takeValueOf(hashIntTake(m->handle, key as int64), out);
     eof: pass;
 }
 
 //  True when `key` is present. Amortised O(1), and cheaper than `hashMapIntGet`
 //  when the value is not needed.
 function hashMapIntHas(ptr HashMapInt m, int key):bool {
-    return hashTableIntGet(#m->table, key as int64, 0 as ptr int);
+    return hashIntContains(m->handle, key as int64) != 0;
     eof: pass;
 }
 
 //  Removes `key`. Returns false when it was not present. Leaves a tombstone.
 function hashMapIntRemove(ptr HashMapInt m, int key):bool {
-    return hashTableIntRemove(#m->table, key as int64);
+    return hashIntRemove(m->handle, key as int64) != 0;
     eof: pass;
 }
 
 //  Number of live entries. O(1).
 function hashMapIntCount(ptr HashMapInt m):int {
-    return m->table.used;
+    return hashIntCount(m->handle);
     eof: pass;
 }
 
-// ─── hash table for string keys ────────────────────────────────────────────
-//
-//  The only difference from the integer table is comparison: key equality is by **content**
-//  (`strCompare`) and the hash is `strHashOf` over bytes. Probing, tombstones and growth are
-//  identical but unshareable -- that needs the compare passed in; Axiom has no function ptrs.
-
-struct HashTableStr {
-    Vec keys;       // string descriptors, slot array
-    Vec values;     // int, slot array
-    Vec states;     // int
-    int used;
-    int filled;
-};
-
-function private makeHashTableStr(int requestedSlots):HashTableStr {
-    HashTableStr t = {makeVecHeap(1, sizeof(string)), makeVecHeap(1, sizeof(int)),
-        makeVecHeap(1, sizeof(int)), 0, 0};
-    const int slots = hashSlotsFor(requestedSlots);
-    if (slots <= 0) {
-        return t;
-    }
-    vecFree(#t.keys);
-    vecFree(#t.values);
-    vecFree(#t.states);
-    t.keys = makeVecHeapZero(slots, sizeof(string));
-    t.values = makeVecHeapZero(slots, sizeof(int));
-    t.states = makeVecHeapZero(slots, sizeof(int));
-    if (t.keys.data == 0 as ptr int8) {
-        return t;
-    }
-    t.keys.count = slots;
-    t.values.count = slots;
-    t.states.count = slots;
-    return t;
-    eof: pass;
-}
-
-function private hashTableStrFree(ptr HashTableStr t):void {
-    vecFree(#t->keys);
-    vecFree(#t->values);
-    vecFree(#t->states);
-    t->used = 0;
-    t->filled = 0;
-    eof: pass;
-}
-
-function private hashTableStrSlots(ptr HashTableStr t):int {
-    return t->states.count;
-    eof: pass;
-}
-
-//  The string-keyed probe. Same shape as the integer one and for the same
-//  reasons: the slot count and both bases are hoisted, `states` is read through
-//  a pointer instead of `vecGetInt`, and the slot index comes from a mask rather
-//  than a remainder.
-function private hashTableStrLocate(ptr HashTableStr t, string key, ptr int insertAt):int {
-    const int slots = t->states.count;
-    if (slots <= 0) {
-        if (insertAt != 0 as ptr int) {
-            @insertAt = -1;
-        }
-        return -1;
-    }
-    ptr int stateBase = t->states.data as ptr int;
-    ptr string keyBase = t->keys.data as ptr string;
-    int index = strHashIndex(key) % slots;
-    int firstTomb = -1;
-    for (int step = 0; step < slots; step++) {
-        const int state = @(stateBase + index);
-        if (state == HASH_EMPTY) {
-            if (insertAt != 0 as ptr int) {
-                @insertAt = firstTomb >= 0 ? firstTomb : index;
-            }
-            return -1;
-        }
-        if (state == HASH_TOMB) {
-            if (firstTomb < 0) {
-                firstTomb = index;
-            }
-        } else {
-            if (strCompare(@(keyBase + index), key) == 0) {
-                if (insertAt != 0 as ptr int) {
-                    @insertAt = index;
-                }
-                return index;
-            }
-        }
-        index = index + 1;
-        if (index >= slots) {
-            index = 0;
-        }
-    }
-    if (insertAt != 0 as ptr int) {
-        @insertAt = firstTomb;
-    }
-    return -1;
-    eof: pass;
-}
-
-function private hashTableStrGrow(ptr HashTableStr t, int minSlots):bool {
-    const int target = hashSlotsFor(minSlots);
-    if (target <= t->states.count) {
-        return true;
-    }
-    HashTableStr fresh = makeHashTableStr(target);
-    if (fresh.keys.data == 0 as ptr int8) {
-        return false;
-    }
-    //  Bases hoisted and `states` read through a pointer, as in the integer
-    //  table's growth: this loop runs once per old slot, and the rehash cost is
-    //  about twice the final table size -- the same order as the inserts.
-    const int slots = t->states.count;
-    ptr int oldStates = t->states.data as ptr int;
-    ptr string oldKeys = t->keys.data as ptr string;
-    ptr int oldValues = t->values.data as ptr int;
-    ptr string newKeys = fresh.keys.data as ptr string;
-    ptr int newValues = fresh.values.data as ptr int;
-    ptr int newStates = fresh.states.data as ptr int;
-    for (int i = 0; i < slots; i++) {
-        if (@(oldStates + i) != HASH_USED) {
-            continue;
-        }
-        string key = @(oldKeys + i);
-        int value = @(oldValues + i);
-        int at = -1;
-        hashTableStrLocate(#fresh, key, #at);
-        if (at < 0) {
-            hashTableStrFree(#fresh);
-            return false;
-        }
-        @(newKeys + at) = key;
-        @(newValues + at) = value;
-        @(newStates + at) = HASH_USED;
-        fresh.used = fresh.used + 1;
-        fresh.filled = fresh.filled + 1;
-    }
-    hashTableStrFree(t);
-    @t = fresh;
-    return true;
-    eof: pass;
-}
-
-function private hashTableStrPut(ptr HashTableStr t, string key, int value):bool {
-    const int slots = hashTableStrSlots(t);
-    if (slots <= 0) {
-        return false;
-    }
-    if ((t->filled + 1) * 4 >= slots * 3) {
-        if (!hashTableStrGrow(t, slots * 2)) {
-            return false;
-        }
-    }
-    int at = -1;
-    const int found = hashTableStrLocate(t, key, #at);
-    if (found >= 0) {
-        @(t->values.data as ptr int + found) = value;
-        return true;
-    }
-    if (at < 0) {
-        return false;
-    }
-    ptr int putStateBase = t->states.data as ptr int;
-    const int state = @(putStateBase + at);
-    @(t->keys.data as ptr string + at) = key;
-    @(t->values.data as ptr int + at) = value;
-    @(putStateBase + at) = HASH_USED;
-    t->used = t->used + 1;
-    if (state != HASH_TOMB) {
-        t->filled = t->filled + 1;
-    }
-    return true;
-    eof: pass;
-}
-
-function private hashTableStrGet(ptr HashTableStr t, string key, ptr int out):bool {
-    const int found = hashTableStrLocate(t, key, 0 as ptr int);
-    if (found < 0) {
-        return false;
-    }
-    if (out != 0 as ptr int) {
-        @out = @(t->values.data as ptr int + found);
-    }
-    return true;
-    eof: pass;
-}
-
-function private hashTableStrRemove(ptr HashTableStr t, string key):bool {
-    const int found = hashTableStrLocate(t, key, 0 as ptr int);
-    if (found < 0) {
-        return false;
-    }
-    @(t->states.data as ptr int + found) = HASH_TOMB;
-    t->used = t->used - 1;
-    return true;
-    eof: pass;
-}
-
-// ─── HashSetStr / HashMapStr ──────────────────────────────────────────────
+// ─── HashSetStr ───────────────────────────────────────────────────────────
 
 struct HashSetStr {
-    HashTableStr table;
+    int64 handle;
 };
 
 //  Creates an empty `string`-keyed hash set.
 //
-//  Same `requestedSlots` rules as `makeHashSetInt`. Keys are stored as descriptor
-//  copies (16 bytes), not character data: the set does not own the text, so a key
-//  from inside an `arena_scope` dangles once that scope ends (AX01-M02).
+//  Same `requestedSlots` rules as `makeHashSetInt`. Keys are compared by content
+//  and the set keeps its own copy of each key's bytes, so a key may come from any
+//  temporary -- an `arena_scope` that has since ended included.
 function makeHashSetStr(int requestedSlots):HashSetStr {
-    HashSetStr s = {makeHashTableStr(requestedSlots)};
+    HashSetStr s = {hashStrCreate(requestedSlots)};
     return s;
     eof: pass;
 }
 
-//  Releases the slot arrays. Does not free the key strings -- the set never
-//  owned them. Safe to call twice.
+//  Releases the slot arrays and the copies of the keys. Safe to call twice.
 function hashSetStrFree(ptr HashSetStr s):void {
-    hashTableStrFree(#s->table);
+    hashStrDestroy(s->handle);
+    s->handle = 0;
     eof: pass;
 }
 
@@ -711,77 +275,85 @@ function hashSetStrFree(ptr HashSetStr s):void {
 //  Returns true when it is a member afterwards, false on allocation failure.
 //  Amortised O(1) probes, each comparison O(key length).
 function hashSetStrAdd(ptr HashSetStr s, string key):bool {
-    return hashTableStrPut(#s->table, key, 0);
+    return hashStrPut(s->handle, key, 0) != 0;
     eof: pass;
 }
 
 //  True when `value` is a member, comparing contents. Amortised O(1) probes.
 function hashSetStrContains(ptr HashSetStr s, string key):bool {
-    return hashTableStrGet(#s->table, key, 0 as ptr int);
+    return hashStrContains(s->handle, key) != 0;
     eof: pass;
 }
 
 //  Removes `value`. Returns false when it was not present.
-//  Leaves a tombstone, and does not free the key text.
+//  Leaves a tombstone; the key copy is released when the set is freed.
 function hashSetStrRemove(ptr HashSetStr s, string key):bool {
-    return hashTableStrRemove(#s->table, key);
+    return hashStrRemove(s->handle, key) != 0;
     eof: pass;
 }
 
 //  Number of live members. O(1).
 function hashSetStrCount(ptr HashSetStr s):int {
-    return s->table.used;
+    return hashStrCount(s->handle);
     eof: pass;
 }
 
+//  Slot capacity, never below the live count. Diagnostic.
+function hashSetStrSlots(ptr HashSetStr s):int {
+    return hashStrSlots(s->handle);
+    eof: pass;
+}
+
+// ─── HashMapStr ───────────────────────────────────────────────────────────
+
 struct HashMapStr {
-    HashTableStr table;
+    int64 handle;
 };
 
 //  Creates an empty `string -> int` hash map.
-//  Same `requestedSlots` rules as `makeHashSetInt`, and the same caveat about key
-//  lifetime: descriptors only, no copy of the text.
+//  Same `requestedSlots` rules as `makeHashSetInt`, and keys are copied rather
+//  than borrowed.
 function makeHashMapStr(int requestedSlots):HashMapStr {
-    HashMapStr m = {makeHashTableStr(requestedSlots)};
+    HashMapStr m = {hashStrCreate(requestedSlots)};
     return m;
     eof: pass;
 }
 
-//  Releases the slot arrays. Key strings are not freed. Safe to call twice.
+//  Releases the slot arrays and the copies of the keys. Safe to call twice.
 function hashMapStrFree(ptr HashMapStr m):void {
-    hashTableStrFree(#m->table);
+    hashStrDestroy(m->handle);
+    m->handle = 0;
     eof: pass;
 }
 
 //  Inserts or overwrites `key` (`string` -> `int`), comparing key contents.
-//  Returns true on success, false when the table has no slots or could not grow.
-//  The key is stored as a descriptor copy -- see `makeHashMapStr`.
+//  Returns true on success, false when the map is unusable or allocation failed.
 function hashMapStrPut(ptr HashMapStr m, string key, int value):bool {
-    return hashTableStrPut(#m->table, key, value);
+    return hashStrPut(m->handle, key, value) != 0;
     eof: pass;
 }
 
 //  Looks up `key` (`string` -> `int`). Returns true and writes `*out` on a hit;
 //  false on a miss with `*out` untouched.
 function hashMapStrGet(ptr HashMapStr m, string key, ptr int out):bool {
-    return hashTableStrGet(#m->table, key, out);
+    return takeValueOf(hashStrTake(m->handle, key), out);
     eof: pass;
 }
 
 //  True when `key` is present. Amortised O(1).
 function hashMapStrHas(ptr HashMapStr m, string key):bool {
-    return hashTableStrGet(#m->table, key, 0 as ptr int);
+    return hashStrContains(m->handle, key) != 0;
     eof: pass;
 }
 
 //  Removes `key`. Returns false when it was not present. Leaves a tombstone.
 function hashMapStrRemove(ptr HashMapStr m, string key):bool {
-    return hashTableStrRemove(#m->table, key);
+    return hashStrRemove(m->handle, key) != 0;
     eof: pass;
 }
 
 //  Number of live entries. O(1).
 function hashMapStrCount(ptr HashMapStr m):int {
-    return m->table.used;
+    return hashStrCount(m->handle);
     eof: pass;
 }
