@@ -200,3 +200,23 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             ./stage/bin/acvm run hello.ax --jit
           fi
+
+      # Running the program here cannot prove it runs on a machine with no toolchain:
+      # this runner has ucrt64/bin on PATH, so an executable that still imports
+      # libstdc++-6.dll would start normally and the release would fail on a user's
+      # machine with "the code execution cannot proceed". The import table is the only
+      # thing that answers the question, and the DLL names appear in the image as plain
+      # strings, so `grep` reads it without needing objdump installed.
+      - name: Windows: no toolchain runtime in the import table
+        run: |
+          found=0
+          for dll in libstdc++-6.dll libc++.dll libunwind.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+            if grep -a -q "$dll" stage/bin/acvm.exe; then
+              echo "::error::acvm.exe imports $dll, which is not in the archive"
+              found=1
+            fi
+          done
+          if [ $found -ne 0 ]; then
+            exit 1
+          fi
+          echo "import table names no toolchain runtime"

@@ -118,6 +118,25 @@ jobs:
           cmake --install build --prefix stage
           cp README.md TUTORIAL.md LICENSE stage/
 
+      # The archive has to run where no toolchain exists, and running it here cannot prove
+      # that: this runner has ucrt64/bin on PATH, so an executable still importing
+      # libstdc++-6.dll would start normally and fail on the user's machine instead. The
+      # import table is the only place the answer is written, and the DLL names sit in the
+      # image as plain strings, so `grep` reads it without objdump being installed.
+      - name: No toolchain runtime in the import table
+        run: |
+          found=0
+          for dll in libstdc++-6.dll libc++.dll libunwind.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+            if grep -a -q "$dll" stage/bin/acvm.exe; then
+              echo "::error::acvm.exe imports $dll, which the archive does not ship"
+              found=1
+            fi
+          done
+          if [ $found -ne 0 ]; then
+            exit 1
+          fi
+          echo "import table names no toolchain runtime"
+
       # 7-Zip from the runner image rather than the MSYS2 `zip` package. Asking pacman
       # for one more package was enough to fail the whole job during setup -- "the process
       # cmd.exe failed with exit code 1" -- while the same list without it built here and
