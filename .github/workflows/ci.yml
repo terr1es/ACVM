@@ -207,7 +207,7 @@ jobs:
       # machine with "the code execution cannot proceed". The import table is the only
       # thing that answers the question, and the DLL names appear in the image as plain
       # strings, so `grep` reads it without needing objdump installed.
-      - name: Windows: no toolchain runtime in the import table
+      - name: Windows import table names no toolchain runtime
         run: |
           found=0
           for dll in libstdc++-6.dll libc++.dll libunwind.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
